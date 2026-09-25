@@ -7,9 +7,7 @@ use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_execution::query_executor::compiled::{CompiledStatement, ResultColumnDesc};
 use paro_parser::ast::Statement;
-use paro_planner::operator::{ExplainMode, LogicalOperator};
-use paro_planner::planner::Planner;
-use paro_planner::verify::verify_physical_planner_invariants;
+use paro_planner::binder::Planner;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error};
@@ -23,20 +21,41 @@ pub fn compile_statement_with_parameter_types(
     stmt: Statement,
     parameter_types: &[LogicalType],
 ) -> Result<CompiledStatement> {
+    // Diagnostic entry includes AST identity preparation; the existing normal
+    // compiler clock and its evidence boundary remain unchanged.
+    let capture_started = ctx.options.compile_capture.as_ref().map(|_| Instant::now());
     let statement_tag = stmt.to_string();
     let started_at = Instant::now();
+    if let Some(capture) = &ctx.options.compile_capture {
+        use paro_context::compile_diagnostics::Observation::Observed;
+        capture.update(|r| {
+            r.input_fingerprint = Observed(paro_context::statement_fingerprint(&statement_tag));
+            r.planning_settings = Observed(ctx.settings.planning_fingerprint());
+            r.available_memory_bytes = Observed(ctx.compile_resources.available_memory_bytes);
+            r.available_parallel_tasks = Observed(ctx.compile_resources.available_parallel_tasks);
+        });
+    }
+    let statement_trace = ctx.statement_trace();
+    if let Some(trace) = &statement_trace {
+        trace.record_event("compile", "compiler_entry");
+    }
     debug!(
         target: targets::QUERY,
         statement_tag = %statement_tag,
         "Statement compilation pipeline started"
     );
 
+    let bind_and_plan_started = Instant::now();
     let mut planner = if parameter_types.is_empty() {
         Planner::new(ctx.clone())
     } else {
         Planner::new_with_parameters(ctx.clone(), parameter_types.to_vec())
     };
     if let Err(error) = planner.create_plan(stmt) {
+        if let Some(trace) = &statement_trace {
+            trace.record_span("compile", "bind_and_plan", bind_and_plan_started);
+            trace.record_event("compile", "bind_and_plan_error");
+        }
         error!(
             target: targets::PLANNER,
             statement_tag = %statement_tag,
@@ -46,7 +65,17 @@ pub fn compile_statement_with_parameter_types(
         );
         return Err(error);
     }
+    if let Some(trace) = &statement_trace {
+        trace.record_span("compile", "bind_and_plan", bind_and_plan_started);
+    }
     let result_names = planner.names.clone();
+    if let Some(capture) = &ctx.options.compile_capture {
+        capture.update(|r| {
+            r.bind_ns = paro_context::compile_diagnostics::Observation::Observed(
+                bind_and_plan_started.elapsed().as_nanos() as u64,
+            )
+        });
+    }
     let result_types = planner.types.clone();
 
     let logical_plan = planner
@@ -60,10 +89,30 @@ pub fn compile_statement_with_parameter_types(
         "Logical plan created"
     );
 
-    let mut optimizer = paro_optimizer::optimizer::Optimizer::new(planner.binder, ctx.clone());
-    let mut optimized_plan = match optimizer.optimize(logical_plan) {
+    let optimizer_started = Instant::now();
+    let partition = paro_optimizer::begin_optimizer_observation(
+        optimizer_started,
+        ctx.options.compile_capture.as_ref().is_some_and(|capture| {
+            capture.level() == paro_context::compile_diagnostics::CaptureLevel::Detail
+        }),
+    );
+    let mut optimizer = paro_optimizer::Optimizer::new(planner.binder, ctx.clone());
+    let optimized = match optimizer.optimize(logical_plan) {
         Ok(plan) => plan,
         Err(error) => {
+            if let Some(report) = partition.finish(Instant::now()) {
+                if let Some(capture) = &ctx.options.compile_capture {
+                    capture.update(|r| {
+                        r.optimizer_work = paro_context::compile_diagnostics::Observation::Observed(
+                            report.snapshot(),
+                        )
+                    });
+                }
+            }
+            if let Some(trace) = &statement_trace {
+                trace.record_span("compile", "optimizer", optimizer_started);
+                trace.record_event("compile", "optimizer_error");
+            }
             error!(
                 target: targets::OPTIMIZER,
                 statement_tag = %statement_tag,
@@ -74,58 +123,125 @@ pub fn compile_statement_with_parameter_types(
             return Err(error);
         }
     };
+    let optimizer_finished = Instant::now();
+    if let Some(capture) = &ctx.options.compile_capture {
+        capture.update(|r| {
+            r.optimizer_ns = paro_context::compile_diagnostics::Observation::Observed(
+                optimizer_finished
+                    .duration_since(optimizer_started)
+                    .as_nanos() as u64,
+            )
+        });
+    }
+    let partition_report = partition.finish(optimizer_finished);
+    let mut compile_work = paro_context::compile_work_evidence_enabled().then(|| {
+        let mut work = optimizer.compile_work();
+        work.optimizer_elapsed_us = u64::try_from(
+            optimizer_finished
+                .duration_since(optimizer_started)
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
+        work
+    });
+    if let Some(trace) = &statement_trace {
+        trace.record_span("compile", "optimizer", optimizer_started);
+    }
+    if let Some(report) = partition_report {
+        if let Some(capture) = &ctx.options.compile_capture {
+            capture.update(|r| {
+                r.optimizer_work =
+                    paro_context::compile_diagnostics::Observation::Observed(report.snapshot())
+            });
+        }
+    }
     debug!(
         target: targets::OPTIMIZER,
         statement_tag = %statement_tag,
         "Logical plan optimized"
     );
 
-    let executable = if let LogicalOperator::Explain(explain) = &mut optimized_plan.operator {
-        if explain.spec.mode == ExplainMode::Analyze {
-            let target_plan = match generate_typed_physical_plan(ctx.as_ref(), &mut explain.child) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    error!(
-                        target: targets::EXECUTOR,
-                        statement_tag = %statement_tag,
-                        error = %error,
-                        stage = "physical_plan",
-                        "EXPLAIN ANALYZE target physical plan generation failed"
-                    );
-                    return Err(error);
-                }
-            };
+    let verify_started = Instant::now();
+    let verification = match &optimized {
+        paro_optimizer::OptimizedStatement::Physical(artifact) => artifact
+            .verify_result_types(&result_types)
+            .and_then(|()| artifact.verify()),
+        paro_optimizer::OptimizedStatement::ExplainAnalyze { target, .. } => target.verify(),
+    };
+    if let Err(error) = verification {
+        if let Some(trace) = &statement_trace {
+            trace.record_span("compile", "verify", verify_started);
+            trace.record_event("compile", "verification_error");
+        }
+        return Err(error);
+    }
+    if let Some(trace) = &statement_trace {
+        trace.record_span("compile", "verify", verify_started);
+    }
+
+    let runtime_image_started = Instant::now();
+    if let Some(capture) = &ctx.options.compile_capture {
+        use paro_context::compile_diagnostics::Observation::Observed;
+        capture.update(|r| {
+            r.verify_ns = Observed(
+                runtime_image_started
+                    .duration_since(verify_started)
+                    .as_nanos() as u64,
+            );
+            r.safety_verified = Observed(true);
+            r.output_columns = Observed(result_names.len());
+            if let paro_optimizer::OptimizedStatement::Physical(artifact) = &optimized {
+                r.expected_class = Observed(artifact.grant.id.0);
+                r.selected_fingerprint = Observed([
+                    (artifact.physical_fingerprint.0 >> 64) as u64,
+                    artifact.physical_fingerprint.0 as u64,
+                ]);
+            }
+        });
+        if let paro_optimizer::OptimizedStatement::Physical(artifact) = &optimized {
+            use paro_context::compile_diagnostics::VariantSummary;
+            capture.variants(
+                1,
+                std::iter::once(VariantSummary {
+                    ordinal: 0,
+                    physical_fingerprint: [
+                        (artifact.physical_fingerprint.0 >> 64) as u64,
+                        artifact.physical_fingerprint.0 as u64,
+                    ],
+                    admissible_classes: 1u64.checked_shl(artifact.grant.id.0).ok_or_else(|| {
+                        paro_common::error::internal(
+                            "resource contract id exceeds receipt capacity",
+                        )
+                    })?,
+                }),
+            );
+        }
+    }
+
+    let executable = match optimized {
+        paro_optimizer::OptimizedStatement::Physical(plan) => {
+            paro_execution::pipeline::StatementProgram::deferred_physical_plan(plan)?
+        }
+        paro_optimizer::OptimizedStatement::ExplainAnalyze { target, spec } => {
             let target =
-                match paro_execution::pipeline::StatementProgram::from_physical_plan(target_plan) {
-                    Ok(program) => program,
-                    Err(error) => {
-                        error!(
-                            target: targets::EXECUTOR,
-                            statement_tag = %statement_tag,
-                            error = %error,
-                            stage = "runtime_program",
-                            "EXPLAIN ANALYZE target runtime program generation failed"
-                        );
-                        return Err(error);
-                    }
-                };
+                paro_execution::pipeline::StatementProgram::deferred_physical_plan(target)?;
             paro_execution::pipeline::StatementProgram::ExplainAnalyze {
                 target: Box::new(target),
-                spec: explain.spec,
+                spec,
             }
-        } else {
-            compile_regular_statement(ctx.as_ref(), &mut optimized_plan, &statement_tag)?
         }
-    } else {
-        compile_regular_statement(ctx.as_ref(), &mut optimized_plan, &statement_tag)?
     };
+    if let Some(trace) = &statement_trace {
+        trace.record_span("compile", "runtime_image", runtime_image_started);
+        trace.record_event("compile", "compiled_artifact_ready");
+    }
     debug!(
         target: targets::EXECUTOR,
         statement_tag = %statement_tag,
         "Runtime program generated"
     );
 
-    let compiled = CompiledStatement::new(
+    let mut compiled = CompiledStatement::new(
         executable,
         result_names
             .into_iter()
@@ -134,7 +250,49 @@ pub fn compile_statement_with_parameter_types(
             .collect(),
         parameter_types.to_vec(),
         ctx.compile_environment_key(),
-    );
+    )?;
+    if let Some(capture) = &ctx.options.compile_capture {
+        use std::hash::{Hash, Hasher};
+        let mut identity = std::collections::hash_map::DefaultHasher::new();
+        for column in compiled.result_schema() {
+            column.name.hash(&mut identity);
+            column.logical_type.hash(&mut identity);
+        }
+        capture.update(|r| {
+            r.output_identity =
+                paro_context::compile_diagnostics::Observation::Observed(identity.finish())
+        });
+    }
+
+    // Copy the small immutable summaries before releasing the planner.  The
+    // compiler clock is finalized below, after that release, so the normal
+    // receipt and compile-work channels retain the historical compiler
+    // boundary instead of silently excluding planner-state cleanup.
+    let mut compile_receipt = optimizer.compile_receipt();
+
+    // The optimizer and planner state are no longer needed once the deferred
+    // executable image has been materialized.  Keep this release boundary in
+    // the same trace as compiler return so a cold sample can distinguish
+    // image construction from memory retained until admission.
+    drop(optimizer);
+    if let Some(trace) = &statement_trace {
+        trace.record_event("compile", "planning_state_released");
+    }
+
+    let compiler_elapsed_us = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+    if let Some(work) = compile_work.as_mut() {
+        work.compiler_elapsed_us = compiler_elapsed_us;
+    }
+    if let Some(receipt) = compile_receipt.as_mut() {
+        receipt.artifact_identity = Some(compiled.artifact_identity());
+        receipt.compile_work = compile_work;
+    }
+    if let Some(receipt) = compile_receipt {
+        compiled = compiled.with_compile_receipt(receipt);
+    }
+    if let Some(work) = compile_work {
+        compiled = compiled.with_compile_work(work);
+    }
 
     debug!(
         target: targets::QUERY,
@@ -144,58 +302,35 @@ pub fn compile_statement_with_parameter_types(
         "Statement compilation pipeline completed"
     );
 
-    Ok(compiled)
-}
-
-fn compile_regular_statement(
-    ctx: &StatementContext,
-    optimized_plan: &mut paro_planner::plan::LogicalPlan,
-    statement_tag: &str,
-) -> Result<paro_execution::pipeline::StatementProgram> {
-    let arena_plan = match generate_typed_physical_plan(ctx, optimized_plan) {
-        Ok(plan) => plan,
-        Err(error) => {
-            error!(
-                target: targets::EXECUTOR,
-                statement_tag = %statement_tag,
-                error = %error,
-                stage = "physical_plan",
-                "Physical plan generation failed"
-            );
-            return Err(error);
-        }
-    };
-    match paro_execution::pipeline::StatementProgram::from_physical_plan(arena_plan) {
-        Ok(program) => Ok(program),
-        Err(error) => {
-            error!(
-                target: targets::EXECUTOR,
-                statement_tag = %statement_tag,
-                error = %error,
-                stage = "runtime_program",
-                "Runtime program generation failed"
-            );
-            Err(error)
-        }
+    if let Some(trace) = &statement_trace {
+        trace.record_event("compile", "compiler_return");
     }
-}
 
-fn generate_typed_physical_plan(
-    ctx: &StatementContext,
-    logical_plan: &mut paro_planner::plan::LogicalPlan,
-) -> Result<paro_execution::physical::PhysicalPlan> {
-    verify_physical_planner_invariants(&logical_plan.operator)?;
-    paro_execution::column_binding_resolver::ColumnBindingResolver::resolve(
-        &mut logical_plan.operator,
-    )?;
-    let mut generator = paro_execution::physical::PhysicalPlanGenerator::new(
-        paro_execution::physical::PlanBuildContext {
-            force_external: ctx.limits.force_external,
-            rowset_scan_pushdown: ctx.limits.rowset_scan_pushdown,
-            max_memory: ctx.limits.max_memory,
-            max_threads: ctx.limits.max_threads.max(1),
-            scan_access_cost: Default::default(),
-        },
-    );
-    generator.generate(logical_plan)
+    if let Some(capture) = &ctx.options.compile_capture {
+        use paro_context::compile_diagnostics::Observation::Observed;
+        capture.update(|r| {
+            r.finish_ns = Observed(runtime_image_started.elapsed().as_nanos() as u64);
+            r.compiler_ns =
+                Observed(capture_started.unwrap_or(started_at).elapsed().as_nanos() as u64);
+            if let (
+                Observed(total),
+                Observed(bind),
+                Observed(opt),
+                Observed(verify),
+                Observed(finish),
+            ) = (
+                r.compiler_ns,
+                r.bind_ns,
+                r.optimizer_ns,
+                r.verify_ns,
+                r.finish_ns,
+            ) {
+                r.compiler_other_ns = Observed(total.saturating_sub(bind + opt + verify + finish));
+            }
+            r.artifact = paro_context::compile_diagnostics::ArtifactStatus::CompiledArtifactReady;
+            r.artifact_identity = Observed(compiled.artifact_identity());
+            r.outcome = paro_context::compile_diagnostics::CompileOutcome::Success;
+        });
+    }
+    Ok(compiled)
 }

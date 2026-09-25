@@ -9,8 +9,8 @@ use std::sync::Arc;
 use crate::binder::plan::subquery::copy_subquery_top_level_plan;
 use crate::binder::CorrelatedColumnInfo;
 use crate::expression::{Expression, ExpressionIterator};
-use crate::operator::{ColumnBinding, LogicalOperator};
-use crate::plan::{LogicalPlan, PlannedStatement};
+use crate::logical::operator::{ColumnBinding, LogicalOperator};
+use crate::logical::plan::{OwnedLogicalPlan, PlannedStatement};
 
 pub type CorrelatedColumnMap = HashMap<ColumnBinding, usize>;
 
@@ -190,13 +190,9 @@ impl RewriteCorrelatedExpressions {
         });
     }
 
-    pub fn rewrite_logical_plan(&self, plan: LogicalPlan) -> LogicalPlan {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
-        LogicalPlan {
+    pub fn rewrite_logical_plan(&self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
+        let (id, stats, operator) = plan.into_parts();
+        OwnedLogicalPlan {
             id,
             stats,
             operator: self.rewrite_operator(operator),
@@ -301,7 +297,7 @@ impl RewriteCorrelatedExpressions {
                 LogicalOperator::EmptyResult(empty)
             }
             LogicalOperator::Join(join) => {
-                use crate::operator::Join;
+                use crate::logical::operator::Join;
                 match join {
                     Join::Comparison(mut comp) => {
                         comp.conditions = comp
@@ -408,6 +404,7 @@ impl RewriteCorrelatedExpressions {
             | LogicalOperator::RefreshPropertyGraph(_)
             | LogicalOperator::Drop(_)
             | LogicalOperator::CTERef(_)
+            | LogicalOperator::SubplanRef(_)
             | LogicalOperator::TableFunctionGet(_)
             | LogicalOperator::SearchScan(_)
             | LogicalOperator::FullTextFilterScan(_)
@@ -435,10 +432,10 @@ mod tests {
         ColumnRefExpression, ComparisonType, Expression, SubqueryExpression, SubqueryPlanningState,
         SubqueryType,
     };
-    use crate::operator::{DependentJoin, ExpressionGet, LogicalOperator};
-    use crate::plan::LogicalPlan;
+    use crate::logical::operator::{DependentJoin, ExpressionGet, LogicalOperator};
+    use crate::logical::plan::OwnedLogicalPlan;
     use crate::{
-        binder::context::BindContext, binder::CorrelatedColumnInfo, plan::PlannedStatement,
+        binder::context::BindContext, binder::CorrelatedColumnInfo, logical::plan::PlannedStatement,
     };
     use paro_common::types::LogicalType;
     use std::sync::Arc;
@@ -468,16 +465,14 @@ mod tests {
         map.insert(ColumnBinding::new(10, 0), 0);
         let rewriter = RewriteCorrelatedExpressions::new_shallow(ColumnBinding::new(99, 0), map, 1);
 
-        let matched = Expression::ColumnRef(ColumnRefExpression::with_depth(
-            ColumnBinding::new(10, 0),
-            LogicalType::Integer,
-            2,
-        ));
-        let deeper = Expression::ColumnRef(ColumnRefExpression::with_depth(
-            ColumnBinding::new(10, 0),
-            LogicalType::Integer,
-            3,
-        ));
+        let matched = Expression::ColumnRef(
+            ColumnRefExpression::with_depth(ColumnBinding::new(10, 0), LogicalType::Integer, 2)
+                .into(),
+        );
+        let deeper = Expression::ColumnRef(
+            ColumnRefExpression::with_depth(ColumnBinding::new(10, 0), LogicalType::Integer, 3)
+                .into(),
+        );
 
         match rewriter.rewrite_expression(matched) {
             Expression::ColumnRef(col_ref) => {
@@ -507,11 +502,9 @@ mod tests {
                 map.clone(),
                 lateral_depth,
             );
-            let expression = Expression::ColumnRef(ColumnRefExpression::with_depth(
-                binding,
-                LogicalType::Integer,
-                source_depth,
-            ));
+            let expression = Expression::ColumnRef(
+                ColumnRefExpression::with_depth(binding, LogicalType::Integer, source_depth).into(),
+            );
 
             let Expression::ColumnRef(rewritten) = rewriter.rewrite_expression(expression) else {
                 panic!("expected rewritten column ref");
@@ -532,7 +525,7 @@ mod tests {
             subquery: Arc::new(PlannedStatement {
                 types: vec![LogicalType::Integer],
                 names: vec!["c0".to_string()],
-                plan: LogicalPlan::new(&BindContext::new(), expression_get(20)),
+                plan: OwnedLogicalPlan::new(&BindContext::new(), expression_get(20)),
             }),
             children: vec![],
             child_types: vec![],
@@ -544,7 +537,7 @@ mod tests {
             planning_state: SubqueryPlanningState::Unplanned,
         };
 
-        match rewriter.rewrite_expression(Expression::Subquery(subquery)) {
+        match rewriter.rewrite_expression(Expression::Subquery(subquery.into())) {
             Expression::Subquery(rewritten) => {
                 assert_eq!(rewritten.correlated_columns[0].table_index, 99);
                 assert_eq!(rewritten.correlated_columns[0].column_index, 0);
@@ -565,7 +558,7 @@ mod tests {
             subquery: Arc::new(PlannedStatement {
                 types: vec![LogicalType::Integer],
                 names: vec!["c0".to_string()],
-                plan: LogicalPlan::new(&BindContext::new(), expression_get(20)),
+                plan: OwnedLogicalPlan::new(&BindContext::new(), expression_get(20)),
             }),
             children: vec![],
             child_types: vec![],
@@ -583,7 +576,7 @@ mod tests {
             planning_state: SubqueryPlanningState::Unplanned,
         };
 
-        match rewriter.rewrite_expression(Expression::Subquery(subquery)) {
+        match rewriter.rewrite_expression(Expression::Subquery(subquery.into())) {
             Expression::Subquery(rewritten) => {
                 assert_eq!(rewritten.correlated_columns[0].table_index, 99);
                 assert_eq!(rewritten.correlated_columns[0].column_index, 0);
@@ -604,7 +597,7 @@ mod tests {
             subquery: Arc::new(PlannedStatement {
                 types: vec![LogicalType::Integer],
                 names: vec!["c0".to_string()],
-                plan: LogicalPlan::new(&BindContext::new(), expression_get(20)),
+                plan: OwnedLogicalPlan::new(&BindContext::new(), expression_get(20)),
             }),
             children: vec![],
             child_types: vec![],
@@ -622,7 +615,7 @@ mod tests {
             planning_state: SubqueryPlanningState::Unplanned,
         };
 
-        match rewriter.rewrite_expression(Expression::Subquery(subquery)) {
+        match rewriter.rewrite_expression(Expression::Subquery(subquery.into())) {
             Expression::Subquery(rewritten) => {
                 assert_eq!(rewritten.correlated_columns[0].table_index, 77);
                 assert_eq!(rewritten.correlated_columns[0].column_index, 0);
@@ -640,17 +633,20 @@ mod tests {
             RewriteCorrelatedExpressions::new_recursive(ColumnBinding::new(99, 0), map, 0);
         let ctx = BindContext::new();
         let dep = DependentJoin::scalar(
-            LogicalPlan::new(&ctx, expression_get(1)),
-            LogicalPlan::new(
+            OwnedLogicalPlan::new(&ctx, expression_get(1)),
+            OwnedLogicalPlan::new(
                 &ctx,
-                LogicalOperator::Projection(crate::operator::Projection::new(
+                LogicalOperator::Projection(crate::logical::operator::Projection::new(
                     2,
-                    LogicalPlan::new(&ctx, expression_get(3)),
-                    vec![Expression::ColumnRef(ColumnRefExpression::with_depth(
-                        ColumnBinding::new(10, 0),
-                        LogicalType::Integer,
-                        2,
-                    ))],
+                    OwnedLogicalPlan::new(&ctx, expression_get(3)),
+                    vec![Expression::ColumnRef(
+                        ColumnRefExpression::with_depth(
+                            ColumnBinding::new(10, 0),
+                            LogicalType::Integer,
+                            2,
+                        )
+                        .into(),
+                    )],
                 )),
             ),
             vec![CorrelatedColumnInfo {
@@ -660,9 +656,10 @@ mod tests {
                 name: "corr".to_string(),
                 depth: 1,
             }],
+            None,
         );
 
-        match rewriter.rewrite_operator(LogicalOperator::DependentJoin(dep)) {
+        match rewriter.rewrite_operator(LogicalOperator::DependentJoin(Box::new(dep))) {
             LogicalOperator::DependentJoin(dep) => match &dep.right.operator {
                 LogicalOperator::Projection(proj) => match &proj.expressions[0] {
                     Expression::ColumnRef(col_ref) => {

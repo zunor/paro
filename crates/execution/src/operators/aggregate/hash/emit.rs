@@ -13,7 +13,9 @@ use paro_planner::expression::Expression;
 use paro_storage::row::RowSpillReader;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
-use crate::operators::aggregate::group_key_codec::{decode_group_columns, has_encoded_group_keys};
+use crate::operators::aggregate::group_key_codec::{
+    has_encoded_group_keys, project_aggregate_output,
+};
 use crate::operators::aggregate::output_filter::copy_selected_rows;
 use crate::operators::aggregate::post_reduction::PostAggregateFilterLocal;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::{
@@ -46,6 +48,7 @@ impl HashAggregateEmitSourceExec {
             handle,
             work: parking_lot::Mutex::new(None),
             work_count: AtomicUsize::new(0),
+            row_count: AtomicUsize::new(0),
         });
         if global.handle.is_finalized() {
             initialize_work(ctx.query, &global)?;
@@ -142,11 +145,6 @@ impl HashAggregateEmitSourceExec {
                 } => {
                     let encoded_groups = has_encoded_group_keys(&self.spec);
                     let projected_state = !self.spec.state_output_projection.is_empty();
-                    if encoded_groups && projected_state {
-                        return Err(paro_error::internal(
-                            "aggregate state projection cannot be combined with encoded group keys",
-                        ));
-                    }
                     let produced = if encoded_groups || projected_state {
                         let scan_types = table.scan_output_types();
                         let scratch = local
@@ -162,10 +160,8 @@ impl HashAggregateEmitSourceExec {
                             local.post_filter.as_mut(),
                             ctx.query,
                         )?;
-                        if produced && encoded_groups {
-                            decode_aggregate_output(&self.spec, scratch, output)?;
-                        } else if produced {
-                            project_aggregate_state_output(&self.spec, scratch, output)?;
+                        if produced {
+                            project_aggregate_output(&self.spec, scratch, output)?;
                         }
                         produced
                     } else {
@@ -234,18 +230,14 @@ impl HashAggregateEmitSourceExec {
                                     .get_or_insert(Chunk::try_new(output.allocator().clone())?);
                                 ensure_source_output(filtered, &scratch.types(), VECTOR_SIZE)?;
                                 copy_selected_rows(scratch, filtered, selection, selected_count)?;
-                                if has_encoded_group_keys(&self.spec) {
-                                    decode_aggregate_output(&self.spec, filtered, output)?;
-                                } else {
-                                    project_aggregate_state_output(&self.spec, filtered, output)?;
-                                }
+                                project_aggregate_output(&self.spec, filtered, output)?;
                             } else {
                                 copy_selected_rows(scratch, output, selection, selected_count)?;
                             }
-                        } else if has_encoded_group_keys(&self.spec) {
-                            decode_aggregate_output(&self.spec, scratch, output)?;
-                        } else if !self.spec.state_output_projection.is_empty() {
-                            project_aggregate_state_output(&self.spec, scratch, output)?;
+                        } else if has_encoded_group_keys(&self.spec)
+                            || !self.spec.state_output_projection.is_empty()
+                        {
+                            project_aggregate_output(&self.spec, scratch, output)?;
                         } else {
                             copy_spilled_output_rows(scratch, output)?;
                         }
@@ -257,53 +249,6 @@ impl HashAggregateEmitSourceExec {
             local.work = None;
         }
     }
-}
-
-fn project_aggregate_state_output(
-    spec: &AggregateSpec,
-    source: &Chunk,
-    output: &mut Chunk,
-) -> Result<()> {
-    if spec.state_output_projection.len() != spec.output_types.len() {
-        return Err(paro_error::internal(format!(
-            "aggregate state output projection width mismatch: projection={} output={}",
-            spec.state_output_projection.len(),
-            spec.output_types.len()
-        )));
-    }
-    if source.size() > output.capacity() {
-        return Err(paro_error::internal(format!(
-            "aggregate projected output is too small: rows={} capacity={}",
-            source.size(),
-            output.capacity()
-        )));
-    }
-    for (output_idx, &source_idx) in spec.state_output_projection.iter().enumerate() {
-        let source_column = source.column(source_idx).ok_or_else(|| {
-            paro_error::internal(format!(
-                "aggregate state projection source is out of bounds: output={output_idx} source={source_idx} columns={}",
-                source.column_count()
-            ))
-        })?;
-        let expected = spec
-            .output_types
-            .get(output_idx)
-            .ok_or_else(|| paro_error::internal("aggregate projected output type is missing"))?;
-        if source_column.logical_type() != expected {
-            return Err(paro_error::internal(format!(
-                "aggregate state projection type mismatch at output {output_idx}: expected={expected:?} actual={:?}",
-                source_column.logical_type()
-            )));
-        }
-        let output_column_count = output.column_count();
-        let output_column = output.data.get_mut(output_idx).ok_or_else(|| {
-            paro_error::internal(format!(
-                "aggregate projected output column is missing: index={output_idx} columns={output_column_count}",
-            ))
-        })?;
-        *output_column = Arc::clone(source_column);
-    }
-    output.try_set_cardinality(source.size())
 }
 
 fn scan_table_batch(
@@ -346,40 +291,6 @@ fn scan_table_batch(
     }
 }
 
-fn decode_aggregate_output(spec: &AggregateSpec, source: &Chunk, output: &mut Chunk) -> Result<()> {
-    decode_group_columns(spec, source, output)?;
-    let group_count = spec.grouping_key_count;
-    if source.column_count() < group_count + spec.aggregates.len() {
-        return Err(paro_error::internal(format!(
-            "encoded aggregate output is too narrow: groups={group_count}, aggregates={}, columns={}",
-            spec.aggregates.len(),
-            source.column_count()
-        )));
-    }
-    for aggregate_idx in 0..spec.aggregates.len() {
-        let column_idx = group_count + aggregate_idx;
-        let source_column = source.column(column_idx).ok_or_else(|| {
-            paro_error::internal(format!(
-                "encoded aggregate source column not found: index={column_idx}"
-            ))
-        })?;
-        let output_column = output.column(column_idx).ok_or_else(|| {
-            paro_error::internal(format!(
-                "decoded aggregate output column not found: index={column_idx}"
-            ))
-        })?;
-        if output_column.logical_type() != source_column.logical_type() {
-            return Err(paro_error::internal(format!(
-                "decoded aggregate output type mismatch at index {column_idx}: expected={:?}, actual={:?}",
-                output_column.logical_type(),
-                source_column.logical_type()
-            )));
-        }
-        output.data[column_idx] = Arc::clone(source_column);
-    }
-    output.try_set_cardinality(source.size())
-}
-
 fn initialize_work(
     query: &QueryRuntimeContext,
     global: &HashAggregateEmitSourceGlobal,
@@ -401,6 +312,8 @@ fn initialize_work(
         .unregister_reclaimer_by_name(&AggregateFinalizedStateReclaimer::name_for(&global.handle));
 
     let mut work = std::collections::VecDeque::new();
+    let mut row_count = 0usize;
+    let mut spilled = false;
     if let Some(state) = global.handle.take_state()? {
         let AggregateRuntimeState::Hash(state) = state else {
             return Err(paro_error::internal(
@@ -408,6 +321,7 @@ fn initialize_work(
             ));
         };
         if let Some(spilled_outputs) = state.spilled_outputs {
+            spilled = true;
             for (grouping_idx, output) in spilled_outputs.into_iter().enumerate() {
                 if let Some(output) = output {
                     work.push_back(HashAggregateEmitWork::Spilled {
@@ -418,7 +332,14 @@ fn initialize_work(
             }
         } else {
             for (grouping_idx, table) in state.tables.into_iter().enumerate() {
-                for table in table.into_scan_partitions() {
+                row_count = row_count.saturating_add(table.count());
+                let bundle = table.into_scan_partitions();
+                debug_assert_eq!(
+                    bundle.hash_runtime_stats,
+                    Default::default(),
+                    "aggregate hash runtime observations must be drained before emit"
+                );
+                for table in bundle.partitions {
                     work.push_back(HashAggregateEmitWork::Table {
                         grouping_idx,
                         table,
@@ -427,6 +348,12 @@ fn initialize_work(
             }
         }
     }
+    if spilled {
+        // A spilled reader does not expose cardinality without consuming its
+        // stream. Preserve work-unit parallelism rather than guessing low.
+        row_count = work.len().saturating_mul(VECTOR_SIZE);
+    }
+    global.row_count.store(row_count, Ordering::Release);
     global.work_count.store(work.len(), Ordering::Release);
     *shared_work = Some(work);
     Ok(())

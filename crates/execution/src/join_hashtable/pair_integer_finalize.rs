@@ -5,7 +5,7 @@
 
 use paro_common::error::{ErrorClass, Result};
 use paro_common::types::LogicalType;
-use paro_planner::operator::join::JoinComparisonType;
+use paro_planner::logical::operator::join::JoinComparisonType;
 
 use super::super::pair_integer_index::ExactI64PairJoinIndex;
 use super::JoinHashTable;

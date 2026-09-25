@@ -18,6 +18,7 @@ _ROUTINE_ID_RE = re.compile(r"(\bRoutine(?:s)?:\s+[^\[]+)\[(\d+)@(\d+)\]")
 _SEARCH_EXPLAIN_ID_RE = re.compile(
     r"(\bSearch (Definition|Generation|Root):\s*)\d+\b"
 )
+_CTE_EXPLAIN_ID_RE = re.compile(r"(\bCTE Index:\s*)(\d+)\b")
 _EXTERNAL_LATENCY_RE = re.compile(
     r"Latency\(us\):\s*acquire=\d+\s+queue=\d+\s+kernel=\d+\s+encode_decode=\d+"
 )
@@ -28,6 +29,7 @@ _OPTIONAL_SCHEDULER_RUNTIME_RE = re.compile(
 )
 _JSON_OPERATOR_TIMING_RE = re.compile(r'"(startup_time_ms|total_time_ms)"\s*:\s*[\d.]+')
 _JSON_OPERATOR_COUNTERS_RE = re.compile(r'"(rows|loops)"\s*:\s*\d+')
+_LOGICAL_NODE_ID_RE = re.compile(r'("logical_node_id"\s*:\s*|\blogical_node_id=)(\d+)')
 _PROFILE_LINE_RE = re.compile(
     r"PROFILE schema_version=(\d+) query_id=\d+ events=\d+ "
     r"parallelism=\d+ workers=\d+ worker_utilization=[\d.]+ "
@@ -57,6 +59,14 @@ _RUNTIME_KEY_VALUE_BYTES_RE = re.compile(
     r"\b(spilled_bytes|peak_memory_bytes|temp_storage_bytes|grant_bytes|"
     r"revocable_bytes|revoked_bytes|spill_bytes)=\d+\b"
 )
+_ADAPTIVE_RUNTIME_COUNTER_RE = re.compile(
+    r"\b(aggregate_hash_full_key_fallback_count|"
+    r"aggregate_hash_max_prefix_probe_distance)=\d+\b"
+)
+_JSON_ADAPTIVE_RUNTIME_COUNTER_RE = re.compile(
+    r'"(aggregate_hash_full_key_fallback_count|'
+    r'aggregate_hash_max_prefix_probe_distance)"\s*:\s*\d+'
+)
 _COPY_ROWCOUNT_RE = re.compile(r"^COPY\s+\d+$")
 _TXN_NUMERIC_ID_RE = re.compile(
     r"\b(TxnId|ReadTs|CommitTs|TableId|DatabaseId)\(\d+\)"
@@ -67,6 +77,31 @@ _REGRESS_PATH_RE = re.compile(
     r"(?<!<repo>)/(?:[^'\"\s)]+/)*regress/(?:report/fixtures|fixtures)/[^'\"\s)]+"
 )
 _PYTHON_RETRY_HINT_RE = re.compile(r"next automatic Python runtime probe in \d+ ms")
+_OUTPUT_SCHEMA_RE = re.compile(r"^(\s*Output Schema:\s*)(.*)$")
+
+
+def _split_top_level_commas(value: str) -> list[str]:
+    """Split an EXPLAIN schema without splitting nested type parameters."""
+    fields: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    for index, char in enumerate(value):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char in "([<{":
+            depth += 1
+        elif char in ")]>}":
+            depth = max(depth - 1, 0)
+        elif char == "," and depth == 0:
+            fields.append(value[start:index].strip())
+            start = index + 1
+    fields.append(value[start:].strip())
+    return fields
 
 
 def normalize_explain_operator_timing(lines: list[str]) -> list[str]:
@@ -128,6 +163,20 @@ def normalize_explain_runtime_bytes(lines: list[str]) -> list[str]:
     return result
 
 
+def normalize_explain_adaptive_runtime(lines: list[str]) -> list[str]:
+    """Preserve adaptive-runtime telemetry fields without pinning heuristics."""
+    result: list[str] = []
+    for line in lines:
+        line = _ADAPTIVE_RUNTIME_COUNTER_RE.sub(
+            lambda m: f"{m.group(1)}=<adaptive>", line
+        )
+        line = _JSON_ADAPTIVE_RUNTIME_COUNTER_RE.sub(
+            lambda m: f'"{m.group(1)}": "<adaptive>"', line
+        )
+        result.append(line)
+    return result
+
+
 def normalize_explain_routine_ids(lines: list[str]) -> list[str]:
     """Normalize volatile catalog ids embedded in EXPLAIN routine labels."""
     result: list[str] = []
@@ -147,6 +196,30 @@ def normalize_explain_search_ids(lines: list[str]) -> list[str]:
     return [_SEARCH_EXPLAIN_ID_RE.sub(_replace, line) for line in lines]
 
 
+def normalize_explain_logical_ids(lines: list[str]) -> list[str]:
+    """Alpha-rename IDs in text/JSON, preserving presence and alias relations."""
+    canonical_ids: dict[str, int] = {}
+
+    def _replace(match: re.Match[str]) -> str:
+        raw_id = match.group(2)
+        canonical_id = canonical_ids.setdefault(raw_id, len(canonical_ids) + 1)
+        return f'{match.group(1)}{canonical_id}'
+
+    return [_LOGICAL_NODE_ID_RE.sub(_replace, line) for line in lines]
+
+
+def normalize_explain_cte_ids(lines: list[str]) -> list[str]:
+    """Normalize allocated CTE ids while preserving identity relationships."""
+    canonical_ids: dict[str, int] = {}
+
+    def _replace(match: re.Match[str]) -> str:
+        raw_id = match.group(2)
+        canonical_id = canonical_ids.setdefault(raw_id, len(canonical_ids) + 1)
+        return f"{match.group(1)}<cte-{canonical_id}>"
+
+    return [_CTE_EXPLAIN_ID_RE.sub(_replace, line) for line in lines]
+
+
 def normalize_explain_external_runtime(lines: list[str]) -> list[str]:
     """Normalize volatile external runtime latency fields in EXPLAIN output."""
     result: list[str] = []
@@ -156,6 +229,19 @@ def normalize_explain_external_runtime(lines: list[str]) -> list[str]:
             line,
         )
         result.append(line)
+    return result
+
+
+def normalize_explain_schema_order(lines: list[str]) -> list[str]:
+    """Canonicalize the unordered relational schema shown by verbose EXPLAIN."""
+    result: list[str] = []
+    for line in lines:
+        match = _OUTPUT_SCHEMA_RE.match(line)
+        if match is None:
+            result.append(line)
+            continue
+        fields = _split_top_level_commas(match.group(2))
+        result.append(f"{match.group(1)}{', '.join(sorted(fields))}")
     return result
 
 
@@ -227,17 +313,24 @@ def normalize_python_runtime_retry_hint(lines: list[str]) -> list[str]:
 # stable: normalize per-operator timing volatility.
 # stable: normalize summary timing volatility.
 # stable: normalize runtime byte volatility for spill/memory observability.
+# stable: normalize adaptive counters while preserving telemetry presence.
 # stable: normalize repo-local regress fixture/report absolute paths.
 # stable: normalize volatile transaction/catalog ids in concurrency errors.
 # stable: normalize volatile search definition/generation/root ids in EXPLAIN output.
+# stable: normalize per-bind logical node ids while preserving plan order.
+# stable: normalize allocated CTE ids while preserving repeated-id equality.
 # transitional: legacy alias kept for gradual migration from explain_runtime.
 NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_operator_timing": normalize_explain_operator_timing,
     "explain_operator_counters": normalize_explain_operator_counters,
     "explain_summary_timing": normalize_explain_summary_timing,
     "explain_runtime_bytes": normalize_explain_runtime_bytes,
+    "explain_adaptive_runtime": normalize_explain_adaptive_runtime,
     "explain_routine_ids": normalize_explain_routine_ids,
     "explain_search_ids": normalize_explain_search_ids,
+    "explain_logical_ids": normalize_explain_logical_ids,
+    "explain_schema_order": normalize_explain_schema_order,
+    "explain_cte_ids": normalize_explain_cte_ids,
     "explain_external_runtime": normalize_explain_external_runtime,
     "explain_runtime": normalize_explain_runtime,
     "copy_rowcount": normalize_copy_rowcount,
@@ -275,11 +368,14 @@ __all__ = [
     "normalize_explain_operator_counters",
     "normalize_explain_operator_timing",
     "normalize_copy_rowcount",
+    "normalize_explain_adaptive_runtime",
+    "normalize_explain_cte_ids",
     "normalize_explain_external_runtime",
     "normalize_explain_routine_ids",
     "normalize_explain_runtime",
     "normalize_explain_runtime_bytes",
     "normalize_explain_search_ids",
+    "normalize_explain_schema_order",
     "normalize_explain_summary_timing",
     "normalize_python_runtime_retry_hint",
     "normalize_regress_paths",

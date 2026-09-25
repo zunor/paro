@@ -652,6 +652,11 @@ impl Display for Statement {
                             .iter()
                             .map(|opt| {
                                 match opt {
+                                    ExplainOption::Compile => "COMPILE",
+                                    ExplainOption::Analyze => "ANALYZE",
+                                    ExplainOption::Detail => "DETAIL",
+                                    ExplainOption::FormatText => "FORMAT TEXT",
+                                    ExplainOption::FormatJson => "FORMAT JSON",
                                     ExplainOption::Verbose => "VERBOSE",
                                     ExplainOption::Logical => "LOGICAL",
                                     ExplainOption::Optimized => "OPTIMIZED",

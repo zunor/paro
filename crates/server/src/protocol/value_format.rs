@@ -12,7 +12,11 @@ use paro_common::runtime_value::{
 };
 use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::{DecodedVectorRef, Vector};
-use tokio_util::bytes::BytesMut;
+use paro_session::append_binary_value;
+use tokio_util::bytes::{BufMut, BytesMut};
+
+const PG_EPOCH_UNIX_DAYS: i32 = 10_957;
+const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 
 /// A formatting target that writes directly into a PostgreSQL message buffer.
 ///
@@ -63,6 +67,143 @@ pub(crate) struct TextVectorEncoder<'a> {
     direct_utf8: bool,
     integer_buffer: itoa::Buffer,
     float_buffer: ryu::Buffer,
+}
+
+/// A decoded vector view for allocation-free PostgreSQL binary row encoding.
+pub(crate) struct BinaryVectorEncoder<'a> {
+    vector: &'a Vector,
+    decoded: DecodedVectorRef<'a>,
+}
+
+impl<'a> BinaryVectorEncoder<'a> {
+    pub(crate) fn try_new(vector: &'a Vector, row_count: usize) -> Result<Self> {
+        Ok(Self {
+            vector,
+            decoded: vector.try_decode_ref(row_count)?,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn is_null(&self, row_idx: usize) -> bool {
+        !self.decoded.is_valid(row_idx)
+    }
+
+    pub(crate) fn encoded_bytes_hint(&self, row_count: usize) -> usize {
+        let per_row = match self.vector.logical_type() {
+            LogicalType::Boolean => 1,
+            LogicalType::TinyInt | LogicalType::UTinyInt | LogicalType::SmallInt => 2,
+            LogicalType::Integer
+            | LogicalType::USmallInt
+            | LogicalType::Float
+            | LogicalType::Date => 4,
+            LogicalType::BigInt
+            | LogicalType::UInteger
+            | LogicalType::Double
+            | LogicalType::Timestamp
+            | LogicalType::TimestampTz => 8,
+            LogicalType::Uuid => 16,
+            LogicalType::HugeInt
+            | LogicalType::UBigInt
+            | LogicalType::UHugeInt
+            | LogicalType::Decimal { .. } => 24,
+            LogicalType::Varchar | LogicalType::VarcharCollation(_) | LogicalType::Json => 24,
+            LogicalType::Blob => 16,
+            _ => 32,
+        };
+        row_count.saturating_mul(per_row)
+    }
+
+    pub(crate) fn append_non_null(&self, buffer: &mut BytesMut, row_idx: usize) -> Result<()> {
+        debug_assert!(!self.is_null(row_idx));
+        match self.vector.logical_type() {
+            LogicalType::Boolean => buffer.put_u8(unsafe { self.fixed::<u8>(row_idx) }),
+            LogicalType::TinyInt => buffer.put_i16(i16::from(unsafe { self.fixed::<i8>(row_idx) })),
+            LogicalType::UTinyInt => {
+                buffer.put_i16(i16::from(unsafe { self.fixed::<u8>(row_idx) }))
+            }
+            LogicalType::SmallInt => buffer.put_i16(unsafe { self.fixed::<i16>(row_idx) }),
+            LogicalType::Integer => buffer.put_i32(unsafe { self.fixed::<i32>(row_idx) }),
+            LogicalType::USmallInt => {
+                buffer.put_i32(i32::from(unsafe { self.fixed::<u16>(row_idx) }))
+            }
+            LogicalType::BigInt => buffer.put_i64(unsafe { self.fixed::<i64>(row_idx) }),
+            LogicalType::UInteger => {
+                buffer.put_i64(i64::from(unsafe { self.fixed::<u32>(row_idx) }))
+            }
+            LogicalType::Float => buffer.put_f32(unsafe { self.fixed::<f32>(row_idx) }),
+            LogicalType::Double => buffer.put_f64(unsafe { self.fixed::<f64>(row_idx) }),
+            LogicalType::Varchar | LogicalType::VarcharCollation(_) | LogicalType::Json => {
+                buffer.put_slice(unsafe { self.fixed::<StringView>(row_idx) }.as_bytes())
+            }
+            LogicalType::Blob => {
+                buffer.put_slice(unsafe { self.fixed::<StringView>(row_idx) }.as_bytes())
+            }
+            LogicalType::Uuid => buffer.put_u128(unsafe { self.fixed::<u128>(row_idx) }),
+            LogicalType::Date => {
+                let days = unsafe { self.fixed::<i32>(row_idx) };
+                buffer.put_i32(
+                    days.checked_sub(PG_EPOCH_UNIX_DAYS)
+                        .ok_or_else(|| paro_error::invalid_value("date", days.to_string()))?,
+                );
+            }
+            LogicalType::Timestamp => {
+                buffer.put_i64(pg_timestamp_micros(unsafe { self.fixed::<i64>(row_idx) })?);
+            }
+            LogicalType::TimestampTz => {
+                buffer.put_i64(pg_timestamp_micros(unsafe { self.fixed::<i64>(row_idx) })?);
+            }
+            LogicalType::HugeInt => append_binary_value(
+                buffer,
+                &Value::HugeInt(unsafe { self.fixed::<i128>(row_idx) }),
+                self.vector.logical_type(),
+            )?,
+            LogicalType::UBigInt => append_binary_value(
+                buffer,
+                &Value::UBigInt(unsafe { self.fixed::<u64>(row_idx) }),
+                self.vector.logical_type(),
+            )?,
+            LogicalType::UHugeInt => append_binary_value(
+                buffer,
+                &Value::UHugeInt(unsafe { self.fixed::<u128>(row_idx) }),
+                self.vector.logical_type(),
+            )?,
+            LogicalType::Decimal { precision, scale } => {
+                let value = if *precision <= 18 {
+                    i128::from(unsafe { self.fixed::<i64>(row_idx) })
+                } else {
+                    unsafe { self.fixed::<i128>(row_idx) }
+                };
+                append_binary_value(
+                    buffer,
+                    &Value::Decimal(value, *precision, *scale),
+                    self.vector.logical_type(),
+                )?;
+            }
+            _ => append_binary_value(
+                buffer,
+                &self.vector.get_value(row_idx),
+                self.vector.logical_type(),
+            )?,
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// Logical-type dispatch must request the vector's physical type and the
+    /// row must belong to this decoded batch.
+    #[inline]
+    unsafe fn fixed<T: Copy>(&self, row_idx: usize) -> T {
+        unsafe { self.decoded.get_value::<T>(row_idx) }
+    }
+}
+
+fn pg_timestamp_micros(micros: i64) -> Result<i64> {
+    if matches!(micros, i64::MIN | i64::MAX) {
+        return Ok(micros);
+    }
+    micros
+        .checked_sub(PG_EPOCH_UNIX_MICROS)
+        .ok_or_else(|| paro_error::invalid_value("timestamp", micros.to_string()))
 }
 
 impl<'a> TextVectorEncoder<'a> {

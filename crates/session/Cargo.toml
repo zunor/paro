@@ -22,6 +22,7 @@ paro-journal = { workspace = true }
 paro-parser = { workspace = true }
 paro-planner = { workspace = true }
 paro-execution = { workspace = true }
+paro-optimizer = { workspace = true }
 paro-function = { workspace = true }
 paro-external = { workspace = true }
 paro-storage = { workspace = true }

@@ -17,6 +17,7 @@ use paro_function::scalar::FunctionExecContext;
 use paro_storage::buffer::BufferPool;
 use paro_storage::row::{RowSpillWriter, RowStoreSpillWriter};
 
+use crate::explain::profiler::OperatorProfiler;
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::aggregate::aggregate_kernel::{
@@ -27,10 +28,11 @@ use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
 #[cfg(test)]
 use crate::operators::aggregate::build_helpers::build_groups_chunk;
 use crate::operators::aggregate::build_helpers::{
-    aggregate_objects, can_skip_regular_aggregate_sink, create_hash_aggregate_tables,
-    group_payload_refs, group_types, has_aggregate_distinct, has_aggregate_ordered,
-    normalized_grouping_sets, projected_payload_chunk, query_hash_table_memory,
-    query_modifier_memory, update_hash_aggregate_tables, update_hash_aggregate_tables_with_scratch,
+    aggregate_objects, build_groups_chunk_for_set, can_skip_regular_aggregate_sink,
+    create_hash_aggregate_tables, group_payload_refs, group_types, has_aggregate_distinct,
+    has_aggregate_ordered, normalized_grouping_sets, projected_payload_chunk,
+    query_hash_table_memory, query_modifier_memory, update_hash_aggregate_tables,
+    update_hash_aggregate_tables_with_growth_plans,
 };
 use crate::operators::aggregate::distinct_helpers::{
     collect_distinct_rows, finalize_distinct_into_tables,
@@ -38,6 +40,7 @@ use crate::operators::aggregate::distinct_helpers::{
 use crate::operators::aggregate::distinct_state::DistinctAggregateState;
 use crate::operators::aggregate::group_hash::{hash_group_columns, GroupHashScratch};
 use crate::operators::aggregate::group_key_codec::GroupKeyEncoder;
+use crate::operators::aggregate::grouped_aggregate_hashtable::AggregateHashRuntimeStats;
 use crate::operators::aggregate::ordered_helpers::{
     collect_ordered_rows, empty_ordered_collectors_with_memory, finalize_ordered_into_hash_tables,
     merge_ordered_collectors,
@@ -50,7 +53,7 @@ use crate::operators::aggregate::post_reduction::PostAggregateReducer;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::operators::aggregate::row_format::AggregateGroupFormat;
 use crate::operators::sort::build::query_has_temporary_directory;
-use crate::physical::specs::AggregateSpec;
+use crate::physical::specs::{AggregateSpec, SpillExecutionPolicy};
 use crate::runtime::breaker::aggregate::AggregateSpilledOutput;
 use crate::runtime::breaker::{
     AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer, AggregateHandle,
@@ -63,11 +66,21 @@ use crate::runtime::state::{
     BreakerHandleGlobal, HashAggregateBuildSinkLocal, SinkGlobal, SinkLocal,
 };
 
+mod grouping_set_spill;
+
+use grouping_set_spill::{append_payload_to_local_spills, spill_grouping_set_payloads_to_outputs};
+
 use super::distinct_finalize::prepare_parallel_distinct_finalize;
 use super::merge_finalize::prepare_parallel_radix_merge;
 
 const HASH_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD: usize =
     paro_storage::buffer::DEFAULT_BLOCK_ALLOC_SIZE * 4;
+const HASH_AGGREGATE_MIN_ADAPTIVE_BUILD_CAPACITY: usize = 8 * 1024 * 1024;
+
+#[inline]
+fn admitted_parallelism(query: &crate::runtime::context::QueryRuntimeContext) -> usize {
+    query.max_parallel_tasks()
+}
 
 /// Sink operator that builds hash aggregate tables (one per grouping set).
 #[derive(Debug, Clone)]
@@ -80,12 +93,17 @@ impl HashAggregateBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         self.spec.verify_post_reduction()?;
         let handle = ctx.handles.get(self.handle)?;
-        if hash_aggregate_external_payload_spill_requested(ctx.query, &self.spec)
-            && !query_has_temporary_directory(ctx.query)
-        {
-            return Err(paro_error::out_of_memory(
-                "force_external hash aggregate requires a temporary directory",
-            ));
+        if hash_aggregate_external_payload_spill_requested(&self.spec) {
+            if !hash_aggregate_payload_spill_supported(&self.spec) {
+                return Err(paro_error::internal(
+                    "optimizer selected forced spill for a hash aggregate without an executable spill path",
+                ));
+            }
+            if !query_has_temporary_directory(ctx.query) {
+                return Err(paro_error::out_of_memory(
+                    "forced-spill hash aggregate requires a temporary directory",
+                ));
+            }
         }
         let group_refs = group_payload_refs(&self.spec)?;
         handle.initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
@@ -138,12 +156,14 @@ impl HashAggregateBuildSinkExec {
                     &self.spec,
                     ctx.query.allocator(MemoryTag::HashTable),
                     query_hash_table_memory(ctx.query),
-                    ctx.query.session.number_of_threads(),
+                    admitted_parallelism(ctx.query),
                 )?
             },
         ));
         let raw_payload_spill_requested = Arc::new(AtomicBool::new(raw_payload_spill_enabled));
         let state_spill = Arc::new(parking_lot::Mutex::new(None));
+        let hash_runtime_stats =
+            Arc::new(parking_lot::Mutex::new(AggregateHashRuntimeStats::default()));
         let (
             local_build_reclaimer_name,
             local_payload_spill_reclaimer_name,
@@ -157,7 +177,8 @@ impl HashAggregateBuildSinkExec {
             ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
                 AggregateLocalBuildCompactionReclaimer::new(&handle, local_id, Arc::clone(&tables)),
             ));
-            let payload_spill_name = if hash_aggregate_payload_spill_supported(&self.spec)
+            let payload_spill_name = if self.spec.spill_policy != SpillExecutionPolicy::InMemory
+                && hash_aggregate_payload_spill_supported(&self.spec)
                 && query_has_temporary_directory(ctx.query)
             {
                 let name = AggregateLocalPayloadSpillReclaimer::name_for(&handle, local_id);
@@ -167,38 +188,43 @@ impl HashAggregateBuildSinkExec {
                         local_id,
                         Arc::clone(&tables),
                         Arc::clone(&raw_payload_spill_requested),
+                        Arc::clone(&hash_runtime_stats),
                     ),
                 ));
                 Some(name)
             } else {
                 None
             };
-            let state_spill_name =
-                if hash_aggregate_state_spill_supported(&self.spec, &aggregate_objects)
-                    && query_has_temporary_directory(ctx.query)
-                {
-                    let state_width = AggregateStateLayout::new(&aggregate_objects)?.total_size();
-                    let state_encoding = hash_aggregate_state_spill_encoding(&aggregate_objects);
-                    let name = AggregateLocalStateSpillReclaimer::name_for(&handle, local_id);
-                    ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
-                        AggregateLocalStateSpillReclaimer::new(
-                            &handle,
-                            local_id,
-                            Arc::clone(&tables),
-                            Arc::clone(&state_spill),
-                            Arc::clone(&raw_payload_spill_requested),
-                            ctx.query.session.buffer_pool().clone(),
-                            group_types(&self.spec)?,
-                            state_width,
-                            state_encoding,
-                            aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
-                            query_hash_table_memory(ctx.query),
+            let state_spill_name = if self.spec.spill_policy != SpillExecutionPolicy::InMemory
+                && hash_aggregate_state_spill_supported(&self.spec, &aggregate_objects)
+                && query_has_temporary_directory(ctx.query)
+            {
+                let state_width = AggregateStateLayout::new(&aggregate_objects)?.total_size();
+                let state_encoding = hash_aggregate_state_spill_encoding(&aggregate_objects);
+                let name = AggregateLocalStateSpillReclaimer::name_for(&handle, local_id);
+                ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+                    AggregateLocalStateSpillReclaimer::new(
+                        &handle,
+                        local_id,
+                        Arc::clone(&tables),
+                        Arc::clone(&state_spill),
+                        Arc::clone(&raw_payload_spill_requested),
+                        Arc::clone(&hash_runtime_stats),
+                        ctx.query.session.buffer_pool().clone(),
+                        group_types(&self.spec)?,
+                        state_width,
+                        state_encoding,
+                        aggregate_spill_radix_bits(
+                            admitted_parallelism(ctx.query),
+                            ctx.query.memory.capacity_bytes(),
                         ),
-                    ));
-                    Some(name)
-                } else {
-                    None
-                };
+                        query_hash_table_memory(ctx.query),
+                    ),
+                ));
+                Some(name)
+            } else {
+                None
+            };
             (
                 Some(build_name),
                 payload_spill_name,
@@ -248,13 +274,16 @@ impl HashAggregateBuildSinkExec {
                 ctx.query.allocator(MemoryTag::HashTable),
             )?,
             tables,
+            hash_runtime_stats,
             local_build_reclaimer_name,
             local_payload_spill_reclaimer_name,
             local_state_spill_reclaimer_name,
             query_memory,
             raw_payload_spill_enabled,
             raw_payload_spill_requested,
-            payload_spill: None,
+            payload_spills: (0..normalized_grouping_sets(&self.spec)?.len())
+                .map(|_| None)
+                .collect(),
             state_spill,
             ordered_collectors: empty_ordered_collectors_with_memory(
                 &self.spec,
@@ -297,10 +326,74 @@ impl HashAggregateBuildSinkExec {
         let groups = local
             .group_key_encoder
             .encode_payload(payload, &local.group_refs)?;
+        let skip_regular_sink =
+            can_skip_regular_aggregate_sink(&self.spec, &local.aggregate_objects);
+        // Prepare a hash-table growth transition without holding the table
+        // owner lock. The reservation covers allocator old/new overlap; if it
+        // cannot be established, an adaptive implementation switches this
+        // and subsequent input to its admitted raw-payload spill path.
+        let (mut growth_plans, persistent_growth, growth_overlap) = if skip_regular_sink
+            || local.raw_payload_spill_enabled
+            || local.raw_payload_spill_requested.load(Ordering::Acquire)
+        {
+            (Vec::new(), 0usize, 0usize)
+        } else {
+            let mut tables = local.tables.lock();
+            if tables.len() != local.grouping_sets.len() {
+                return Err(paro_error::internal(
+                    "aggregate growth planning lost a grouping-set table",
+                ));
+            }
+            let mut plans = Vec::with_capacity(tables.len());
+            let mut persistent = 0usize;
+            let mut overlap = 0usize;
+            for (table, grouping_set) in tables.iter_mut().zip(local.grouping_sets.iter()) {
+                let table_groups =
+                    build_groups_chunk_for_set(groups, grouping_set, self.spec.grouping_key_count)?;
+                let (plan, requirement) =
+                    table.growth_plan(&table_groups, &mut local.group_hash_scratch)?;
+                persistent = persistent
+                    .checked_add(requirement.persistent_bytes)
+                    .ok_or_else(|| paro_error::internal("aggregate persistent growth overflow"))?;
+                overlap = overlap.max(requirement.overlap_bytes);
+                plans.push(plan);
+            }
+            (plans, persistent, overlap)
+        };
+        let growth_reservation_bytes = persistent_growth
+            .checked_add(growth_overlap)
+            .ok_or_else(|| paro_error::internal("aggregate transition reservation overflow"))?;
+        let growth_reservation = if growth_reservation_bytes == 0 {
+            None
+        } else {
+            match query_hash_table_memory(ctx.query)
+                .with_class(paro_common::memory::MemoryAccountingClass::Metadata)
+                .reserve_grant(growth_reservation_bytes)
+            {
+                Ok(reservation) => Some(reservation),
+                Err(_error)
+                    if self.spec.spill_policy != SpillExecutionPolicy::InMemory
+                        && hash_aggregate_payload_spill_supported(&self.spec)
+                        && query_has_temporary_directory(ctx.query) =>
+                {
+                    local
+                        .raw_payload_spill_requested
+                        .store(true, Ordering::Release);
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         if local.raw_payload_spill_enabled
             || local.raw_payload_spill_requested.load(Ordering::Acquire)
         {
-            append_payload_to_local_spill(ctx, payload, groups, &mut local.payload_spill)?;
+            append_payload_to_local_spills(
+                ctx,
+                payload,
+                groups,
+                &local.grouping_sets,
+                &mut local.payload_spills,
+            )?;
             local.activate_raw_payload_spill_if_requested();
             return Ok(SinkPoll::NeedMoreInput);
         }
@@ -310,7 +403,7 @@ impl HashAggregateBuildSinkExec {
                 &local.aggregate_objects,
                 payload,
                 groups,
-                ctx.query.session.number_of_threads(),
+                admitted_parallelism(ctx.query),
                 ctx.query.memory.capacity_bytes(),
                 &local.modifier_memory,
                 &mut local.distinct,
@@ -325,7 +418,7 @@ impl HashAggregateBuildSinkExec {
                 &mut local.ordered_collectors,
             )?;
         }
-        if can_skip_regular_aggregate_sink(&self.spec, &local.aggregate_objects) {
+        if skip_regular_sink {
             return Ok(SinkPoll::NeedMoreInput);
         }
         let tables_ref = Arc::clone(&local.tables);
@@ -334,11 +427,27 @@ impl HashAggregateBuildSinkExec {
             || local.raw_payload_spill_requested.load(Ordering::Acquire)
         {
             drop(tables);
-            append_payload_to_local_spill(ctx, payload, groups, &mut local.payload_spill)?;
+            append_payload_to_local_spills(
+                ctx,
+                payload,
+                groups,
+                &local.grouping_sets,
+                &mut local.payload_spills,
+            )?;
             local.activate_raw_payload_spill_if_requested();
             return Ok(SinkPoll::NeedMoreInput);
         }
-        update_hash_aggregate_tables_with_scratch(
+        if let Some(reservation) = growth_reservation.as_ref() {
+            if growth_plans.len() != tables.len() {
+                return Err(paro_error::internal(
+                    "aggregate growth preparation lost a table plan",
+                ));
+            }
+            for (table, plan) in tables.iter_mut().zip(growth_plans.iter()) {
+                table.prepare_growth(plan, reservation)?;
+            }
+        }
+        update_hash_aggregate_tables_with_growth_plans(
             &self.spec,
             &local.aggregate_objects,
             payload,
@@ -346,15 +455,17 @@ impl HashAggregateBuildSinkExec {
             &local.grouping_sets,
             &mut tables,
             &mut local.group_hash_scratch,
+            &mut growth_plans,
             &mut local.addresses,
             &mut local.new_groups,
         )?;
+        drop(growth_reservation);
         Ok(SinkPoll::NeedMoreInput)
     }
 
     pub(crate) fn merge_local(
         &self,
-        _ctx: &mut OperatorCallContext,
+        ctx: &mut OperatorCallContext,
         global: &SinkGlobal,
         local: &mut SinkLocal,
     ) -> Result<MergePoll> {
@@ -369,6 +480,17 @@ impl HashAggregateBuildSinkExec {
             ));
         };
         local.activate_raw_payload_spill_if_requested();
+        let local_hash_runtime_stats = {
+            let mut tables = local.tables.lock();
+            let mut stats = std::mem::take(&mut *local.hash_runtime_stats.lock());
+            stats.merge(drain_aggregate_hash_runtime(&mut tables));
+            stats
+        };
+        record_aggregate_hash_runtime_stats(
+            ctx.profiler,
+            ctx.operator.index() as u64,
+            local_hash_runtime_stats,
+        );
         if local.raw_payload_spill_enabled() {
             global.handle.with_state_mut(|state| {
                 let AggregateRuntimeState::Hash(global) = state else {
@@ -376,8 +498,12 @@ impl HashAggregateBuildSinkExec {
                         "aggregate handle does not contain hash aggregate state",
                     ));
                 };
-                if let Some(spill) = local.payload_spill.take() {
-                    global.spilled_payloads.push(spill.seal());
+                for (grouping_idx, spill) in local.payload_spills.iter_mut().enumerate() {
+                    if let Some(spill) = spill.take() {
+                        global
+                            .spilled_payloads
+                            .push(spill.seal_for_grouping(grouping_idx));
+                    }
                 }
                 if let Some(spill) = local.state_spill.lock().take() {
                     global.spilled_states.push(spill.seal());
@@ -409,8 +535,12 @@ impl HashAggregateBuildSinkExec {
                 merge_pending_radix_tables(global)?;
                 merge_local_tables(&mut global.tables, &mut local_tables)?;
             }
-            if let Some(spill) = local.payload_spill.take() {
-                global.spilled_payloads.push(spill.seal());
+            for (grouping_idx, spill) in local.payload_spills.iter_mut().enumerate() {
+                if let Some(spill) = spill.take() {
+                    global
+                        .spilled_payloads
+                        .push(spill.seal_for_grouping(grouping_idx));
+                }
             }
             if let Some(spill) = local.state_spill.lock().take() {
                 global.spilled_states.push(spill.seal());
@@ -465,7 +595,7 @@ impl HashAggregateBuildSinkExec {
                     "aggregate handle does not contain hash aggregate state",
                 ));
             };
-            ensure_modifier_target_tables(ctx.query, &self.spec, global)
+            ensure_grouping_domains(ctx.query, &self.spec, global)
         })?;
         if let Some(group) = prepare_parallel_radix_merge(global.handle.clone(), &self.spec)? {
             return Ok(FinishWork::Parallel(group));
@@ -525,10 +655,15 @@ impl HashAggregateBuildSinkExec {
                 post_reducer.as_mut(),
             )?;
             if global.spilled_outputs.is_some() {
+                record_aggregate_hash_runtime(
+                    ctx.profiler,
+                    ctx.operator.index() as u64,
+                    &mut global.tables,
+                );
                 return Ok(());
             }
-            ensure_modifier_target_tables(ctx.query, &self.spec, global)?;
-            finalize_distinct_into_tables(
+            ensure_grouping_domains(ctx.query, &self.spec, global)?;
+            let mut hash_runtime_stats = finalize_distinct_into_tables(
                 &self.spec,
                 &aggregate_objects,
                 &group_refs,
@@ -555,6 +690,12 @@ impl HashAggregateBuildSinkExec {
                     )?;
                 }
             }
+            hash_runtime_stats.merge(drain_aggregate_hash_runtime(&mut global.tables));
+            record_aggregate_hash_runtime_stats(
+                ctx.profiler,
+                ctx.operator.index() as u64,
+                hash_runtime_stats,
+            );
             Ok(())
         })?;
         if let Some(reducer) = post_reducer {
@@ -568,20 +709,123 @@ impl HashAggregateBuildSinkExec {
     }
 }
 
-fn ensure_modifier_target_tables(
+fn record_aggregate_hash_runtime(
+    profiler: &mut OperatorProfiler,
+    operator_id: u64,
+    tables: &mut [AggregateHashTable],
+) {
+    let stats = drain_aggregate_hash_runtime(tables);
+    record_aggregate_hash_runtime_stats(profiler, operator_id, stats);
+}
+
+fn record_aggregate_hash_runtime_stats(
+    profiler: &mut OperatorProfiler,
+    operator_id: u64,
+    stats: AggregateHashRuntimeStats,
+) {
+    if stats == AggregateHashRuntimeStats::default() {
+        return;
+    }
+    profiler.record_runtime(
+        operator_id,
+        ExplainRuntimeStats {
+            aggregate_hash_full_key_fallback_count: (stats.full_key_fallback_count > 0)
+                .then_some(stats.full_key_fallback_count),
+            aggregate_hash_max_prefix_probe_distance: (stats.max_prefix_probe_distance > 0)
+                .then_some(stats.max_prefix_probe_distance),
+            aggregate_hash_max_radix_partition_skew_percent: (stats
+                .max_radix_partition_skew_percent
+                > 0)
+            .then_some(stats.max_radix_partition_skew_percent),
+            ..ExplainRuntimeStats::default()
+        },
+    );
+}
+
+fn drain_aggregate_hash_runtime(tables: &mut [AggregateHashTable]) -> AggregateHashRuntimeStats {
+    let mut stats = AggregateHashRuntimeStats::default();
+    for table in tables {
+        stats.merge(table.take_hash_runtime_stats());
+    }
+    stats
+}
+
+/// Establish every logical grouping domain before modifier finalization.
+///
+/// Domain existence is independent of whether it received a payload. A
+/// non-empty grouping set produces no row over empty input, while the empty
+/// grouping set owns one initialized aggregate state and therefore emits its
+/// identity row. Both in-memory and spill paths converge here once pending
+/// replay has been resolved.
+fn ensure_grouping_domains(
     query: &crate::runtime::context::QueryRuntimeContext,
     spec: &AggregateSpec,
     state: &mut HashAggregateRuntimeState,
 ) -> Result<()> {
-    if !state.tables.is_empty() || (!has_aggregate_distinct(spec) && !has_aggregate_ordered(spec)) {
+    if state.spilled_outputs.is_some()
+        || !state.spilled_payloads.is_empty()
+        || !state.spilled_states.is_empty()
+    {
         return Ok(());
     }
-    state.tables = create_hash_aggregate_tables(
-        spec,
-        query.allocator(MemoryTag::HashTable),
-        query_hash_table_memory(query),
-        query.session.number_of_threads(),
-    )?;
+    if state.tables.is_empty() {
+        state.tables = create_hash_aggregate_tables(
+            spec,
+            query.allocator(MemoryTag::HashTable),
+            query_hash_table_memory(query),
+            admitted_parallelism(query),
+        )?;
+    }
+    let grouping_sets = normalized_grouping_sets(spec)?;
+    if grouping_sets.len() != state.tables.len() {
+        return Err(paro_error::internal(format!(
+            "hash aggregate grouping domain count mismatch: grouping_sets={} tables={}",
+            grouping_sets.len(),
+            state.tables.len()
+        )));
+    }
+    initialize_empty_grouping_domain_rows(query, spec, &grouping_sets, &mut state.tables)
+}
+
+fn initialize_empty_grouping_domain_rows<G: AsRef<[usize]>>(
+    query: &crate::runtime::context::QueryRuntimeContext,
+    spec: &AggregateSpec,
+    grouping_sets: &[G],
+    tables: &mut [AggregateHashTable],
+) -> Result<()> {
+    if grouping_sets.len() != tables.len() {
+        return Err(paro_error::internal(format!(
+            "empty grouping domain count mismatch: grouping_sets={} tables={}",
+            grouping_sets.len(),
+            tables.len()
+        )));
+    }
+    let empty_domains = grouping_sets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, grouping_set)| grouping_set.as_ref().is_empty().then_some(index))
+        .collect::<Vec<_>>();
+    if empty_domains.is_empty() {
+        return Ok(());
+    }
+    let allocator = query.allocator(MemoryTag::HashTable);
+    let vectors = group_types(spec)?
+        .into_iter()
+        .map(|logical_type| {
+            Vector::try_constant_null(logical_type, 1, allocator.clone()).map(Arc::new)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut groups = Chunk::from_arc_vectors(vectors, allocator.clone());
+    groups.try_set_cardinality(1)?;
+    let hashes = hash_group_columns(&groups)?;
+    let mut addresses = Vector::try_new(LogicalType::BigInt, 1, allocator.clone())?;
+    let mut new_groups = SelectionVector::try_with_capacity(1, allocator)?;
+    for domain in empty_domains {
+        let table = &mut tables[domain];
+        if table.count() == 0 {
+            table.find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)?;
+        }
+    }
     Ok(())
 }
 
@@ -614,11 +858,7 @@ fn merge_pending_radix_tables(state: &mut HashAggregateRuntimeState) -> Result<(
 }
 
 fn hash_aggregate_payload_spill_supported(spec: &AggregateSpec) -> bool {
-    spec.grouping_key_count > 0
-        && spec.grouping_sets.is_empty()
-        && spec.grouping_functions.is_empty()
-        && !has_aggregate_distinct(spec)
-        && !has_aggregate_ordered(spec)
+    spec.grouping_key_count > 0 && !has_aggregate_distinct(spec) && !has_aggregate_ordered(spec)
 }
 
 fn hash_aggregate_state_spill_supported(
@@ -626,6 +866,7 @@ fn hash_aggregate_state_spill_supported(
     aggregate_objects: &[crate::operators::aggregate::aggregate_object::AggregateObject],
 ) -> bool {
     hash_aggregate_payload_spill_supported(spec)
+        && spec.grouping_sets.len() <= 1
         && aggregate_state_spill_supported(aggregate_objects)
 }
 
@@ -639,21 +880,21 @@ fn hash_aggregate_state_spill_encoding(
     }
 }
 
-fn hash_aggregate_external_payload_spill_requested(
-    query: &crate::runtime::context::QueryRuntimeContext,
-    spec: &AggregateSpec,
-) -> bool {
-    query.session.limits.force_external && hash_aggregate_payload_spill_supported(spec)
+fn hash_aggregate_external_payload_spill_requested(spec: &AggregateSpec) -> bool {
+    spec.spill_policy == SpillExecutionPolicy::ForcedExternal
 }
 
 fn hash_aggregate_external_payload_spill_enabled(
     query: &crate::runtime::context::QueryRuntimeContext,
     spec: &AggregateSpec,
 ) -> bool {
-    if !hash_aggregate_payload_spill_supported(spec) || !query_has_temporary_directory(query) {
+    if spec.spill_policy == SpillExecutionPolicy::InMemory
+        || !hash_aggregate_payload_spill_supported(spec)
+        || !query_has_temporary_directory(query)
+    {
         return false;
     }
-    hash_aggregate_external_payload_spill_requested(query, spec)
+    hash_aggregate_external_payload_spill_requested(spec)
         || hash_aggregate_preemptive_payload_spill_enabled(query)
 }
 
@@ -672,29 +913,9 @@ fn hash_aggregate_preemptive_payload_spill_enabled(
         return false;
     }
     let threshold = HASH_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD
-        .saturating_mul(query.session.number_of_threads().max(1));
+        .saturating_mul(admitted_parallelism(query))
+        .max(HASH_AGGREGATE_MIN_ADAPTIVE_BUILD_CAPACITY);
     capacity <= threshold
-}
-
-fn append_payload_to_local_spill(
-    ctx: &mut OperatorCallContext,
-    payload: &Chunk,
-    groups: &Chunk,
-    payload_spill: &mut Option<AggregatePayloadSpillBuffer>,
-) -> Result<()> {
-    let hashes = hash_group_columns(groups)?;
-    if payload_spill.is_none() {
-        *payload_spill = Some(AggregatePayloadSpillBuffer::new(
-            ctx.query.session.buffer_pool().clone(),
-            payload.types(),
-            aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
-            query_hash_table_memory(ctx.query),
-        )?);
-    }
-    payload_spill
-        .as_mut()
-        .expect("aggregate payload spill initialized above")
-        .append_payload(payload, &hashes)
 }
 
 fn replay_spilled_states(
@@ -712,7 +933,7 @@ fn replay_spilled_states(
             spec,
             ctx.query.allocator(MemoryTag::HashTable),
             query_hash_table_memory(ctx.query),
-            ctx.query.session.number_of_threads(),
+            admitted_parallelism(ctx.query),
         )?;
     }
     let spilled_bytes = state
@@ -820,7 +1041,8 @@ fn combine_spilled_state_batch(
         )));
     }
 
-    target_table.find_or_create_groups(groups, hashes, addresses, new_groups)?;
+    target_table
+        .find_or_create_groups_with_routing_hashes(groups, hashes, addresses, new_groups)?;
     if aggregate_objects.is_empty() {
         return Ok(());
     }
@@ -995,9 +1217,30 @@ fn spill_payload_partitions_to_outputs(
     spilled_states: &[crate::operators::aggregate::payload_spill::AggregateSpilledState],
     mut post_reducer: Option<&mut PostAggregateReducer>,
 ) -> Result<usize> {
+    if grouping_sets.len() > 1 {
+        return spill_grouping_set_payloads_to_outputs(
+            ctx,
+            spec,
+            aggregate_objects,
+            group_refs,
+            grouping_sets,
+            state,
+            spilled_payloads,
+            spilled_states,
+            post_reducer,
+        );
+    }
     let Some(first_payload) = spilled_payloads.first() else {
         return Ok(0);
     };
+    if spilled_payloads
+        .iter()
+        .any(|payload| payload.grouping_idx() != 0)
+    {
+        return Err(paro_error::internal(
+            "plain aggregate spill contains a nonzero grouping domain",
+        ));
+    }
     let partition_count = first_payload.partition_count();
     if partition_count == 0 {
         return Ok(0);
@@ -1041,6 +1284,7 @@ fn spill_payload_partitions_to_outputs(
         }
     }
 
+    record_aggregate_hash_runtime(ctx.profiler, ctx.operator.index() as u64, &mut state.tables);
     let in_memory_state_spill = spill_in_memory_tables_to_state_partitions(
         ctx,
         spec,
@@ -1064,7 +1308,7 @@ fn spill_payload_partitions_to_outputs(
             spec,
             ctx.query.allocator(MemoryTag::HashTable),
             query_hash_table_memory(ctx.query),
-            ctx.query.session.number_of_threads(),
+            admitted_parallelism(ctx.query),
         )?;
         for spilled_state in spilled_states {
             spilled_state.replay_partition_state_rows(
@@ -1125,6 +1369,11 @@ fn spill_payload_partitions_to_outputs(
                 },
             )?;
         }
+        record_aggregate_hash_runtime(
+            ctx.profiler,
+            ctx.operator.index() as u64,
+            &mut partition_tables,
+        );
         append_partition_tables_to_output_writers(
             &mut writers,
             &mut partition_tables,
@@ -1179,7 +1428,10 @@ fn spill_in_memory_tables_to_state_partitions(
         group_types(spec)?,
         state_width,
         hash_aggregate_state_spill_encoding(aggregate_objects),
-        aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
+        aggregate_spill_radix_bits(
+            admitted_parallelism(ctx.query),
+            ctx.query.memory.capacity_bytes(),
+        ),
         query_hash_table_memory(ctx.query),
     )?;
     for table in tables.iter() {
@@ -1227,7 +1479,7 @@ fn replay_spilled_payloads_into_tables(
             spec,
             ctx.query.allocator(MemoryTag::HashTable),
             query_hash_table_memory(ctx.query),
-            ctx.query.session.number_of_threads(),
+            admitted_parallelism(ctx.query),
         )?;
         for spilled_payload in spilled_payloads {
             spilled_payload.replay_partition_payloads(
@@ -1258,6 +1510,11 @@ fn replay_spilled_payloads_into_tables(
         for (target, partition) in target_tables.iter_mut().zip(partition_tables.iter_mut()) {
             target.combine(partition)?;
         }
+        record_aggregate_hash_runtime(
+            ctx.profiler,
+            ctx.operator.index() as u64,
+            &mut partition_tables,
+        );
     }
     Ok(())
 }

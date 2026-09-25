@@ -9,7 +9,7 @@ use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
-use paro_planner::operator::graph_expand::graph_path_element_list_type;
+use paro_planner::logical::operator::graph_expand::graph_path_element_list_type;
 use paro_storage::index::graph::GraphReadSnapshot;
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::table::StorageSnapshot;

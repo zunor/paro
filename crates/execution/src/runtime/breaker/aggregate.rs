@@ -28,6 +28,7 @@ use crate::operators::aggregate::aggregate_kernel::destroy_states;
 use crate::operators::aggregate::aggregate_object::AggregateObject;
 use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
 use crate::operators::aggregate::distinct_state::DistinctAggregateState;
+use crate::operators::aggregate::grouped_aggregate_hashtable::AggregateHashRuntimeStats;
 use crate::operators::aggregate::ordered_helpers::OrderedAggregateCollector;
 use crate::operators::aggregate::payload_spill::{
     AggregateSpilledPayload, AggregateSpilledState, AggregateStateEncoding,
@@ -394,6 +395,7 @@ pub struct AggregateLocalPayloadSpillReclaimer {
     name: String,
     tables: Arc<Mutex<Vec<AggregateHashTable>>>,
     raw_payload_spill_requested: Arc<AtomicBool>,
+    hash_runtime_stats: Arc<Mutex<AggregateHashRuntimeStats>>,
 }
 
 #[derive(Debug)]
@@ -402,6 +404,7 @@ pub struct AggregateLocalStateSpillReclaimer {
     tables: Arc<Mutex<Vec<AggregateHashTable>>>,
     state_spill: Arc<Mutex<Option<AggregateStateSpillBuffer>>>,
     raw_payload_spill_requested: Arc<AtomicBool>,
+    hash_runtime_stats: Arc<Mutex<AggregateHashRuntimeStats>>,
     buffer_pool: Arc<BufferPool>,
     group_types: Vec<paro_common::types::LogicalType>,
     state_width: usize,
@@ -416,11 +419,13 @@ impl AggregateLocalPayloadSpillReclaimer {
         local_id: u64,
         tables: Arc<Mutex<Vec<AggregateHashTable>>>,
         raw_payload_spill_requested: Arc<AtomicBool>,
+        hash_runtime_stats: Arc<Mutex<AggregateHashRuntimeStats>>,
     ) -> Self {
         Self {
             name: Self::name_for(handle, local_id),
             tables,
             raw_payload_spill_requested,
+            hash_runtime_stats,
         }
     }
 
@@ -466,7 +471,9 @@ impl Reclaimer for AggregateLocalPayloadSpillReclaimer {
         if before == 0 {
             return Ok(ReclaimStats::empty(target_bytes));
         }
+        let mut hash_runtime_stats = self.hash_runtime_stats.lock();
         for table in tables.iter_mut() {
+            hash_runtime_stats.merge(table.take_hash_runtime_stats());
             table
                 .destroy()
                 .map_err(|err| MemoryError::reclaim_failed(err.to_string()))?;
@@ -490,6 +497,7 @@ impl AggregateLocalStateSpillReclaimer {
         tables: Arc<Mutex<Vec<AggregateHashTable>>>,
         state_spill: Arc<Mutex<Option<AggregateStateSpillBuffer>>>,
         raw_payload_spill_requested: Arc<AtomicBool>,
+        hash_runtime_stats: Arc<Mutex<AggregateHashRuntimeStats>>,
         buffer_pool: Arc<BufferPool>,
         group_types: Vec<paro_common::types::LogicalType>,
         state_width: usize,
@@ -502,6 +510,7 @@ impl AggregateLocalStateSpillReclaimer {
             tables,
             state_spill,
             raw_payload_spill_requested,
+            hash_runtime_stats,
             buffer_pool,
             group_types,
             state_width,
@@ -582,7 +591,9 @@ impl Reclaimer for AggregateLocalStateSpillReclaimer {
         }
         let spilled = spill.size_in_bytes().saturating_sub(spill_bytes_before);
 
+        let mut hash_runtime_stats = self.hash_runtime_stats.lock();
         for table in tables.iter_mut() {
+            hash_runtime_stats.merge(table.take_hash_runtime_stats());
             table
                 .destroy()
                 .map_err(|err| MemoryError::reclaim_failed(err.to_string()))?;
@@ -1109,12 +1120,14 @@ mod tests {
         .expect("aggregate table");
         let tables = Arc::new(Mutex::new(vec![table]));
         let request = Arc::new(AtomicBool::new(false));
+        let hash_runtime_stats = Arc::new(Mutex::new(AggregateHashRuntimeStats::default()));
         let handle = AggregateHandle::new(metadata());
         let reclaimer = AggregateLocalPayloadSpillReclaimer::new(
             &handle,
             9,
             Arc::clone(&tables),
             Arc::clone(&request),
+            Arc::clone(&hash_runtime_stats),
         );
         let query_memory = QueryMemoryPool::unbounded();
         query_memory.register_reclaimer_once_by_name(Arc::new(reclaimer));
@@ -1164,12 +1177,14 @@ mod tests {
 
         let tables = Arc::new(Mutex::new(vec![table]));
         let request = Arc::new(AtomicBool::new(false));
+        let hash_runtime_stats = Arc::new(Mutex::new(AggregateHashRuntimeStats::default()));
         let handle = AggregateHandle::new(metadata());
         let reclaimer = AggregateLocalPayloadSpillReclaimer::new(
             &handle,
             10,
             Arc::clone(&tables),
             Arc::clone(&request),
+            Arc::clone(&hash_runtime_stats),
         );
         let query_memory = QueryMemoryPool::unbounded();
         query_memory.register_reclaimer_once_by_name(Arc::new(reclaimer));
@@ -1219,10 +1234,16 @@ mod tests {
         table
             .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
             .expect("insert group");
+        table.merge_hash_runtime_stats(AggregateHashRuntimeStats {
+            full_key_fallback_count: 1,
+            max_prefix_probe_distance: 41,
+            max_radix_partition_skew_percent: 0,
+        });
 
         let tables = Arc::new(Mutex::new(vec![table]));
         let state_spill = Arc::new(Mutex::new(None));
         let request = Arc::new(AtomicBool::new(false));
+        let hash_runtime_stats = Arc::new(Mutex::new(AggregateHashRuntimeStats::default()));
         let handle = AggregateHandle::new(metadata());
         let reclaimer = AggregateLocalStateSpillReclaimer::new(
             &handle,
@@ -1230,6 +1251,7 @@ mod tests {
             Arc::clone(&tables),
             Arc::clone(&state_spill),
             Arc::clone(&request),
+            Arc::clone(&hash_runtime_stats),
             BufferPool::new_arc(16 * 1024 * 1024),
             vec![LogicalType::Integer],
             0,
@@ -1246,6 +1268,15 @@ mod tests {
         assert!(stats.reclaimed_bytes > 0);
         assert!(request.load(Ordering::Acquire));
         assert!(tables.lock().is_empty());
+        assert_eq!(
+            *hash_runtime_stats.lock(),
+            AggregateHashRuntimeStats {
+                full_key_fallback_count: 1,
+                max_prefix_probe_distance: 41,
+                max_radix_partition_skew_percent: 0,
+            },
+            "reclaiming table ownership must retain its unpublished observations"
+        );
         assert_eq!(
             state_spill
                 .lock()

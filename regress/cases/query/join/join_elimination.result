@@ -15,7 +15,8 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: l.id, l.payload
   ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
-    Columns: id, payload
+        Column IDs: 0, 1
+        Columns: id, payload
 
 EXPLAIN
 SELECT l.id, r.note
@@ -25,13 +26,15 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: l.id, r.note
   ->  HASH_JOIN  (rows=3)
-    Join Type: LEFT
-    Build Index: integer_build_time
-    Join Condition: l.id = r.id
-    ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
-      Columns: id
-    ->  ROWSET_SCAN on public.join_elim_right_unique r  (rows=2)
-      Columns: id, note
+        Join Type: LEFT
+        Build Index: integer_build_time
+        Join Condition: l.id = r.id
+        ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+              Column IDs: 0
+              Columns: id
+        ->  ROWSET_SCAN on public.join_elim_right_unique r  (rows=2)
+              Column IDs: 0, 1
+              Columns: id, note
 
 SELECT r.id, r.note
 FROM join_elim_left_unique AS l
@@ -49,7 +52,8 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: r.id, r.note
   ->  ROWSET_SCAN on public.join_elim_right r  (rows=2)
-    Columns: id, note
+        Column IDs: 0, 1
+        Columns: id, note
 
 SELECT l.id
 FROM join_elim_left AS l
@@ -69,10 +73,38 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: l.id
   ->  HASH_JOIN  (rows=3)
-    Join Type: LEFT
-    Build Index: integer_build_time
-    Join Condition: l.id = r.id
-    ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
-      Columns: id
-    ->  ROWSET_SCAN on public.join_elim_right_nonunique r  (rows=2)
-      Columns: id
+        Join Type: LEFT
+        Build Index: integer_build_time
+        Join Condition: l.id = r.id
+        ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+              Column IDs: 0
+              Columns: id
+        ->  ROWSET_SCAN on public.join_elim_right_nonunique r  (rows=2)
+              Column IDs: 0
+              Columns: id
+
+EXPLAIN
+SELECT l.id, l.payload
+FROM join_elim_left AS l
+LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: l.id, l.payload
+  ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+        Column IDs: 0, 1
+        Columns: id, payload
+
+SELECT name, kind, metric_unit, metric_value > 0 AS observed
+FROM paro_optimizers()
+WHERE name IN (
+    'semantic_normalization',
+    'region_optimization',
+    'physical_selection',
+    'physical_extraction'
+)
+ORDER BY kind, name;
+name	kind	metric_unit	observed
+physical_extraction	extraction	invocations	true
+semantic_normalization	frontend	invocations	true
+physical_selection	planning	invocations	true
+region_optimization	planning	invocations	true

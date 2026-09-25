@@ -1,0 +1,28 @@
+[meta]
+name = "optimizer_planning"
+description = "Staged planning of join, union and aggregate regions"
+
+[params]
+rows = 1024
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "join_aggregate_topn"
+file = "sql/q_five_way_aggregate_topn.sql"
+validate = "text_contains_all"
+expected = ["TOP_N", "AGGREGATE", "HASH_JOIN"]
+
+[[query]]
+id = "union_aggregate"
+file = "sql/q_union_aggregate.sql"
+validate = "text_contains_all"
+expected = ["TOP_N", "AGGREGATE", "SET_OPERATION"]
+
+[[query]]
+id = "aggregate_dense_union"
+file = "sql/q_aggregate_dense_union.sql"
+validate = "text_contains_all"
+expected = ["AGGREGATE", "SET_OPERATION"]

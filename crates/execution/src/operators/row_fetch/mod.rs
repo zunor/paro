@@ -4,5 +4,7 @@
 mod state;
 mod transform;
 
-pub use state::{RowFetchTableState, RowFetchTransformLocal};
+pub use state::{
+    RowFetchTableBinding, RowFetchTableState, RowFetchTransformGlobal, RowFetchTransformLocal,
+};
 pub use transform::RowFetchTransformExec;

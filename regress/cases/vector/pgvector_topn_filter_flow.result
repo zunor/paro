@@ -21,12 +21,13 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
   ->  TOP_N  (rows=3)
-    Sort Key: l2_distance(public.vector_topn_case.emb, [1, 0, 0]) ASC NULLS LAST
-    Limit: 3
-    ->  PROJECTION  (rows=5)
-      Output: id, l2_distance(public.vector_topn_case.emb, [1, 0, 0])
-      ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
-        Columns: id, emb
+        Sort Key: l2_distance(public.vector_topn_case.emb, [1, 0, 0]) ASC NULLS LAST
+        Limit: 3
+        ->  PROJECTION  (rows=5)
+              Output: id, l2_distance(public.vector_topn_case.emb, [1, 0, 0])
+              ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
+                    Column IDs: 0, 2
+                    Columns: id, emb
 
 SELECT id FROM vector_topn_case ORDER BY emb <-> '[1,0,0]', id LIMIT 3;
 id
@@ -39,14 +40,15 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: l1_distance(public.vector_topn_case.emb, [1, 0, 0]) ASC NULLS LAST
-    Limit: 2
-    ->  PROJECTION  (rows=2)
-      Output: id, l1_distance(public.vector_topn_case.emb, [1, 0, 0])
-      ->  ROWSET_SCAN on public.vector_topn_case  (rows=2)
-        Columns: id, emb
-        Pushed Predicate: category = 'x'
-        Late Materialize: auto
+        Sort Key: l1_distance(public.vector_topn_case.emb, [1, 0, 0]) ASC NULLS LAST
+        Limit: 2
+        ->  PROJECTION  (rows=2)
+              Output: id, l1_distance(public.vector_topn_case.emb, [1, 0, 0])
+              ->  ROWSET_SCAN on public.vector_topn_case  (rows=2)
+                    Column IDs: 0, 2
+                    Columns: id, emb
+                    Pushed Predicate: category = 'x'
+                    Late Materialize: auto
 
 SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[1,0,0]', id LIMIT 2;
 id
@@ -58,12 +60,13 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
   ->  TOP_N  (rows=3)
-    Sort Key: cosine_distance(public.vector_topn_case.emb, [1, 0, 0]) ASC NULLS LAST
-    Limit: 3
-    ->  PROJECTION  (rows=5)
-      Output: id, cosine_distance(public.vector_topn_case.emb, [1, 0, 0])
-      ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
-        Columns: id, emb
+        Sort Key: cosine_distance(public.vector_topn_case.emb, [1, 0, 0]) ASC NULLS LAST
+        Limit: 3
+        ->  PROJECTION  (rows=5)
+              Output: id, cosine_distance(public.vector_topn_case.emb, [1, 0, 0])
+              ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
+                    Column IDs: 0, 2
+                    Columns: id, emb
 
 SELECT id FROM vector_topn_case ORDER BY emb <=> '[1,0,0]', id LIMIT 3;
 id
@@ -76,12 +79,13 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
   ->  TOP_N  (rows=3)
-    Sort Key: neg_inner_product(public.vector_topn_case.emb, [1, 0, 0]) ASC NULLS LAST
-    Limit: 3
-    ->  PROJECTION  (rows=5)
-      Output: id, neg_inner_product(public.vector_topn_case.emb, [1, 0, 0])
-      ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
-        Columns: id, emb
+        Sort Key: neg_inner_product(public.vector_topn_case.emb, [1, 0, 0]) ASC NULLS LAST
+        Limit: 3
+        ->  PROJECTION  (rows=5)
+              Output: id, neg_inner_product(public.vector_topn_case.emb, [1, 0, 0])
+              ->  ROWSET_SCAN on public.vector_topn_case  (rows=5)
+                    Column IDs: 0, 2
+                    Columns: id, emb
 
 SELECT id FROM vector_topn_case ORDER BY emb <#> '[1,0,0]', id LIMIT 3;
 id

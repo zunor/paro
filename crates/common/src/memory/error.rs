@@ -3,11 +3,33 @@
 
 //! Memory runtime error types.
 
+use std::fmt;
+
 use thiserror::Error;
 
 use crate::error::{self as paro_error, ParoError};
 
 use super::MemoryDomain;
+
+/// Retained-memory demand before a best-effort resident cap is applied.
+///
+/// This deliberately does not use `u64::MAX` as an unknown sentinel. A known
+/// finite upper bound and the absence of any semantic upper bound have
+/// different comparison, composition, and diagnostic semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UncappedMemoryDemand {
+    KnownBytes(u64),
+    Unbounded,
+}
+
+impl fmt::Display for UncappedMemoryDemand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::KnownBytes(bytes) => write!(formatter, "{bytes} bytes"),
+            Self::Unbounded => formatter.write_str("unbounded"),
+        }
+    }
+}
 
 /// Result alias for memory runtime operations.
 pub type MemoryResult<T> = std::result::Result<T, MemoryError>;
@@ -21,6 +43,17 @@ pub enum MemoryError {
         domain: MemoryDomain,
         requested: usize,
         available: usize,
+    },
+
+    /// A best-effort non-spillable plan reached its admitted resident cap.
+    #[error(
+        "runtime-capped plan exhausted memory in {domain:?}: requested {requested} bytes, available {available} bytes; uncapped peak demand is {uncapped_memory_demand} and has no forward-progress proof"
+    )]
+    RuntimeCapExhausted {
+        domain: MemoryDomain,
+        requested: usize,
+        available: usize,
+        uncapped_memory_demand: UncappedMemoryDemand,
     },
 
     /// The physical allocator failed after a grant was consumed.
@@ -71,6 +104,14 @@ impl From<MemoryError> for ParoError {
                 available,
             } => paro_error::out_of_memory(format!(
                 "memory quota exhausted in {domain:?}: requested {requested} bytes, available {available} bytes"
+            )),
+            MemoryError::RuntimeCapExhausted {
+                domain,
+                requested,
+                available,
+                uncapped_memory_demand,
+            } => paro_error::out_of_memory(format!(
+                "runtime-capped plan exhausted memory in {domain:?}: requested {requested} bytes, available {available} bytes; uncapped peak demand is {uncapped_memory_demand} and has no forward-progress proof"
             )),
             MemoryError::PhysicalAllocationFailed { bytes } => {
                 paro_error::out_of_memory(format!("physical allocation failed for {bytes} bytes"))

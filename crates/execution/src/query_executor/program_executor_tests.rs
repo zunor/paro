@@ -19,15 +19,14 @@ use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{
     AggregateExpression, ConstantExpression, Expression, ParameterExpression, ReferenceExpression,
 };
-use paro_planner::operator::join::{Join, JoinCondition, JoinType};
-use paro_planner::operator::{
+use paro_planner::logical::operator::join::{Join, JoinCondition, JoinType};
+use paro_planner::logical::operator::{
     Aggregate as LogicalAggregate, ExpressionGet, LogicalOperator, Order as LogicalOrder,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::physical::children::{PlanChildren, PlanChildrenArena};
-use crate::physical::generator::{PhysicalPlanGenerator, PlanBuildContext};
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::node::{OperatorLabel, PhysicalPlanNode};
 use crate::physical::plan::{PhysicalPlan, PhysicalPlanNodeArena};
@@ -37,32 +36,37 @@ use crate::physical::{ChunkScanSpec, DummyScanSpec, RowType};
 use crate::pipeline::graph::{
     ClientResultSpec, ControlRegion, CorrelatedSubqueryRegion, DelimJoinSide, DependencyKind,
     MaterializeSinkSpec, MaterializedSourceSpec, PipelineDependency, PipelineGraph, PipelineId,
-    PipelineRoot, PipelineSpec, PipelineSubgraphRoot, SinkSharing, SinkSpec, SourceSpec,
+    PipelineRoot, PipelineSpec, PipelineSubgraphRoot, RecursiveCteDedup, RecursiveCteRegion,
+    RecursiveTermination, SinkSharing, SinkSpec, SourceSpec,
 };
 use crate::pipeline::handles::{BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind};
 use crate::pipeline::lowerer::PipelineLowerer;
 use crate::pipeline::{PipelineProgramBuilder, StatementProgram};
 use crate::query_executor::pipeline_driver::{PipelineDriveResult, PipelineExecutionDriver};
 use crate::query_executor::program_executor::{
-    control_region_pipeline_members, control_region_root_pipelines, execute_program,
-    run_pipeline_graph_with_registry_for_test, start_program, start_program_with_output_for_test,
-    ProgramExecution,
+    control_region_covered_pipelines, control_region_pipeline_members,
+    control_region_root_pipelines, execute_program, run_pipeline_graph_with_registry_for_test,
+    start_program, start_program_with_output_for_test, ProgramExecution,
 };
 use crate::query_executor::stream::ResultHandler;
 use crate::runtime::{
     BreakerHandleRegistry, CleanupStatus, ParameterBindingEpoch, ParameterBindings,
     QueryOutputPort, QueryOutputPortStats, QueryRuntimeContext,
 };
+use paro_optimizer::test_support::{PhysicalBuildContext, PhysicalPlanBuilder};
 use tokio_util::sync::CancellationToken;
 
 #[test]
 fn execute_program_uses_compiled_parameter_bindings() {
     let ctx = BindContext::new();
-    let param = Expression::Parameter(ParameterExpression::new(ParameterSlot::new(
-        RuntimeParamId::new(0),
-        LogicalType::Integer,
-    )));
-    let logical = LogicalPlan::new(
+    let param = Expression::Parameter(
+        ParameterExpression::new(ParameterSlot::new(
+            RuntimeParamId::new(0),
+            LogicalType::Integer,
+        ))
+        .into(),
+    );
+    let logical = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -72,8 +76,8 @@ fn execute_program_uses_compiled_parameter_bindings() {
         )),
     );
 
-    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
-    let plan = Arc::new(generator.generate(&logical).expect("physical plan"));
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    let plan = Arc::new(extractor.build(logical).expect("physical plan"));
     let mut lowerer = PipelineLowerer::new(plan.as_ref());
     let graph = Arc::new(
         lowerer
@@ -854,6 +858,122 @@ fn control_region_members_include_nested_region_root_pipelines() {
     );
 }
 
+#[test]
+fn control_region_coverage_includes_exclusive_invariant_dependencies() {
+    let row_type = RowType::new(Vec::new(), Vec::new());
+    let pipeline = |id| PipelineSpec {
+        id: PipelineId::new(id),
+        source: SourceSpec::Dummy(DummyScanSpec),
+        transforms: Vec::new(),
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: row_type.clone(),
+    };
+    let graph = PipelineGraph {
+        pipelines: (0..5).map(pipeline).collect(),
+        dependencies: vec![
+            PipelineDependency {
+                producer: PipelineId::new(1),
+                consumer: PipelineId::new(2),
+                kind: DependencyKind::BuildBeforeProbe,
+            },
+            PipelineDependency {
+                producer: PipelineId::new(2),
+                consumer: PipelineId::new(3),
+                kind: DependencyKind::ProbeBeforeSpillReplay,
+            },
+        ],
+        handles: BreakerHandleCatalogBuilder::default().finish(),
+        control_regions: vec![ControlRegion::RecursiveCte(RecursiveCteRegion {
+            anchor: PipelineId::new(0),
+            recursive: vec![PipelineId::new(2), PipelineId::new(3)],
+            emit: PipelineId::new(4),
+            working: crate::pipeline::handles::BreakerHandleId::new(0),
+            intermediate: crate::pipeline::handles::BreakerHandleId::new(1),
+            accumulated: Some(crate::pipeline::handles::BreakerHandleId::new(2)),
+            termination: RecursiveTermination::UntilEmpty,
+            dedup: RecursiveCteDedup::HashSet,
+        })],
+        root: PipelineRoot::ControlRegion(crate::pipeline::graph::ControlRegionId::new(0)),
+    };
+
+    let roots = control_region_root_pipelines(&graph).expect("region roots");
+    let scheduled = control_region_pipeline_members(&graph, &roots).expect("region members");
+    let members = control_region_covered_pipelines(
+        &graph,
+        crate::pipeline::graph::ControlRegionId::new(0),
+        &scheduled[0],
+        &roots,
+    )
+    .expect("covered pipelines");
+
+    assert_eq!(
+        members,
+        vec![
+            PipelineId::new(0),
+            PipelineId::new(1),
+            PipelineId::new(2),
+            PipelineId::new(3),
+            PipelineId::new(4),
+        ]
+    );
+}
+
+#[test]
+fn control_region_coverage_excludes_shared_invariant_dependencies() {
+    let row_type = RowType::new(Vec::new(), Vec::new());
+    let pipeline = |id| PipelineSpec {
+        id: PipelineId::new(id),
+        source: SourceSpec::Dummy(DummyScanSpec),
+        transforms: Vec::new(),
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: row_type.clone(),
+    };
+    let graph = PipelineGraph {
+        pipelines: (0..6).map(pipeline).collect(),
+        dependencies: vec![
+            PipelineDependency {
+                producer: PipelineId::new(1),
+                consumer: PipelineId::new(2),
+                kind: DependencyKind::BuildBeforeProbe,
+            },
+            PipelineDependency {
+                producer: PipelineId::new(1),
+                consumer: PipelineId::new(5),
+                kind: DependencyKind::BuildBeforeProbe,
+            },
+        ],
+        handles: BreakerHandleCatalogBuilder::default().finish(),
+        control_regions: vec![ControlRegion::RecursiveCte(RecursiveCteRegion {
+            anchor: PipelineId::new(0),
+            recursive: vec![PipelineId::new(2), PipelineId::new(3)],
+            emit: PipelineId::new(4),
+            working: crate::pipeline::handles::BreakerHandleId::new(0),
+            intermediate: crate::pipeline::handles::BreakerHandleId::new(1),
+            accumulated: Some(crate::pipeline::handles::BreakerHandleId::new(2)),
+            termination: RecursiveTermination::UntilEmpty,
+            dedup: RecursiveCteDedup::HashSet,
+        })],
+        root: PipelineRoot::ControlRegion(crate::pipeline::graph::ControlRegionId::new(0)),
+    };
+
+    let roots = control_region_root_pipelines(&graph).expect("region roots");
+    let scheduled = control_region_pipeline_members(&graph, &roots).expect("region members");
+    let members = control_region_covered_pipelines(
+        &graph,
+        crate::pipeline::graph::ControlRegionId::new(0),
+        &scheduled[0],
+        &roots,
+    )
+    .expect("covered pipelines");
+
+    assert!(!members.contains(&PipelineId::new(1)));
+    assert!(!members.contains(&PipelineId::new(5)));
+}
+
 fn i32_chunk(values: &[i32]) -> paro_common::chunk::Chunk {
     paro_common::test_utils::test_chunk_from_vectors(vec![Vector::try_from_i32(
         values,
@@ -929,9 +1049,9 @@ fn assert_pipeline_count_at_least(statement: &StatementProgram, expected: usize)
     );
 }
 
-fn statement_from_logical(logical: LogicalPlan) -> StatementProgram {
-    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
-    let plan = Arc::new(generator.generate(&logical).expect("physical plan"));
+fn statement_from_logical(logical: OwnedLogicalPlan) -> StatementProgram {
+    let mut extractor = PhysicalPlanBuilder::new(PhysicalBuildContext::default());
+    let plan = Arc::new(extractor.build(logical).expect("physical plan"));
     let mut lowerer = PipelineLowerer::new(plan.as_ref());
     let graph = Arc::new(
         lowerer
@@ -948,7 +1068,7 @@ fn statement_from_logical(logical: LogicalPlan) -> StatementProgram {
     }
 }
 
-fn hash_join_logical_plan(row_count: usize) -> LogicalPlan {
+fn hash_join_logical_plan(row_count: usize) -> OwnedLogicalPlan {
     let ctx = BindContext::new();
     let left_rows = (0..row_count)
         .map(|idx| {
@@ -969,10 +1089,10 @@ fn hash_join_logical_plan(row_count: usize) -> LogicalPlan {
     let left = int_values(&ctx, 0, vec!["lk", "lv"], left_rows);
     let right = int_values(&ctx, 1, vec!["rk", "rv"], right_rows);
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -983,7 +1103,7 @@ fn hash_join_logical_plan(row_count: usize) -> LogicalPlan {
     )
 }
 
-fn sort_logical_plan(row_count: usize) -> LogicalPlan {
+fn sort_logical_plan(row_count: usize) -> OwnedLogicalPlan {
     let ctx = BindContext::new();
     let rows = (0..row_count)
         .rev()
@@ -991,41 +1111,43 @@ fn sort_logical_plan(row_count: usize) -> LogicalPlan {
         .collect::<Vec<_>>();
     let values = int_values(&ctx, 0, vec!["v"], rows);
     let order = OrderByNode {
-        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         ascending: true,
         nulls_first: false,
     };
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Order(LogicalOrder::new(values, vec![order])),
     )
 }
 
-fn grouped_aggregate_logical_plan(row_count: usize) -> LogicalPlan {
+fn grouped_aggregate_logical_plan(row_count: usize) -> OwnedLogicalPlan {
     let ctx = BindContext::new();
     let rows = (0..row_count)
         .map(|idx| vec![int_constant(idx as i32)])
         .collect::<Vec<_>>();
     let values = int_values(&ctx, 0, vec!["k"], rows);
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Aggregate(LogicalAggregate::new(
+        LogicalOperator::Aggregate(Box::new(LogicalAggregate::new(
             1,
             2,
             3,
             values,
-            vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::Integer,
-            ))],
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            )],
             Vec::new(),
-            vec![Expression::Aggregate(AggregateExpression::new(
-                get_count_star_function(),
-                Vec::new(),
-                LogicalType::BigInt,
-            ))],
+            vec![Expression::Aggregate(
+                AggregateExpression::new(
+                    get_count_star_function(),
+                    Vec::new(),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )],
             Vec::new(),
-        )),
+        ))),
     )
 }
 
@@ -1034,9 +1156,9 @@ fn int_values(
     table_index: usize,
     names: Vec<&str>,
     rows: Vec<Vec<Expression>>,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     let column_count = names.len();
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             table_index,
@@ -1048,10 +1170,9 @@ fn int_values(
 }
 
 fn int_constant(value: i32) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Integer(value),
-        LogicalType::Integer,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+    )
 }
 
 fn materialized_statement(
@@ -1225,7 +1346,12 @@ fn single_node_plan(kind: PhysicalNodeKind, output: RowType) -> PhysicalPlan {
         cardinality: None,
         kind,
         children: PlanChildren::Empty,
-        label: OperatorLabel::new(paro_planner::plan::PlanNodeId::SYNTHETIC, "TEST"),
+        label: OperatorLabel::new(paro_planner::logical::plan::PlanNodeId::SYNTHETIC, "TEST"),
     });
-    PhysicalPlan::new(root, nodes, PlanChildrenArena::default(), PlanPropertyMap)
+    PhysicalPlan::new(
+        root,
+        nodes,
+        PlanChildrenArena::default(),
+        PlanPropertyMap::default(),
+    )
 }

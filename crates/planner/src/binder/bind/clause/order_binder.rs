@@ -121,8 +121,20 @@ impl<'a> OrderBinder<'a> {
 
             // COLUMN REF expression - check if it can be bound to an alias
             Expr::ColumnRef { column, .. } => {
-                if let Some(index) = self.try_get_projection_reference_from_colref(column) {
-                    return Ok(self.create_projection_reference(&expr, index));
+                if column.table.is_none() && column.schema.is_none() {
+                    if let paro_parser::ast::ColumnID::Name(name) = &column.column {
+                        if let Some(index) = self
+                            .bind_state
+                            .order_output_index(&name.name, name.quote.is_some())?
+                        {
+                            return Ok(self.create_projection_reference(&expr, index));
+                        }
+                    }
+                }
+                if column.table.is_some() {
+                    if let Some(index) = self.try_get_projection_reference_from_colref(column) {
+                        return Ok(self.create_projection_reference(&expr, index));
+                    }
                 }
             }
 
@@ -322,12 +334,15 @@ impl OrderByBinding {
         return_type: paro_common::types::LogicalType,
     ) -> crate::expression::Expression {
         use crate::expression::ColumnRefExpression;
-        use crate::operator::ColumnBinding;
+        use crate::logical::operator::ColumnBinding;
 
-        crate::expression::Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(projection_table_index, self.index),
-            return_type,
-        ))
+        crate::expression::Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(projection_table_index, self.index),
+                return_type,
+            )
+            .into(),
+        )
     }
 }
 

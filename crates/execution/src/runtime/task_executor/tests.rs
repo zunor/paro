@@ -25,7 +25,9 @@ use paro_planner::expression::{
     AggregateExpression, AggregateType, ComparisonExpression, ComparisonType, ConstantExpression,
     Expression, OrderByExpression, ReferenceExpression, WindowExpression, WindowFrame,
 };
-use paro_planner::operator::join::{AntiJoinMode, JoinComparisonType, JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{
+    AntiJoinMode, JoinComparisonType, JoinCondition, JoinType,
+};
 
 use crate::explain::profiler::{ExplainProfileSnapshot, ExplainProfiler, OperatorProfiler};
 use crate::memory_runtime::QueryMemoryPool;
@@ -178,39 +180,33 @@ fn values_spec(rows: Vec<Vec<Expression>>, types: Vec<LogicalType>) -> ValuesSpe
 }
 
 fn int_constant(value: i32) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Integer(value),
-        LogicalType::Integer,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+    )
 }
 
 fn bigint_constant(value: i64) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::BigInt(value),
-        LogicalType::BigInt,
-    ))
+    Expression::Constant(ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into())
 }
 
 fn varchar_constant(value: &str) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Varchar(value.to_string()),
-        LogicalType::Varchar,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Varchar(value.to_string()), LogicalType::Varchar).into(),
+    )
 }
 
 fn null_constant(ty: LogicalType) -> Expression {
-    Expression::Constant(ConstantExpression::new(Value::Null(ty.clone()), ty))
+    Expression::Constant(ConstantExpression::new(Value::Null(ty.clone()), ty).into())
 }
 
 fn bool_constant(value: bool) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Boolean(value),
-        LogicalType::Boolean,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Boolean(value), LogicalType::Boolean).into(),
+    )
 }
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, ty))
+    Expression::Reference(ReferenceExpression::new(index, ty).into())
 }
 
 fn order_by_ref(index: usize, ty: LogicalType) -> paro_planner::binder::ir::OrderByNode {
@@ -239,16 +235,15 @@ fn join_condition() -> JoinCondition {
 }
 
 fn count_star_expression() -> Expression {
-    Expression::Aggregate(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    ))
+    Expression::Aggregate(
+        AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+    )
 }
 
 fn grouped_count_spec(perfect_hash: Option<PerfectHashAggregatePlan>) -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -264,6 +259,11 @@ fn grouped_count_spec(perfect_hash: Option<PerfectHashAggregatePlan>) -> Aggrega
         aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: if perfect_hash.is_some() {
+            crate::physical::specs::SpillExecutionPolicy::InMemory
+        } else {
+            crate::physical::specs::SpillExecutionPolicy::Adaptive
+        },
         perfect_hash,
         output_names: vec!["k".to_string(), "count".to_string()].into_boxed_slice(),
         output_types: vec![LogicalType::Integer, LogicalType::BigInt].into_boxed_slice(),
@@ -287,23 +287,30 @@ fn grouped_sum_post_max_spec(
         .expect("bind max(bigint)");
     let post_reduction = PostAggregateReductionSpec {
         aggregate_types: Box::new([LogicalType::BigInt]),
-        reducers: Box::new([Expression::Aggregate(AggregateExpression::new(
-            max,
-            vec![reference(0, LogicalType::BigInt)],
-            LogicalType::BigInt,
-        ))]),
+        reducers: Box::new([Expression::Aggregate(
+            AggregateExpression::new(
+                max,
+                vec![reference(0, LogicalType::BigInt)],
+                LogicalType::BigInt,
+            )
+            .into(),
+        )]),
         reducer_types: Box::new([LogicalType::BigInt]),
         scalar_expressions: Box::new([reference(0, LogicalType::BigInt)]),
         scalar_types: Box::new([LogicalType::BigInt]),
-        predicate: Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            reference(0, LogicalType::BigInt),
-            reference(1, LogicalType::BigInt),
-        )),
+        predicate: Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                reference(0, LogicalType::BigInt),
+                reference(1, LogicalType::BigInt),
+            )
+            .into(),
+        ),
         input_rollup_sources: None,
     };
     AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -311,17 +318,25 @@ fn grouped_sum_post_max_spec(
         groups: Box::new([reference(0, key_type.clone())]),
         group_key_encodings: Box::new([crate::physical::specs::GroupKeyEncoding::Identity]),
         grouping_sets: Box::new([]),
-        aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
-            sum,
-            vec![reference(1, LogicalType::Integer)],
-            LogicalType::BigInt,
-        ))]),
+        aggregates: Box::new([Expression::Aggregate(
+            AggregateExpression::new(
+                sum,
+                vec![reference(1, LogicalType::Integer)],
+                LogicalType::BigInt,
+            )
+            .into(),
+        )]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([1])]),
         aggregate_filters: Box::new([None]),
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: Some(post_reduction),
         having_filter,
+        spill_policy: if perfect_hash.is_some() {
+            crate::physical::specs::SpillExecutionPolicy::InMemory
+        } else {
+            crate::physical::specs::SpillExecutionPolicy::Adaptive
+        },
         perfect_hash,
         output_names: Box::new(["k".to_string(), "sum".to_string()]),
         output_types: Box::new([key_type, LogicalType::BigInt]),
@@ -331,6 +346,7 @@ fn grouped_sum_post_max_spec(
 fn ungrouped_count_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 0,
+        initial_lookup_hash_key_count: 0,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -345,6 +361,7 @@ fn ungrouped_count_spec() -> AggregateSpec {
         aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
         perfect_hash: None,
         output_names: vec!["count".to_string()].into_boxed_slice(),
         output_types: vec![LogicalType::BigInt].into_boxed_slice(),
@@ -357,6 +374,7 @@ fn ungrouped_distinct_count_spec() -> AggregateSpec {
         .expect("bind count(integer)");
     AggregateSpec {
         grouping_key_count: 0,
+        initial_lookup_hash_key_count: 0,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -370,7 +388,8 @@ fn ungrouped_distinct_count_spec() -> AggregateSpec {
                 vec![reference(0, LogicalType::Integer)],
                 LogicalType::BigInt,
             )
-            .with_aggr_type(AggregateType::Distinct),
+            .with_aggr_type(AggregateType::Distinct)
+            .into(),
         )]
         .into_boxed_slice(),
         grouping_functions: Box::new([]),
@@ -379,6 +398,7 @@ fn ungrouped_distinct_count_spec() -> AggregateSpec {
         aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
         perfect_hash: None,
         output_names: vec!["count".to_string()].into_boxed_slice(),
         output_types: vec![LogicalType::BigInt].into_boxed_slice(),
@@ -391,6 +411,7 @@ fn grouped_distinct_count_spec() -> AggregateSpec {
         .expect("bind count(integer)");
     AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -404,7 +425,8 @@ fn grouped_distinct_count_spec() -> AggregateSpec {
                 vec![reference(1, LogicalType::Integer)],
                 LogicalType::BigInt,
             )
-            .with_aggr_type(AggregateType::Distinct),
+            .with_aggr_type(AggregateType::Distinct)
+            .into(),
         )]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([1])]),
@@ -412,6 +434,7 @@ fn grouped_distinct_count_spec() -> AggregateSpec {
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
         perfect_hash: None,
         output_names: Box::new(["k".to_string(), "count".to_string()]),
         output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),

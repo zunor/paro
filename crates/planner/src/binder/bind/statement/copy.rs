@@ -12,7 +12,7 @@ use crate::binder::ir::BoundFromItem;
 use crate::binder::ir::BoundStatementKind;
 use crate::binder::Binder;
 use crate::expression::Expression;
-use crate::operator::{CopyTo, Filter, Insert, LogicalOperator, TableFunctionGet};
+use crate::logical::operator::{CopyTo, Filter, Insert, LogicalOperator, TableFunctionGet};
 use paro_catalog::entry::{CatalogEntryEnum, CatalogType};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -102,7 +102,7 @@ fn bind_copy_to(binder: &mut Binder, stmt: CopyStmt) -> Result<BoundStatementKin
     );
 
     Ok(BoundStatementKind::Copy(BoundCopyInfo {
-        plan: LogicalOperator::CopyTo(copy_to),
+        plan: LogicalOperator::CopyTo(Box::new(copy_to)),
         names: output_names,
         types: output_types,
     }))
@@ -215,7 +215,7 @@ fn bind_copy_from(binder: &mut Binder, stmt: CopyStmt) -> Result<BoundStatementK
     )
     .with_bind_data(BoundTableFunctionData::new(bind_data));
 
-    let mut source = LogicalOperator::TableFunctionGet(table_function_get);
+    let mut source = LogicalOperator::TableFunctionGet(Box::new(table_function_get));
     if let Some(expr) = where_clause {
         let condition = bind_copy_from_where_clause(
             binder,

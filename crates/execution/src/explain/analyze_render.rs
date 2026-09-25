@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 
-use paro_planner::operator::{ExplainFormat, ExplainSpec};
+use paro_planner::logical::operator::{ExplainFormat, ExplainSpec};
 
 use crate::explain::profiler::{
     ExplainProfileEvent, ExplainProfileSnapshot, ExplainProfiler, ProfileMorselRange,
@@ -56,27 +56,30 @@ fn render_explain_analyze_text(
             for program in programs.pipelines.iter() {
                 lines.push(format!("PIPELINE {}", program.id.index()));
                 lines.push(format!(
-                    "  SOURCE #{} {}{}",
+                    "  SOURCE #{} {}{}{}",
                     program.source.operator_id.index(),
                     program.source.exec.name(),
                     actual_suffix(
                         &snapshot.operators,
                         program.source.operator_id.index() as u64
-                    )
+                    ),
+                    logical_node_suffix(program.source.origin.logical_plan_node)
                 ));
                 for transform in program.transforms.iter() {
                     lines.push(format!(
-                        "  TRANSFORM #{} {}{}",
+                        "  TRANSFORM #{} {}{}{}",
                         transform.operator_id.index(),
                         transform.exec.name(),
-                        actual_suffix(&snapshot.operators, transform.operator_id.index() as u64)
+                        actual_suffix(&snapshot.operators, transform.operator_id.index() as u64),
+                        logical_node_suffix(transform.origin.logical_plan_node)
                     ));
                 }
                 lines.push(format!(
-                    "  SINK #{} {}{}",
+                    "  SINK #{} {}{}{}",
                     program.sink.operator_id.index(),
                     program.sink.exec.name(),
-                    actual_suffix(&snapshot.operators, program.sink.operator_id.index() as u64)
+                    actual_suffix(&snapshot.operators, program.sink.operator_id.index() as u64),
+                    logical_node_suffix(program.sink.origin.logical_plan_node)
                 ));
             }
             render_control_regions_text(&snapshot.control_regions, &mut lines);
@@ -86,8 +89,8 @@ fn render_explain_analyze_text(
             lines.push(format!("UTILITY {:?}", utility.spec));
             render_profile_summary_text(snapshot, elapsed_ms, &mut lines);
         }
-        StatementProgram::ExplainAnalyze { .. } => {
-            unreachable!("nested EXPLAIN ANALYZE is rejected before rendering");
+        StatementProgram::Physical(_) | StatementProgram::ExplainAnalyze { .. } => {
+            unreachable!("unadmitted or nested EXPLAIN ANALYZE target reached rendering");
         }
     }
     lines
@@ -114,6 +117,7 @@ fn render_explain_analyze_json(
                     program.source.operator_id.index(),
                     "source",
                     program.source.exec.name(),
+                    program.source.origin.logical_plan_node,
                     &snapshot.operators,
                 ));
                 for transform in program.transforms.iter() {
@@ -122,6 +126,7 @@ fn render_explain_analyze_json(
                         transform.operator_id.index(),
                         "transform",
                         transform.exec.name(),
+                        transform.origin.logical_plan_node,
                         &snapshot.operators,
                     ));
                 }
@@ -130,6 +135,7 @@ fn render_explain_analyze_json(
                     program.sink.operator_id.index(),
                     "sink",
                     program.sink.exec.name(),
+                    program.sink.origin.logical_plan_node,
                     &snapshot.operators,
                 ));
             }
@@ -139,8 +145,8 @@ fn render_explain_analyze_json(
             "role": "utility",
             "operator": format!("{:?}", utility.spec),
         })],
-        StatementProgram::ExplainAnalyze { .. } => {
-            unreachable!("nested EXPLAIN ANALYZE is rejected before rendering");
+        StatementProgram::Physical(_) | StatementProgram::ExplainAnalyze { .. } => {
+            unreachable!("unadmitted or nested EXPLAIN ANALYZE target reached rendering");
         }
     };
     let mut output = serde_json::json!({
@@ -168,6 +174,7 @@ const PROFILE_SCHEMA_FIELDS: &[&str] = &[
     "pipeline_id",
     "work_unit_id",
     "operator_id",
+    "logical_node_id",
     "thread_id",
     "morsel_range",
     "phase",
@@ -497,15 +504,25 @@ fn operator_json(
     runtime_id: usize,
     role: &'static str,
     operator: &str,
+    logical_plan_node: Option<paro_planner::logical::plan::PlanNodeId>,
     stats: &HashMap<ExplainNodeId, ExplainActualStats>,
 ) -> serde_json::Value {
     serde_json::json!({
         "pipeline": pipeline,
         "runtime_id": runtime_id,
+        "logical_node_id": logical_plan_node.map(|node| node.0),
         "role": role,
         "operator": operator,
         "actual": actual_json(stats, runtime_id as u64),
     })
+}
+
+fn logical_node_suffix(
+    logical_plan_node: Option<paro_planner::logical::plan::PlanNodeId>,
+) -> String {
+    logical_plan_node
+        .map(|node| format!(" logical_node_id={}", node.0))
+        .unwrap_or_default()
 }
 
 fn recursive_cte_json(stats: &ExplainRecursiveCteStats) -> serde_json::Value {
@@ -571,6 +588,18 @@ fn write_runtime_suffix(suffix: &mut String, runtime: &ExplainRuntimeStats) {
         (
             "runtime_filter_no_wait_count",
             runtime.runtime_filter_no_wait_count,
+        ),
+        (
+            "aggregate_hash_full_key_fallback_count",
+            runtime.aggregate_hash_full_key_fallback_count,
+        ),
+        (
+            "aggregate_hash_max_prefix_probe_distance",
+            runtime.aggregate_hash_max_prefix_probe_distance,
+        ),
+        (
+            "aggregate_hash_max_radix_partition_skew_percent",
+            runtime.aggregate_hash_max_radix_partition_skew_percent,
         ),
         ("grant_bytes", runtime.grant_bytes),
         ("revoked_bytes", runtime.revoked_bytes),
@@ -686,6 +715,21 @@ fn insert_actual_runtime_json(actual: &mut serde_json::Value, runtime: &ExplainR
         "runtime_filter_no_wait_count",
         runtime.runtime_filter_no_wait_count,
     );
+    insert_optional_json_u64(
+        object,
+        "aggregate_hash_full_key_fallback_count",
+        runtime.aggregate_hash_full_key_fallback_count,
+    );
+    insert_optional_json_u64(
+        object,
+        "aggregate_hash_max_prefix_probe_distance",
+        runtime.aggregate_hash_max_prefix_probe_distance,
+    );
+    insert_optional_json_u64(
+        object,
+        "aggregate_hash_max_radix_partition_skew_percent",
+        runtime.aggregate_hash_max_radix_partition_skew_percent,
+    );
     insert_optional_json_u64(object, "grant_bytes", runtime.grant_bytes);
     insert_optional_json_u64(object, "revoked_bytes", runtime.revoked_bytes);
     insert_optional_json_u64(object, "yield_latency_us", runtime.yield_latency_us);
@@ -758,6 +802,9 @@ mod tests {
                     spilled_bytes: Some(8192),
                     scheduler_wait_time_us: Some(17),
                     runtime_filter_installed_count: Some(1),
+                    aggregate_hash_full_key_fallback_count: Some(2),
+                    aggregate_hash_max_prefix_probe_distance: Some(32),
+                    aggregate_hash_max_radix_partition_skew_percent: Some(125),
                     grant_bytes: Some(64),
                     allocator_tracking_event_count: Some(4),
                     ..ExplainRuntimeStats::default()
@@ -780,6 +827,18 @@ mod tests {
         assert_eq!(
             actual["runtime_filter_installed_count"],
             serde_json::Value::from(1)
+        );
+        assert_eq!(
+            actual["aggregate_hash_full_key_fallback_count"],
+            serde_json::Value::from(2)
+        );
+        assert_eq!(
+            actual["aggregate_hash_max_prefix_probe_distance"],
+            serde_json::Value::from(32)
+        );
+        assert_eq!(
+            actual["aggregate_hash_max_radix_partition_skew_percent"],
+            serde_json::Value::from(125)
         );
         assert_eq!(actual["grant_bytes"], serde_json::Value::from(64));
     }

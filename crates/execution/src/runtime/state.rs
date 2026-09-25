@@ -46,7 +46,9 @@ pub use crate::operators::join::state::{
     SortRangeProbeOffsets,
 };
 pub use crate::operators::result::state::{ClientResultSinkGlobal, ClientResultSinkLocal};
-pub use crate::operators::row_fetch::{RowFetchTableState, RowFetchTransformLocal};
+pub use crate::operators::row_fetch::{
+    RowFetchTableBinding, RowFetchTableState, RowFetchTransformGlobal, RowFetchTransformLocal,
+};
 pub use crate::operators::scan::state::{
     ChunkSourceGlobal, ChunkSourceLocal, EmptySourceGlobal, EmptySourceLocal,
     ExpressionSourceGlobal, ExpressionSourceLocal, PreparedRowsetPredicate, RowsetScanMorsel,
@@ -55,10 +57,11 @@ pub use crate::operators::scan::state::{
 };
 pub use crate::operators::search::state::{SearchSourceGlobal, SearchSourceLocal};
 pub use crate::operators::set::state::{
-    CteMaterializeSinkLocal, CteScanSourceLocal, DelimCaptureSinkGlobal, DelimCaptureSinkLocal,
-    DelimScanSourceLocal, RecursiveTableAppendSinkGlobal, RecursiveTableAppendSinkLocal,
-    RecursiveTableScanSourceLocal, SetOperationEmitSourceLocal, SetOperationInputSinkLocal,
+    DelimCaptureSinkGlobal, DelimCaptureSinkLocal, DelimScanSourceLocal,
+    RecursiveTableAppendSinkGlobal, RecursiveTableAppendSinkLocal, RecursiveTableScanSourceLocal,
+    SetOperationEmitSourceLocal, SetOperationInputSinkLocal,
 };
+pub use crate::operators::set::{CteMaterializeSinkLocal, CteScanSourceGlobal, CteScanSourceLocal};
 pub use crate::operators::sort::state::{
     SortBuildSinkLocal, SortEmitSourceLocal, StreamingTopNTransformGlobal,
     StreamingTopNTransformLocal, TopNBuildSinkLocal, TopNEmitSourceLocal,
@@ -147,7 +150,7 @@ pub enum SourceGlobal {
     WindowEmit(Arc<BreakerHandleGlobal<WindowHandle>>),
     PartitionAggregateWindowEmit(Arc<PartitionAggregateEmitGlobal>),
     SetOperationEmit(Arc<BreakerHandleGlobal<SetOperationHandle>>),
-    CteScan(Arc<BreakerHandleGlobal<CteHandle>>),
+    CteScan(Arc<CteScanSourceGlobal>),
     DelimScan(Arc<BreakerHandleGlobal<DelimHandle>>),
     RecursiveTableScan(Arc<BreakerHandleGlobal<RecursiveTableHandle>>),
     Search(Arc<SearchSourceGlobal>),
@@ -342,6 +345,7 @@ pub enum TransformGlobal {
     ExternalProject(Arc<ExternalProjectTransformGlobal>),
     GraphExpand(Arc<GraphExpandTransformGlobal>),
     GraphShortestPath(Arc<GraphShortestPathTransformGlobal>),
+    RowFetch(Arc<RowFetchTransformGlobal>),
     Dyn(DynGlobalStateBox),
 }
 

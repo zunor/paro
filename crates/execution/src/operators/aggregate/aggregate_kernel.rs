@@ -659,10 +659,9 @@ mod tests {
         );
         let bound = AggregateExpression::new(
             function,
-            vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::BigInt,
-            ))],
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::BigInt).into(),
+            )],
             LogicalType::BigInt,
         )
         .with_aggr_type(AggregateType::NonDistinct);

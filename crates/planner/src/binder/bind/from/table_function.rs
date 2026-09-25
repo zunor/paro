@@ -340,7 +340,8 @@ fn bind_external_table_routine_ref(
                 .cloned()
                 .unwrap_or(paro_common::types::LogicalType::Unknown),
         )
-        .with_routine_meta(routine_meta.clone()),
+        .with_routine_meta(routine_meta.clone())
+        .into(),
     );
 
     Ok(BoundFromItem::ExternalRoutine(BoundExternalRoutine {

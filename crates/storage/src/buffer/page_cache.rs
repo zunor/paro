@@ -8,7 +8,7 @@
 //! codec-decoded representations have independent eviction slots.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use bytes::Bytes;
@@ -220,7 +220,7 @@ impl PageCacheEntryState {
 struct PageCacheEntry {
     state: Mutex<PageCacheEntryState>,
     cvar: Condvar,
-    decoded_accesses: AtomicU8,
+    decoded_accesses: AtomicU32,
 }
 
 impl PageCacheEntry {
@@ -228,19 +228,20 @@ impl PageCacheEntry {
         Self {
             state: Mutex::new(PageCacheEntryState::new()),
             cvar: Condvar::new(),
-            decoded_accesses: AtomicU8::new(0),
+            decoded_accesses: AtomicU32::new(0),
         }
     }
 
-    /// A first sparse access leaves the page on probation. Repeated access is
-    /// evidence of reuse and promotes it into the decoded cache. Saturation
-    /// preserves that history without adding global admission metadata.
-    fn observe_sparse_decoded_access(&self) -> bool {
-        self.decoded_accesses
+    /// Record a sparse access while the page is on probation. Saturation
+    /// preserves frequency evidence without adding global admission metadata.
+    fn observe_sparse_decoded_access(&self) -> u32 {
+        let previous = self
+            .decoded_accesses
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 Some(count.saturating_add(1))
             })
-            .is_ok_and(|previous| previous > 0)
+            .expect("saturating sparse-access update cannot fail");
+        previous.saturating_add(1)
     }
 }
 
@@ -385,6 +386,11 @@ pub struct PageCacheStats {
     evictions: AtomicU64,
     entries: AtomicUsize,
     decoded_admission_rejections: AtomicU64,
+    decoded_hits: AtomicU64,
+    decoded_misses: AtomicU64,
+    decoded_first_touch_admissions: AtomicU64,
+    decoded_probation_promotions: AtomicU64,
+    decoded_policy_rejections: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +404,11 @@ pub struct PageCacheStatsSnapshot {
     pub decoded_physical_bytes: usize,
     pub decoded_capacity: usize,
     pub decoded_admission_rejections: u64,
+    pub decoded_hits: u64,
+    pub decoded_misses: u64,
+    pub decoded_first_touch_admissions: u64,
+    pub decoded_probation_promotions: u64,
+    pub decoded_policy_rejections: u64,
 }
 
 impl PageCacheStats {
@@ -416,6 +427,13 @@ impl PageCacheStats {
             decoded_physical_bytes,
             decoded_capacity: decoded.options.decoded_capacity,
             decoded_admission_rejections: self.decoded_admission_rejections.load(Ordering::Relaxed),
+            decoded_hits: self.decoded_hits.load(Ordering::Relaxed),
+            decoded_misses: self.decoded_misses.load(Ordering::Relaxed),
+            decoded_first_touch_admissions: self
+                .decoded_first_touch_admissions
+                .load(Ordering::Relaxed),
+            decoded_probation_promotions: self.decoded_probation_promotions.load(Ordering::Relaxed),
+            decoded_policy_rejections: self.decoded_policy_rejections.load(Ordering::Relaxed),
         }
     }
 }
@@ -464,13 +482,33 @@ impl PageCache {
         self.stats.snapshot(&decoded, decoded_physical_bytes)
     }
 
-    /// Return whether a sparse codec access has demonstrated reuse and should
-    /// be promoted to the decoded cache. The probation counter shares the
-    /// lifetime of the physical page entry, keeping admission metadata bounded
-    /// by the page cache itself.
-    pub(crate) fn should_promote_sparse_decoded(&self, key: &PageKey) -> bool {
+    /// Record and return the page-local sparse-access frequency. The probation
+    /// counter shares the lifetime of the physical page entry, keeping
+    /// admission metadata bounded by the page cache itself.
+    pub(crate) fn observe_sparse_decoded_access(&self, key: &PageKey) -> Option<u32> {
         let entry = self.entries.read().unwrap().get(key).cloned();
-        entry.is_some_and(|entry| entry.observe_sparse_decoded_access())
+        entry.map(|entry| entry.observe_sparse_decoded_access())
+    }
+
+    pub(crate) fn record_decoded_first_touch_admission(&self) {
+        self.stats
+            .decoded_first_touch_admissions
+            .fetch_add(1, Ordering::Relaxed);
+        storage_metrics().inc_decoded_page_cache_first_touch_admission();
+    }
+
+    pub(crate) fn record_decoded_probation_promotion(&self) {
+        self.stats
+            .decoded_probation_promotions
+            .fetch_add(1, Ordering::Relaxed);
+        storage_metrics().inc_decoded_page_cache_probation_promotion();
+    }
+
+    pub(crate) fn record_decoded_policy_rejection(&self) {
+        self.stats
+            .decoded_policy_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        storage_metrics().inc_decoded_page_cache_policy_rejection();
     }
 
     /// Non-blocking lookup for a cached page.
@@ -480,14 +518,14 @@ impl PageCache {
             guard.get(key).cloned()
         };
         let Some(entry) = entry else {
-            self.record_miss();
+            self.record_miss(kind);
             return None;
         };
 
         let slot_handle = {
             let state = entry.state.lock().unwrap();
             if state.removing {
-                self.record_miss();
+                self.record_miss(kind);
                 return None;
             }
             match state.slot(kind) {
@@ -498,28 +536,22 @@ impl PageCache {
                     slot.handle.clone()
                 }
                 PageSlotState::Empty | PageSlotState::Loading | PageSlotState::Failed(_) => {
-                    self.record_miss();
+                    self.record_miss(kind);
                     return None;
                 }
             }
         };
 
-        if !slot_handle.is_loaded() {
-            self.handle_unloaded(key, &entry, kind);
-            self.record_miss();
-            return None;
-        }
-
-        let buffer = match self.buffer_pool.pin(slot_handle.block_id()) {
-            Ok(buf) => buf,
-            Err(_) => {
+        let buffer = match self.buffer_pool.pin_resident(slot_handle.block_id()) {
+            Some(buffer) => buffer,
+            None => {
                 self.handle_unloaded(key, &entry, kind);
-                self.record_miss();
+                self.record_miss(kind);
                 return None;
             }
         };
 
-        self.record_hit();
+        self.record_hit(kind);
         Some(PageCacheHandle::new(buffer, kind))
     }
 
@@ -536,7 +568,11 @@ impl PageCache {
                 Ok(())
             });
         }
-        self.get_or_load(key, kind, || Ok(data)).map(Some)
+        self.get_or_load_into(key, kind, data.len(), |destination| {
+            destination.copy_from_slice(&data);
+            Ok(())
+        })
+        .map(Some)
     }
 
     /// Get a cached page or load it with single-flight semantics.
@@ -569,14 +605,12 @@ impl PageCache {
                     let slot_handle = slot.handle.clone();
                     drop(state);
 
-                    if !slot_handle.is_loaded() {
-                        self.handle_unloaded(&key, &entry, kind);
-                        continue;
+                    if let Some(buffer) = self.buffer_pool.pin_resident(slot_handle.block_id()) {
+                        self.record_hit(kind);
+                        return Ok(PageCacheHandle::new(buffer, kind));
                     }
-
-                    let buffer = self.buffer_pool.pin(slot_handle.block_id())?;
-                    self.record_hit();
-                    return Ok(PageCacheHandle::new(buffer, kind));
+                    self.handle_unloaded(&key, &entry, kind);
+                    continue;
                 }
                 PageSlotState::Loading => {
                     state = entry.cvar.wait(state).unwrap();
@@ -593,7 +627,7 @@ impl PageCache {
                     *state.slot_mut(kind) = PageSlotState::Loading;
                     drop(state);
 
-                    self.record_miss();
+                    self.record_miss(kind);
                     let data = match loader() {
                         Ok(data) => data,
                         Err(err) => {
@@ -624,6 +658,127 @@ impl PageCache {
                     return Ok(PageCacheHandle::new(buffer, kind));
                 }
             }
+        }
+    }
+
+    /// Get a cached page or initialize its allocation in place.
+    ///
+    /// The initializer owns the source-side I/O/decode operation and writes
+    /// exactly `size` bytes into the cache allocation.  This is the ownership
+    /// boundary for page readers: the cache remains the owner of the backing
+    /// storage, while the returned handle keeps that storage pinned for the
+    /// immutable consumer view.  The method is intentionally separate from
+    /// `get_or_load` so callers which cannot size their destination up front
+    /// keep the legacy Vec-returning contract.
+    pub fn get_or_load_into<F>(
+        &self,
+        key: PageKey,
+        kind: PageContentKind,
+        size: usize,
+        initializer: F,
+    ) -> Result<PageCacheHandle>
+    where
+        F: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        if kind == PageContentKind::Decoded {
+            return Err(paro_error::invalid_input(
+                "decoded pages require the decoded admission loader",
+            ));
+        }
+        if size == 0 {
+            return Err(paro_error::invalid_input("page data is empty"));
+        }
+
+        loop {
+            let (entry, _) = self.get_or_insert_entry(&key);
+
+            let mut state = entry.state.lock().unwrap();
+            if state.removing {
+                while !state.removed {
+                    state = entry.cvar.wait(state).unwrap();
+                }
+                continue;
+            }
+            match state.slot_mut(kind) {
+                PageSlotState::Ready(slot) => {
+                    let slot_handle = slot.handle.clone();
+                    drop(state);
+
+                    if let Some(buffer) = self.buffer_pool.pin_resident(slot_handle.block_id()) {
+                        self.record_hit(kind);
+                        return Ok(PageCacheHandle::new(buffer, kind));
+                    }
+                    self.handle_unloaded(&key, &entry, kind);
+                    continue;
+                }
+                PageSlotState::Loading => {
+                    state = entry.cvar.wait(state).unwrap();
+                    continue;
+                }
+                PageSlotState::Failed(err) => {
+                    let err = err.clone();
+                    *state.slot_mut(kind) = PageSlotState::Empty;
+                    drop(state);
+                    self.maybe_remove_entry(&key, &entry);
+                    return Err(paro_error::internal(err));
+                }
+                PageSlotState::Empty => {
+                    *state.slot_mut(kind) = PageSlotState::Loading;
+                    drop(state);
+                }
+            }
+
+            self.record_miss(kind);
+            let buffer = match self.allocate(kind, size) {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    self.cancel_loading(&key, &entry, kind);
+                    return Err(err);
+                }
+            };
+            let _cold_work = paro_common::cold_work::WorkScope::new(
+                paro_common::cold_work::Kind::BufferFill,
+                size,
+            );
+
+            // SAFETY: the newly allocated buffer is pinned by `buffer` and is
+            // not reachable from the cache until initialization succeeds.
+            let initialize_result = unsafe {
+                buffer
+                    .data_mut()
+                    .ok_or_else(|| paro_error::internal("page cache buffer missing"))
+                    .and_then(initializer)
+            };
+            if let Err(err) = initialize_result {
+                let block_id = buffer.block_handle().map(|block| block.block_id());
+                drop(buffer);
+                if let Some(block_id) = block_id {
+                    let _ = self.buffer_pool.free(block_id);
+                }
+                self.fail_loading(&entry, kind, &err);
+                return Err(err);
+            }
+
+            let Some(block_handle) = buffer.block_handle().cloned() else {
+                let err = paro_error::internal("page cache block handle missing");
+                let block_id = buffer.block_handle().map(|block| block.block_id());
+                drop(buffer);
+                if let Some(block_id) = block_id {
+                    let _ = self.buffer_pool.free(block_id);
+                }
+                self.fail_loading(&entry, kind, &err);
+                return Err(err);
+            };
+
+            let mut state = entry.state.lock().unwrap();
+            *state.slot_mut(kind) = PageSlotState::Ready(PageSlot {
+                handle: block_handle,
+                decoded_meta: None,
+            });
+            entry.cvar.notify_all();
+            drop(state);
+
+            return Ok(PageCacheHandle::new(buffer, kind));
         }
     }
 
@@ -660,13 +815,12 @@ impl PageCache {
                         meta.referenced.store(true, Ordering::Relaxed);
                     }
                     drop(state);
-                    if !slot_handle.is_loaded() {
-                        self.handle_unloaded(&key, &entry, PageContentKind::Decoded);
-                        continue;
+                    if let Some(buffer) = self.buffer_pool.pin_resident(slot_handle.block_id()) {
+                        self.record_hit(PageContentKind::Decoded);
+                        return Ok(Some(PageCacheHandle::new(buffer, PageContentKind::Decoded)));
                     }
-                    let buffer = self.buffer_pool.pin(slot_handle.block_id())?;
-                    self.record_hit();
-                    return Ok(Some(PageCacheHandle::new(buffer, PageContentKind::Decoded)));
+                    self.handle_unloaded(&key, &entry, PageContentKind::Decoded);
+                    continue;
                 }
                 PageSlotState::Loading => {
                     drop(entry.cvar.wait(state).unwrap());
@@ -685,7 +839,7 @@ impl PageCache {
                 }
             }
 
-            self.record_miss();
+            self.record_miss(PageContentKind::Decoded);
             let Some(buffer) = self.try_allocate_decoded(key, size) else {
                 self.cancel_loading(&key, &entry, PageContentKind::Decoded);
                 self.stats
@@ -693,6 +847,11 @@ impl PageCache {
                     .fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
             };
+
+            let _cold_work = paro_common::cold_work::WorkScope::new(
+                paro_common::cold_work::Kind::BufferFill,
+                size,
+            );
 
             // SAFETY: this newly allocated buffer is pinned by `buffer` and
             // is not reachable from the cache until initialization succeeds.
@@ -962,14 +1121,22 @@ impl PageCache {
     }
 
     #[inline]
-    fn record_hit(&self) {
+    fn record_hit(&self, kind: PageContentKind) {
         self.stats.hits.fetch_add(1, Ordering::Relaxed);
+        if kind == PageContentKind::Decoded {
+            self.stats.decoded_hits.fetch_add(1, Ordering::Relaxed);
+            storage_metrics().inc_decoded_page_cache_hit();
+        }
         storage_metrics().inc_page_cache_hit();
     }
 
     #[inline]
-    fn record_miss(&self) {
+    fn record_miss(&self, kind: PageContentKind) {
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        if kind == PageContentKind::Decoded {
+            self.stats.decoded_misses.fetch_add(1, Ordering::Relaxed);
+            storage_metrics().inc_decoded_page_cache_miss();
+        }
         storage_metrics().inc_page_cache_miss();
     }
 
@@ -990,6 +1157,10 @@ impl PageCache {
         kind: PageContentKind,
         data: &[u8],
     ) -> Result<(BufferHandle, SharedBlockHandle)> {
+        let _cold_work = paro_common::cold_work::WorkScope::new(
+            paro_common::cold_work::Kind::BufferFill,
+            data.len(),
+        );
         if data.is_empty() {
             return Err(paro_error::invalid_input("page data is empty"));
         }
@@ -1051,6 +1222,99 @@ mod tests {
     }
 
     #[test]
+    fn in_place_loader_uses_cache_allocation_and_reuses_it() {
+        let pool = BufferPool::new_arc(1024 * 1024);
+        let cache = PageCache::new(pool.clone());
+        let key = PageKey::new(1, 2, 0, 3, 1024, 4);
+        let source = [1_u8, 2, 3, 4];
+
+        let first = cache
+            .get_or_load_into(
+                key,
+                PageContentKind::Compressed,
+                source.len(),
+                |destination| {
+                    destination.copy_from_slice(&source);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let first_ptr = first.data().unwrap().as_ptr();
+        assert_eq!(first.data().unwrap(), source);
+        assert_eq!(
+            pool.get_tag_usage(MemoryTag::PageCache),
+            source.len() as i64
+        );
+        drop(first);
+
+        let mut initialized = false;
+        let second = cache
+            .get_or_load_into(
+                key,
+                PageContentKind::Compressed,
+                source.len(),
+                |destination| {
+                    initialized = true;
+                    destination.fill(9);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(!initialized);
+        assert_eq!(second.data().unwrap().as_ptr(), first_ptr);
+        assert_eq!(second.data().unwrap(), source);
+    }
+
+    #[test]
+    fn in_place_loader_failure_releases_memory_before_retry() {
+        let pool = BufferPool::new_arc(1024 * 1024);
+        let cache = PageCache::new(pool.clone());
+        let key = PageKey::new(1, 2, 0, 3, 1024, 4);
+
+        let first = cache.get_or_load_into(key, PageContentKind::Compressed, 4, |_destination| {
+            Err(paro_common::error::data_corrupted("synthetic read failure"))
+        });
+        assert!(first.is_err());
+        assert_eq!(pool.get_tag_usage(MemoryTag::PageCache), 0);
+
+        let failed_retry =
+            cache.get_or_load_into(key, PageContentKind::Compressed, 4, |destination| {
+                destination.fill(2);
+                Ok(())
+            });
+        assert!(failed_retry.is_err());
+
+        let recovered = cache
+            .get_or_load_into(key, PageContentKind::Compressed, 4, |destination| {
+                destination.fill(3);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(recovered.data().unwrap(), &[3; 4]);
+        assert_eq!(pool.get_tag_usage(MemoryTag::PageCache), 4);
+    }
+
+    #[test]
+    fn evicted_page_is_reloaded_from_its_source() {
+        let pool = BufferPool::new_arc(1024);
+        let cache = PageCache::new(pool.clone());
+        let key = PageKey::new(1, 2, 0, 3, 1024, 256);
+        let handle = cache
+            .get_or_load(key, PageContentKind::Compressed, || Ok(vec![1; 1024]))
+            .unwrap();
+        drop(handle);
+
+        let eviction = pool.evict_blocks(MemoryTag::PageCache, 0, 0, None);
+        assert!(eviction.success);
+
+        let reloaded = cache
+            .get_or_load(key, PageContentKind::Compressed, || Ok(vec![2; 1024]))
+            .unwrap();
+        assert_eq!(reloaded.data().unwrap()[0], 2);
+        assert_eq!(cache.stats().evictions, 1);
+    }
+
+    #[test]
     fn page_cache_handle_converts_to_zero_copy_bytes() {
         let pool = BufferPool::new_arc(1024 * 1024);
         let cache = PageCache::new(pool);
@@ -1064,6 +1328,9 @@ mod tests {
         let bytes = handle.try_into_bytes().unwrap();
         assert_eq!(bytes.as_ptr(), cached_ptr);
         assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
+        drop(cache.lookup(&key, PageContentKind::Decoded));
+        assert_eq!(cache.stats().decoded_misses, 1);
+        assert_eq!(cache.stats().decoded_hits, 1);
         assert!(cache.remove(&key));
         assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
     }

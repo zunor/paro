@@ -17,12 +17,58 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
 use crate::scalar::executor::variadic::{execute_concat, execute_concat_ws};
+use crate::scalar::executor::varlen::VarcharResultWriter;
 use crate::{ExpressionState, FunctionNullHandling, ScalarFunction, ScalarFunctionSet};
 
 /// Implementation of `concat(VARCHAR...) -> VARCHAR`.
 /// NULL values are treated as empty strings.
 fn concat_varchar(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
     execute_concat(input, result)
+}
+
+/// Binary SQL `||` implementation. Its default null handling deliberately
+/// differs from `concat(...)`: the operator is strict, while the variadic
+/// function treats NULL as an empty string.
+fn string_concat_varchar(
+    input: &Chunk,
+    _state: &dyn ExpressionState,
+    result: &mut Vector,
+) -> Result<()> {
+    let count = input.size();
+    let left = input
+        .column(0)
+        .expect("bound string_concat has a left operand")
+        .try_to_utf8_view(count)?;
+    let right = input
+        .column(1)
+        .expect("bound string_concat has a right operand")
+        .try_to_utf8_view(count)?;
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
+
+    for row in 0..count {
+        if !left.is_valid(row) || !right.is_valid(row) {
+            writer.set_null(row);
+            continue;
+        }
+        let left = left.str(row);
+        let right = right.str(row);
+        let mut value = String::with_capacity(left.len() + right.len());
+        value.push_str(left);
+        value.push_str(right);
+        writer.write_str(row, &value)?;
+    }
+    Ok(())
+}
+
+pub fn get_string_concat_functions() -> ScalarFunctionSet {
+    let mut set = ScalarFunctionSet::new("string_concat".to_string());
+    set.add_function(ScalarFunction::new(
+        "string_concat".to_string(),
+        vec![LogicalType::Varchar, LogicalType::Varchar],
+        LogicalType::Varchar,
+        string_concat_varchar,
+    ));
+    set
 }
 
 /// Implementation of `concat_ws(VARCHAR, VARCHAR...) -> VARCHAR`.
@@ -139,6 +185,26 @@ mod tests {
         // NULL is treated as empty string
         assert_eq!(result.get_string(0), Some("helloworld"));
         assert_eq!(result.get_string(1), Some("foo-bar"));
+    }
+
+    #[test]
+    fn string_concat_operator_propagates_null() {
+        let mut left = paro_common::test_utils::test_string_vector_with_allocator(
+            &["hello", "ignored"],
+            paro_common::test_utils::test_allocator(),
+        );
+        left.validity_mut().set_null(1);
+        let right = paro_common::test_utils::test_string_vector_with_allocator(
+            &[" world", "suffix"],
+            paro_common::test_utils::test_allocator(),
+        );
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![left, right]);
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
+
+        string_concat_varchar(&chunk, &MockState, &mut result).unwrap();
+
+        assert_eq!(result.get_string(0), Some("hello world"));
+        assert!(result.is_null(1));
     }
 
     #[test]

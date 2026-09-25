@@ -96,13 +96,21 @@ pub(crate) fn ymd_to_days(year: i32, month: u32, day: u32) -> i64 {
 
 /// Parse a date string in YYYY-MM-DD format.
 fn parse_date(s: &str) -> Option<i32> {
-    let s = s.trim();
+    let mut s = s.trim();
 
     // Handle special values
     match s.to_lowercase().as_str() {
         "infinity" | "inf" => return Some(i32::MAX),
         "-infinity" | "-inf" => return Some(i32::MIN),
         _ => {}
+    }
+
+    // SQL DATE input accepts a complete timestamp literal and discards its
+    // time-of-day. Validate the complete timestamp first so arbitrary text
+    // after an otherwise valid date is never silently accepted.
+    if let Some(separator) = s.find([' ', 'T']) {
+        parse_timestamp(s)?;
+        s = &s[..separator];
     }
 
     // Parse YYYY-MM-DD format
@@ -361,7 +369,9 @@ fn datetime_to_micros(
 }
 
 /// Parse a timestamp string in various formats.
-/// Supports: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, YYYY-MM-DD HH:MM:SS.ffffff
+/// Supports: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, and fractional seconds.
+/// A timezone suffix is accepted and ignored, matching the SQL semantics of
+/// `TIMESTAMP WITHOUT TIME ZONE` input.
 fn parse_timestamp(s: &str) -> Option<i64> {
     let s = s.trim();
 
@@ -372,11 +382,20 @@ fn parse_timestamp(s: &str) -> Option<i64> {
         _ => {}
     }
 
-    // Split date and time parts
-    let parts: Vec<&str> = s.split([' ', 'T']).collect();
+    let (date_str, time_str) = match s.find([' ', 'T']) {
+        Some(separator) => {
+            let raw_time = s[separator + 1..].trim();
+            let timezone_start = raw_time
+                .char_indices()
+                .find(|(_, ch)| !(ch.is_ascii_digit() || *ch == ':' || *ch == '.'))
+                .map(|(index, _)| index)
+                .unwrap_or(raw_time.len());
+            (&s[..separator], Some(&raw_time[..timezone_start]))
+        }
+        None => (s, None),
+    };
 
     // Parse date part
-    let date_str = parts.first()?;
     let date_parts: Vec<&str> = date_str.split('-').collect();
     if date_parts.len() != 3 {
         return None;
@@ -402,9 +421,7 @@ fn parse_timestamp(s: &str) -> Option<i64> {
     }
 
     // Parse time part (if present)
-    let (hour, minute, second, micros) = if parts.len() > 1 {
-        let time_str = parts[1];
-
+    let (hour, minute, second, micros) = if let Some(time_str) = time_str {
         // Split time and fractional seconds
         let (time_main, frac) = if let Some(dot_pos) = time_str.find('.') {
             (&time_str[..dot_pos], Some(&time_str[dot_pos + 1..]))
@@ -1384,11 +1401,13 @@ mod tests {
         let expected = i32::try_from(ymd_to_days(2024, 6, 15)).unwrap();
         assert_eq!(parse_date("2024-06-15"), Some(expected));
         assert_eq!(parse_date("  2024-06-15  "), Some(expected));
+        assert_eq!(parse_date("2024-06-15T23:59:58.123+09:30"), Some(expected));
 
         // Invalid formats
         assert_eq!(parse_date("not-a-date"), None);
         assert_eq!(parse_date("2024-13-01"), None); // Invalid month
         assert_eq!(parse_date("2024-02-30"), None); // Invalid day
+        assert_eq!(parse_date("2024-06-15Tnot-a-time"), None);
 
         // Special values
         assert_eq!(parse_date("infinity"), Some(i32::MAX));
@@ -1531,6 +1550,10 @@ mod tests {
 
         // ISO format with T separator
         assert_eq!(parse_timestamp("1970-01-01T00:00:00"), Some(0));
+        assert_eq!(
+            parse_timestamp("1970-01-01T00:00:00.123+09:30"),
+            Some(123_000)
+        );
 
         // Trimmed whitespace
         assert_eq!(

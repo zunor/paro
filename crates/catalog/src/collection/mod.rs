@@ -525,7 +525,14 @@ impl CatalogCollection {
             .flatten()
     }
 
-    /// Lazily create a committed entry after winning the install race on `name`.
+    /// Lazily materialize an immutable committed entry after winning the install
+    /// race on `name`.
+    ///
+    /// Default catalog objects are logically visible before their in-memory
+    /// entry is materialized. Installing that cache entry creates neither an
+    /// MVCC version chain nor obsolete state for GC, so it must not advance the
+    /// catalog mutation epoch. Real catalog mutations use the staged write
+    /// APIs, which do advance it.
     pub fn create_committed_entry_lazy<F>(
         &self,
         name: &str,
@@ -558,7 +565,6 @@ impl CatalogCollection {
         );
         drop(map);
         drop(_write_lock);
-        self.mark_gc_dirty();
         Ok(Some(entry))
     }
 
@@ -1555,6 +1561,23 @@ mod tests {
         let entry2 = make_schema_entry("schema1", 0);
         let result2 = set.create_committed_entry(entry2);
         assert!(result2.is_none());
+    }
+
+    #[test]
+    fn immutable_default_materialization_does_not_advance_gc_epoch() {
+        let gc_epoch = Arc::new(AtomicU64::new(41));
+        let set = CatalogCollection::new(
+            "test".to_string(),
+            CollectionLockKey::database_schemas(),
+            Arc::clone(&gc_epoch),
+        );
+
+        let inserted = set
+            .create_committed_entry_lazy("schema1", || Some(make_schema_entry("schema1", 0)))
+            .expect("default materialization");
+
+        assert!(inserted.is_some());
+        assert_eq!(gc_epoch.load(Ordering::Relaxed), 41);
     }
 
     #[test]

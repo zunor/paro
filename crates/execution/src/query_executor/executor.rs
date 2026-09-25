@@ -3,6 +3,7 @@
 
 //! Query executor for typed runtime programs.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,16 +11,23 @@ use paro_common::allocator::{BufferAllocator, MemoryTag};
 use paro_common::error::Result;
 use paro_common::logging::targets;
 use paro_common::types::LogicalType;
-use paro_context::{QueryMemoryBudgetSpec, QueryMemoryTarget, StatementContext};
+use paro_context::{
+    AdmissionFallback, AdmissionResult, ExecutionReceiptHandle, ExecutionReceiptStart,
+    MemoryCompletionReceipt, QueryMemoryBudgetSpec, QueryMemoryTarget, ResourceReceipt,
+    StatementContext,
+};
 use paro_scheduler::scheduler::TaskScheduler;
 use tracing::debug;
 
-use crate::memory_runtime::QueryMemoryPool;
-use crate::query_executor::compiled::ExecutionRequest;
+use crate::memory_runtime::{ExecutionLease, QueryMemoryPool};
+use crate::pipeline::{AdmissionSelection, SelectedStatementProgram};
+use crate::query_executor::compiled::{CompiledStatement, ExecutionRequest};
 use crate::query_executor::program_executor;
 use crate::runtime::ParameterBindings;
 
 use super::stream::ResultHandler;
+
+static NEXT_STANDALONE_EXECUTION_ID: AtomicU64 = AtomicU64::new(1_u64 << 63);
 
 /// Executor holds a StatementContext Arc to avoid lifetime pollution.
 pub struct Executor {
@@ -46,11 +54,15 @@ impl Executor {
 
     /// Execute a typed runtime program and return a streaming result handler.
     pub fn execute(&self, request: ExecutionRequest) -> Result<ResultHandler> {
-        let (compiled, parameter_bindings) = request.into_parts();
+        let (compiled, parameter_bindings, statement_decision_id) = request.into_parts();
         let result_names = compiled.result_names();
         let result_types = compiled.result_types();
         let is_query = !result_names.is_empty();
         let started_at = Instant::now();
+        let statement_trace = self.session.statement_trace();
+        if let Some(trace) = &statement_trace {
+            trace.record_event("execution", "executor_entry");
+        }
         debug!(
             target: targets::EXECUTOR,
             is_query,
@@ -64,14 +76,108 @@ impl Executor {
         )) as Arc<dyn paro_common::allocator::Allocator>;
 
         let query_memory_pool = self.create_query_memory_pool();
-        let handler = self.execute_program(
-            compiled.program(),
+        // Portfolio admission models configured capacity. Runtime readiness is
+        // an execution capability with its own typed diagnostics; collapsing
+        // the two here turns a precise unavailable/misconfigured error into a
+        // misleading "no physical variant" planning failure.
+        let external_worker_slots = self.session.python_execution_slot_limit();
+        if let Some(trace) = &statement_trace {
+            trace.record_event("admission", "admission_entry");
+        }
+        // Own the execution identity before admission starts.  A later
+        // reservation or lowering failure must update this same receipt; it
+        // must not create a second failure-only record after admission.
+        let receipt = self
+            .session
+            .diagnostics
+            .begin_execution_receipt(ExecutionReceiptStart {
+                statement_decision_id,
+                artifact_identity: compiled.artifact_identity(),
+                expected_class: compiled.expected_grant_class(),
+                actual_class: None,
+                actual_fingerprint: None,
+                resources: None,
+                admission: AdmissionResult::Failed,
+                fallback: None,
+            });
+        let admission_started = Instant::now();
+        let admitted = self.admit_program(
+            &compiled,
+            &query_memory_pool,
+            external_worker_slots,
+            &receipt,
+        );
+        if let Some(trace) = &statement_trace {
+            trace.record_span("admission", "lower_and_admit", admission_started);
+        }
+        let (selected, execution_lease, selection, fallback) = match admitted {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                // Close the one receipt created before admission.  For an
+                // unselected failure this preserves NotExecuted; when a
+                // selected reservation/lowering path reported the error, the
+                // same handle retains that selection and archives Failed.
+                if error.sqlstate().is_resource_error() {
+                    receipt.infeasible(error.to_string());
+                } else {
+                    receipt.fail(error.to_string());
+                }
+                if let Some(trace) = &statement_trace {
+                    trace.record_event("admission", "admission_error");
+                }
+                return Err(error);
+            }
+        };
+        receipt.selected(
+            selection.map(|selection| selection.resources.class.0),
+            selection.map(|selection| fingerprint_words(selection.physical_fingerprint)),
+            selection.map(|selection| resource_receipt(selection.resources)),
+            fallback,
+        );
+        if let Some(lease) = execution_lease {
+            if let Err(error) = query_memory_pool.install_execution_lease(lease) {
+                receipt.reservation_failed(error.to_string());
+                receipt.fail(error.to_string());
+                return Err(error);
+            }
+            if let Some(trace) = &statement_trace {
+                trace.record_event("admission", "resource_grant_published");
+            }
+        }
+        let program = match selected.lower() {
+            Ok(program) => program,
+            Err(error) => {
+                // Admission already selected and reserved this operating
+                // point. Lowering failure is a distinct post-selection
+                // failure, never an Infeasible/no-plan result.
+                receipt.lowering_failed(error.to_string());
+                return Err(error);
+            }
+        };
+        receipt.lowering_ready();
+        if let Some(trace) = &statement_trace {
+            trace.record_event("execution", "pipeline_dispatch_entry");
+        }
+        let handler = match self.execute_program(
+            &program,
             result_names,
             result_types,
             parameter_bindings,
             allocator,
             query_memory_pool,
-        )?;
+            Some(receipt.clone()),
+        ) {
+            Ok(handler) => handler,
+            Err(error) => {
+                receipt.fail(error.to_string());
+                return Err(error);
+            }
+        };
+        receipt.image_ready();
+        if let Some(trace) = &statement_trace {
+            trace.record_event("execution", "result_handler_ready");
+            trace.record_event("execution", "executor_return");
+        }
         debug!(
             target: targets::EXECUTOR,
             is_query,
@@ -79,6 +185,155 @@ impl Executor {
             "Execution pipelines completed"
         );
         Ok(handler)
+    }
+
+    /// Resolve one immutable artifact and acquire every selected resource.
+    ///
+    /// External capacity is acquired before memory so a worker race cannot
+    /// strand a capacity floor. A memory race drops the external lease and
+    /// monotonically retries a lower operating point. The returned lease is
+    /// published exactly once before physical runtime construction.
+    fn admit_program(
+        &self,
+        compiled: &CompiledStatement,
+        query_memory_pool: &Arc<QueryMemoryPool>,
+        available_external_worker_slots: u16,
+        receipt: &ExecutionReceiptHandle,
+    ) -> Result<(
+        SelectedStatementProgram,
+        Option<ExecutionLease>,
+        Option<AdmissionSelection>,
+        Option<AdmissionFallback>,
+    )> {
+        let available_parallel_tasks =
+            u16::try_from(self.session.number_of_threads()).unwrap_or(u16::MAX);
+        let mut memory_ceiling =
+            u64::try_from(query_memory_pool.capacity_bytes()).unwrap_or(u64::MAX);
+        let mut external_ceiling = available_external_worker_slots;
+        let mut admission_attempt = 0_u64;
+        let mut fallback = None;
+        loop {
+            admission_attempt = admission_attempt.saturating_add(1);
+            if let Some(trace) = self.session.statement_trace() {
+                trace.record_value("admission", "admission_attempt", admission_attempt);
+            }
+            let selected = compiled.program().select_for_execution(
+                memory_ceiling,
+                available_parallel_tasks,
+                external_ceiling,
+                &|plan| super::compiled::physical_plan_dependencies_available(plan, &self.session),
+            )?;
+            let selection = selected.selection();
+            let Some(resources) = selected.execution_resources() else {
+                if let Some(trace) = self.session.statement_trace() {
+                    trace.record_event("admission", "resource_contract_absent");
+                }
+                return Ok((selected, None, selection, fallback));
+            };
+            if let Some(trace) = self.session.statement_trace() {
+                trace.record_value(
+                    "admission",
+                    "working_set_memory_bytes",
+                    resources.working_set_memory_bytes,
+                );
+                trace.record_value(
+                    "admission",
+                    "max_parallel_tasks",
+                    u64::from(resources.max_parallel_tasks),
+                );
+                trace.record_value(
+                    "admission",
+                    "external_worker_slots",
+                    u64::from(resources.external_worker_slots),
+                );
+            }
+            let external_workers = if resources.external_worker_slots == 0 {
+                None
+            } else {
+                let query_id = query_memory_pool
+                    .registered_query_id()
+                    .unwrap_or_else(|| NEXT_STANDALONE_EXECUTION_ID.fetch_add(1, Ordering::AcqRel));
+                match self
+                    .session
+                    .try_acquire_python_worker_slots(query_id, resources.external_worker_slots)
+                {
+                    Ok(Some(lease)) => Some(lease),
+                    Ok(None) => {
+                        if let Some(trace) = self.session.statement_trace() {
+                            trace.record_event("admission", "external_capacity_retry");
+                        }
+                        external_ceiling = 0;
+                        fallback = Some(AdmissionFallback::ExternalCapacity);
+                        continue;
+                    }
+                    Err(error) => {
+                        receipt.selected(
+                            Some(resources.class.0),
+                            Some(fingerprint_words(
+                                selected
+                                    .selection()
+                                    .expect("selection")
+                                    .physical_fingerprint,
+                            )),
+                            Some(resource_receipt(resources)),
+                            fallback,
+                        );
+                        receipt.reservation_failed(error.to_string());
+                        return Err(error);
+                    }
+                }
+            };
+            let working_set =
+                usize::try_from(resources.working_set_memory_bytes).unwrap_or(usize::MAX);
+            match query_memory_pool.try_reserve_minimum_capacity(working_set) {
+                Ok(true) => {
+                    let lease = match ExecutionLease::new(resources, external_workers) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            receipt.selected(
+                                Some(resources.class.0),
+                                selection
+                                    .map(|value| fingerprint_words(value.physical_fingerprint)),
+                                Some(resource_receipt(resources)),
+                                fallback,
+                            );
+                            receipt.reservation_failed(error.to_string());
+                            return Err(error);
+                        }
+                    };
+                    receipt.selected(
+                        Some(resources.class.0),
+                        selection.map(|value| fingerprint_words(value.physical_fingerprint)),
+                        Some(resource_receipt(resources)),
+                        fallback,
+                    );
+                    return Ok((selected, Some(lease), selection, fallback));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let error: paro_common::error::ParoError = error.into();
+                    receipt.selected(
+                        Some(resources.class.0),
+                        selection.map(|value| fingerprint_words(value.physical_fingerprint)),
+                        Some(resource_receipt(resources)),
+                        fallback,
+                    );
+                    receipt.reservation_failed(error.to_string());
+                    return Err(error);
+                }
+            }
+            drop(external_workers);
+            if resources.working_set_memory_bytes == 0 {
+                return Err(paro_common::error::out_of_memory(
+                    "unable to reserve a zero-byte physical operating point after admission changed",
+                ));
+            }
+            memory_ceiling = memory_ceiling.min(resources.working_set_memory_bytes - 1);
+            fallback = Some(AdmissionFallback::LowerResourceClass);
+            if let Some(trace) = self.session.statement_trace() {
+                trace.record_event("admission", "memory_capacity_retry");
+            }
+        }
     }
 
     fn execute_program(
@@ -89,7 +344,9 @@ impl Executor {
         params: Arc<ParameterBindings>,
         allocator: Arc<dyn paro_common::allocator::Allocator>,
         query_memory_pool: Arc<QueryMemoryPool>,
+        receipt: Option<ExecutionReceiptHandle>,
     ) -> Result<ResultHandler> {
+        let pipeline_started = Instant::now();
         let execution =
             if result_types.is_empty() && !self.session.input.requires_background_execution() {
                 program_executor::execute_program(
@@ -108,12 +365,16 @@ impl Executor {
                     allocator.clone(),
                 )?
             };
-        ResultHandler::from_program_execution(
+        if let Some(trace) = self.session.statement_trace() {
+            trace.record_span("execution", "pipeline_initialized", pipeline_started);
+        }
+        ResultHandler::from_program_execution_with_receipt(
             result_names,
             result_types,
             execution,
             allocator,
             Some(query_memory_pool),
+            receipt,
         )
     }
 
@@ -159,6 +420,37 @@ impl Executor {
             .register_query(spec, Arc::downgrade(&target));
         pool.attach_registration(registration);
         pool
+    }
+}
+
+fn fingerprint_words(fingerprint: paro_planner::physical::Fingerprint) -> [u64; 2] {
+    [(fingerprint.0 >> 64) as u64, fingerprint.0 as u64]
+}
+
+fn resource_receipt(
+    resources: paro_planner::physical::ExecutionResourceContract,
+) -> ResourceReceipt {
+    let memory_completion = match resources.memory_completion {
+        paro_planner::physical::MemoryCompletion::Guaranteed => MemoryCompletionReceipt::Guaranteed,
+        completion => match completion.uncapped_memory_demand() {
+            Some(paro_planner::physical::UncappedMemoryDemand::KnownBytes(bytes)) => {
+                MemoryCompletionReceipt::RuntimeCappedKnown {
+                    uncapped_memory_bytes: bytes,
+                }
+            }
+            Some(paro_planner::physical::UncappedMemoryDemand::Unbounded) | None => {
+                MemoryCompletionReceipt::RuntimeCappedUnbounded
+            }
+        },
+    };
+    ResourceReceipt {
+        class: resources.class.0,
+        minimum_memory_bytes: resources.minimum_memory_bytes,
+        working_set_memory_bytes: resources.working_set_memory_bytes,
+        memory_ceiling_bytes: resources.memory_ceiling_bytes,
+        memory_completion,
+        max_parallel_tasks: resources.max_parallel_tasks,
+        external_worker_slots: resources.external_worker_slots,
     }
 }
 

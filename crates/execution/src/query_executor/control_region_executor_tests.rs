@@ -7,8 +7,8 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_context::TestStatementContextBuilder;
 use paro_planner::expression::{Expression, ReferenceExpression};
-use paro_planner::operator::{ExplainFormat, ExplainSpec};
-use paro_planner::plan::PlanNodeId;
+use paro_planner::logical::operator::{ExplainFormat, ExplainSpec};
+use paro_planner::logical::plan::PlanNodeId;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::physical::children::{PlanChildren, PlanChildrenArena};
@@ -336,10 +336,9 @@ fn correlated_control_region_statement() -> StatementProgram {
                 transforms: Vec::new(),
                 sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
                     handle: delim_values,
-                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
-                        0,
-                        LogicalType::Integer,
-                    ))]
+                    duplicate_keys: vec![Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::Integer).into(),
+                    )]
                     .into_boxed_slice(),
                     cached_outer: None,
                 }),
@@ -411,10 +410,9 @@ fn correlated_control_region_with_capture_dependency_statement() -> StatementPro
                 transforms: Vec::new(),
                 sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
                     handle: delim_values,
-                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
-                        0,
-                        LogicalType::Integer,
-                    ))]
+                    duplicate_keys: vec![Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::Integer).into(),
+                    )]
                     .into_boxed_slice(),
                     cached_outer: None,
                 }),
@@ -481,10 +479,9 @@ fn correlated_control_region_with_external_dependent_producer_statement() -> Sta
                 transforms: Vec::new(),
                 sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
                     handle: delim_values,
-                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
-                        0,
-                        LogicalType::Integer,
-                    ))]
+                    duplicate_keys: vec![Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::Integer).into(),
+                    )]
                     .into_boxed_slice(),
                     cached_outer: None,
                 }),
@@ -618,5 +615,10 @@ fn single_node_plan(kind: PhysicalNodeKind, output: RowType) -> PhysicalPlan {
         children: PlanChildren::Empty,
         label: OperatorLabel::new(PlanNodeId::SYNTHETIC, "TEST"),
     });
-    PhysicalPlan::new(root, nodes, PlanChildrenArena::default(), PlanPropertyMap)
+    PhysicalPlan::new(
+        root,
+        nodes,
+        PlanChildrenArena::default(),
+        PlanPropertyMap::default(),
+    )
 }

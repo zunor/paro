@@ -179,7 +179,8 @@ impl<'a> GroupBinder<'a> {
                 crate::expression::ConstantExpression::new(
                     Value::Integer(42),
                     paro_common::types::LogicalType::Integer,
-                ),
+                )
+                .into(),
             ));
         }
 

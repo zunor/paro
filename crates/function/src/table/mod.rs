@@ -220,6 +220,12 @@ static EMPTY_TABLE_FUNCTION_RUNTIME_CONTEXT: TestTableFunctionRuntimeContext =
 /// - Estimated cardinality
 /// - Any function-specific bind data
 pub trait TableFunctionBindData: Send + Sync {
+    /// Versioned semantic binding, never a Debug string, pointer or runtime
+    /// handle. Absence means that cross-run structural identity is unsupported.
+    fn canonical_plan_payload(&self) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Clone the bind data.
     fn clone_box(&self) -> Box<dyn TableFunctionBindData>;
 

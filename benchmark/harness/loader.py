@@ -36,6 +36,8 @@ class QueryDef:
     plan_contains: tuple[str, ...] = ()
     collect_explain_profile: bool = False
     allow_reexecute: bool = False
+    max_median_ratio_to: str | None = None
+    max_median_ratio: float | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,36 @@ def load_workload(
             query_id,
             field_name="allow_reexecute",
         )
+        max_median_ratio_to_raw = item.get("max_median_ratio_to")
+        max_median_ratio_raw = item.get("max_median_ratio")
+        if (max_median_ratio_to_raw is None) != (max_median_ratio_raw is None):
+            raise ValueError(
+                f"{manifest_path}: query '{query_id}' must set both "
+                "max_median_ratio_to and max_median_ratio"
+            )
+        max_median_ratio_to = None
+        max_median_ratio = None
+        if max_median_ratio_to_raw is not None:
+            max_median_ratio_to = str(max_median_ratio_to_raw).strip()
+            if not max_median_ratio_to:
+                raise ValueError(
+                    f"{manifest_path}: query '{query_id}' has an empty "
+                    "max_median_ratio_to"
+                )
+            if isinstance(max_median_ratio_raw, bool):
+                raise ValueError(
+                    f"{manifest_path}: query '{query_id}' max_median_ratio must be positive"
+                )
+            try:
+                max_median_ratio = float(max_median_ratio_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{manifest_path}: query '{query_id}' max_median_ratio must be numeric"
+                ) from exc
+            if max_median_ratio <= 0.0:
+                raise ValueError(
+                    f"{manifest_path}: query '{query_id}' max_median_ratio must be positive"
+                )
         sql = _load_sql(workload_root, query_file, params)
         query_setup_sql = _load_optional_query_sql(
             workload_root,
@@ -228,8 +260,19 @@ def load_workload(
                 plan_contains=plan_contains,
                 collect_explain_profile=collect_explain_profile,
                 allow_reexecute=allow_reexecute,
+                max_median_ratio_to=max_median_ratio_to,
+                max_median_ratio=max_median_ratio,
             )
         )
+
+    query_ids = {query.id for query in queries}
+    for query in queries:
+        target = query.max_median_ratio_to
+        if target is not None and (target == query.id or target not in query_ids):
+            raise ValueError(
+                f"{manifest_path}: query '{query.id}' max_median_ratio_to "
+                f"references invalid query '{target}'"
+            )
 
     return WorkloadDef(
         name=name,

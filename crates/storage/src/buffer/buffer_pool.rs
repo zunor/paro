@@ -54,6 +54,16 @@ pub struct BufferPoolStats {
     pub buffer_reuse_attempts: AtomicUsize,
     /// Number of times size mismatch prevented reuse
     pub buffer_reuse_size_mismatches: AtomicUsize,
+    /// Number of bounded temporary-admission refills.
+    pub admission_reservations: AtomicUsize,
+    /// Number of bytes returned without becoming a live allocation.
+    pub admission_releases: AtomicUsize,
+    /// Time spent waiting for the admission lock on contended allocations.
+    pub admission_lock_wait_nanos: AtomicU64,
+    /// Bytes initialized by block allocation. BufferPool blocks are always
+    /// zeroed, so this is also the amount that must not be cleared again by a
+    /// compute-side `allocate_zeroed` wrapper.
+    pub zeroed_bytes: AtomicUsize,
 }
 
 impl BufferPoolStats {
@@ -112,6 +122,10 @@ pub struct BufferPool {
     admission_lock: Mutex<()>,
     /// Current memory usage in bytes
     used_memory: AtomicUsize,
+    /// Bytes admitted for an allocation but not yet committed to a block.
+    /// These bytes are included in `used_memory` so concurrent admissions
+    /// cannot oversubscribe the pool while the slow physical allocation runs.
+    reserved_memory: AtomicUsize,
     /// Next block ID to assign
     next_block_id: AtomicI64,
     /// All blocks indexed by ID
@@ -174,6 +188,7 @@ impl BufferPool {
             max_memory: AtomicUsize::new(max_memory),
             admission_lock: Mutex::new(()),
             used_memory: AtomicUsize::new(0),
+            reserved_memory: AtomicUsize::new(0),
             next_block_id: AtomicI64::new(1),
             blocks: RwLock::new(HashMap::new()),
             queues,
@@ -295,6 +310,13 @@ impl BufferPool {
         self.used_memory.load(Ordering::Acquire)
     }
 
+    /// Bytes currently reserved for an allocation which has not reached the
+    /// block registry yet.
+    #[inline]
+    pub fn reserved_memory(&self) -> usize {
+        self.reserved_memory.load(Ordering::Acquire)
+    }
+
     /// Get available memory.
     #[inline]
     pub fn available_memory(&self) -> usize {
@@ -304,6 +326,22 @@ impl BufferPool {
             usize::MAX - used
         } else {
             max.saturating_sub(used)
+        }
+    }
+
+    fn lock_admission(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.admission_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let started = std::time::Instant::now();
+                let guard = self.admission_lock.lock().unwrap();
+                self.stats.admission_lock_wait_nanos.fetch_add(
+                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                guard
+            }
         }
     }
 
@@ -403,7 +441,7 @@ impl BufferPool {
     ///
     /// Follows an "evict + set + verify + rollback" pattern.
     pub fn set_memory_limit(&self, limit: usize) -> Result<()> {
-        let _admission_guard = self.admission_lock.lock().unwrap();
+        let _admission_guard = self.lock_admission();
 
         if limit != 0 {
             let precheck = self.evict_blocks(MemoryTag::Extension, 0, limit, None);
@@ -519,12 +557,16 @@ impl BufferPool {
     /// # Arguments
     /// * `block` - The block handle to load
     /// * `reusable_buffer` - Optional buffer to reuse (for memory efficiency)
-    fn load_block(&self, block: Arc<BlockHandle>, _reusable_buffer: Option<Vec<u8>>) -> Result<()> {
+    fn load_block_pinned(
+        &self,
+        block: Arc<BlockHandle>,
+        _reusable_buffer: Option<Vec<u8>>,
+    ) -> Result<()> {
         let block_id = block.block_id();
         let size = block.size();
 
         if block.buffer_type().is_reconstructible() {
-            block.reconstruct_zeroed()?;
+            block.reconstruct_zeroed_pinned()?;
             return Ok(());
         }
         if !block.must_write_to_disk() {
@@ -544,8 +586,8 @@ impl BufferPool {
 
         let buffer = self.read_from_temporary_file(block_id, size)?;
 
-        // Set the buffer and mark as loaded
-        block.set_buffer(buffer)?;
+        // Install the bytes and their first pin as one lifecycle transition.
+        block.set_buffer_pinned(buffer)?;
 
         Ok(())
     }
@@ -662,6 +704,94 @@ impl BufferPool {
         self.allocate_internal(tag, buffer_type, size, false)
     }
 
+    /// Reserve pool capacity for a group of short-lived allocations.
+    ///
+    /// The reservation is published in `used_memory` before the admission
+    /// mutex is released. Physical allocation is intentionally not performed
+    /// here, so a slow allocator or zeroing operation cannot hold the global
+    /// admission lock.
+    fn reserve_allocation_bytes(&self, tag: MemoryTag, size: usize) -> Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+        let _admission_guard = self.lock_admission();
+        self.ensure_memory_available(tag, size)?;
+        self.used_memory.fetch_add(size, Ordering::AcqRel);
+        self.reserved_memory.fetch_add(size, Ordering::AcqRel);
+        self.memory_usage.add(tag, size);
+        self.stats
+            .admission_reservations
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Allocate and publish a block from capacity already reserved by
+    /// [`Self::reserve_allocation_bytes`]. The slow allocator runs without the
+    /// global admission mutex. A failed allocation restores the reservation so
+    /// the caller can release it through the same rollback path as an
+    /// unconsumed quota.
+    fn allocate_from_reserved(
+        &self,
+        tag: MemoryTag,
+        buffer_type: FileBufferType,
+        size: usize,
+        can_destroy: bool,
+    ) -> Result<BufferHandle> {
+        if size == 0 {
+            return Err(paro_error::invalid_input(
+                "reserved block allocation cannot have zero size",
+            ));
+        }
+
+        let mut reserved = self.reserved_memory.load(Ordering::Acquire);
+        loop {
+            if reserved < size {
+                return Err(paro_error::internal(format!(
+                    "reserved allocation exceeds available quota: requested={size}, reserved={reserved}"
+                )));
+            }
+            match self.reserved_memory.compare_exchange_weak(
+                reserved,
+                reserved - size,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => reserved = observed,
+            }
+        }
+
+        let block_id = self.next_block_id.fetch_add(1, Ordering::Relaxed);
+        let block = match BlockHandle::allocate(
+            block_id,
+            tag,
+            size,
+            can_destroy,
+            Arc::new(default_allocator().clone()),
+            buffer_type,
+        ) {
+            Ok(block) => Arc::new(block),
+            Err(error) => {
+                // Keep the reservation owned by the caller on failure. This
+                // makes allocate_reserved's failure contract composable with
+                // BufferAllocator: only a successful block consumes quota.
+                self.reserved_memory.fetch_add(size, Ordering::AcqRel);
+                return Err(error);
+            }
+        };
+
+        self.stats.zeroed_bytes.fetch_add(size, Ordering::Relaxed);
+        block.set_lru_timestamp(current_timestamp_ms());
+        {
+            let mut blocks = self.blocks.write().unwrap();
+            blocks.insert(block_id, block.clone());
+        }
+        self.stats.allocations.fetch_add(1, Ordering::Relaxed);
+
+        let pool_weak = self.weak_self.read().unwrap().clone();
+        Ok(BufferHandle::with_pool(block, pool_weak))
+    }
+
     fn allocate_internal(
         &self,
         tag: MemoryTag,
@@ -670,42 +800,45 @@ impl BufferPool {
         can_destroy: bool,
     ) -> Result<BufferHandle> {
         let size = if size == 0 { DEFAULT_BLOCK_SIZE } else { size };
-        let _admission_guard = self.admission_lock.lock().unwrap();
+        self.reserve_allocation_bytes(tag, size)?;
+        match self.allocate_from_reserved(tag, buffer_type, size, can_destroy) {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                self.release_reserved_allocation(tag, size);
+                Err(error)
+            }
+        }
+    }
 
-        // Check memory limit and try eviction if needed
-        // EvictBlocksOrThrow is called before allocation
-        self.ensure_memory_available(tag, size)?;
-
-        // Generate new block ID
-        let block_id = self.next_block_id.fetch_add(1, Ordering::Relaxed);
-
-        // Allocate the block
-        let block = BlockHandle::allocate(
-            block_id,
-            tag,
-            size,
-            can_destroy,
-            Arc::new(default_allocator().clone()),
-            buffer_type,
-        )?;
-        let block = Arc::new(block);
-
-        // Set initial LRU timestamp
-        block.set_lru_timestamp(current_timestamp_ms());
-
-        // Track memory and store block
-        self.used_memory.fetch_add(size, Ordering::AcqRel);
-        // Track per-tag memory usage
-        self.memory_usage.add(tag, size);
-        {
-            let mut blocks = self.blocks.write().unwrap();
-            blocks.insert(block_id, block.clone());
+    fn release_reserved_allocation(&self, tag: MemoryTag, size: usize) {
+        if size == 0 {
+            return;
         }
 
-        self.stats.allocations.fetch_add(1, Ordering::Relaxed);
+        let mut reserved = self.reserved_memory.load(Ordering::Acquire);
+        loop {
+            assert!(
+                reserved >= size,
+                "BufferPool reserved_memory underflow during release: tag={}, size={}, reserved={}",
+                tag,
+                size,
+                reserved
+            );
+            match self.reserved_memory.compare_exchange_weak(
+                reserved,
+                reserved - size,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => reserved = observed,
+            }
+        }
 
-        let pool_weak = self.weak_self.read().unwrap().clone();
-        Ok(BufferHandle::with_pool(block, pool_weak))
+        self.sub_used_memory_checked(tag, size, "release_reserved");
+        self.stats
+            .admission_releases
+            .fetch_add(size, Ordering::Relaxed);
     }
 
     /// Pin a block by ID and return a handle.
@@ -738,26 +871,15 @@ impl BufferPool {
         // Fast path: atomically publish the pin against the loaded allocation.
         // `is_loaded()` followed by `pin()` is not sufficient here: eviction
         // may detach the buffer between those two independent observations.
-        if block.try_pin().is_some() {
-            // Remove from eviction queue if present
-            self.remove_from_eviction_queue(block_id);
-
-            // Update LRU timestamp
-            block.set_lru_timestamp(current_timestamp_ms());
-            self.stats.pins.fetch_add(1, Ordering::Relaxed);
-
-            let pool_weak = self.weak_self.read().unwrap().clone();
-            return Ok(BufferHandle::with_pool(block, pool_weak));
+        if let Some(handle) = self.try_pin_loaded(block.clone()) {
+            return Ok(handle);
         }
 
         // Slow-path admission and publication are serialized with new block
         // allocation and memory-limit changes.
-        let _admission_guard = self.admission_lock.lock().unwrap();
-        if block.try_pin().is_some() {
-            block.set_lru_timestamp(current_timestamp_ms());
-            self.stats.pins.fetch_add(1, Ordering::Relaxed);
-            let pool_weak = self.weak_self.read().unwrap().clone();
-            return Ok(BufferHandle::with_pool(block, pool_weak));
+        let _admission_guard = self.lock_admission();
+        if let Some(handle) = self.try_pin_loaded(block.clone()) {
+            return Ok(handle);
         }
 
         // Get required memory for loading
@@ -780,26 +902,45 @@ impl BufferPool {
         }
 
         // Double-check locking: check if another thread loaded the block
-        if block.try_pin().is_some() {
+        if let Some(handle) = self.try_pin_loaded(block.clone()) {
             // Block was loaded by another thread, just pin it
-            block.set_lru_timestamp(current_timestamp_ms());
-            self.stats.pins.fetch_add(1, Ordering::Relaxed);
-            let pool_weak = self.weak_self.read().unwrap().clone();
-            return Ok(BufferHandle::with_pool(block, pool_weak));
+            return Ok(handle);
         }
 
-        // Now we can actually load the block
-        self.load_block(block.clone(), reusable_buffer)?;
+        // Loading publishes the first pin in the same lifecycle transition as
+        // the allocation. An evictor can therefore never detach the freshly
+        // installed bytes before this caller receives its handle.
+        self.load_block_pinned(block.clone(), reusable_buffer)?;
         eviction_result.reservation.resize(0);
         self.update_used_memory(block.tag(), required_memory as i64);
 
-        // Pin the block and update LRU timestamp
-        block.pin();
+        // The first pin was already published by `load_block_pinned`.
         block.set_lru_timestamp(current_timestamp_ms());
         self.stats.pins.fetch_add(1, Ordering::Relaxed);
 
         let pool_weak = self.weak_self.read().unwrap().clone();
         Ok(BufferHandle::with_pool(block, pool_weak))
+    }
+
+    /// Pin a block only when its bytes are still resident.
+    ///
+    /// This is the cache-facing counterpart of [`Self::pin`]. It never reloads
+    /// or reconstructs an evicted block: eviction is reported as `None`, so the
+    /// owning cache can remove its stale slot and fetch the durable source
+    /// again. The loaded check and pin publication are one lifecycle-locked
+    /// operation, closing the check-then-pin race with eviction.
+    pub fn pin_resident(&self, block_id: BlockId) -> Option<BufferHandle> {
+        let block = self.blocks.read().unwrap().get(&block_id).cloned()?;
+        self.try_pin_loaded(block)
+    }
+
+    fn try_pin_loaded(&self, block: Arc<BlockHandle>) -> Option<BufferHandle> {
+        block.try_pin()?;
+        self.remove_from_eviction_queue(block.block_id());
+        block.set_lru_timestamp(current_timestamp_ms());
+        self.stats.pins.fetch_add(1, Ordering::Relaxed);
+        let pool_weak = self.weak_self.read().unwrap().clone();
+        Some(BufferHandle::with_pool(block, pool_weak))
     }
 
     /// Unpin a block by ID.
@@ -1288,6 +1429,38 @@ impl BufferManager for BufferPool {
         }
 
         Ok(ptr)
+    }
+
+    fn allocate_zeroed(&self, tag: MemoryTag, size: usize) -> Result<*mut u8> {
+        // BufferPool block allocation is already zeroed by BlockHandle. Keep
+        // the initialization contract at this boundary so BufferAllocator
+        // does not write the whole allocation a second time.
+        <Self as BufferManager>::allocate(self, tag, size)
+    }
+
+    fn reserve(&self, tag: MemoryTag, size: usize) -> Result<Option<usize>> {
+        if size == 0 {
+            return Ok(Some(0));
+        }
+        self.reserve_allocation_bytes(tag, size)?;
+        Ok(Some(size))
+    }
+
+    fn allocate_reserved(&self, tag: MemoryTag, size: usize) -> Result<*mut u8> {
+        let handle = self.allocate_from_reserved(tag, FileBufferType::ManagedBuffer, size, true)?;
+        let ptr = handle
+            .ptr()
+            .ok_or_else(|| paro_error::internal("Failed to get pointer from reserved buffer"))?;
+        let mut allocations = self.allocations.write().unwrap();
+        allocations.insert(ptr as usize, handle);
+        Ok(ptr)
+    }
+
+    fn release_reserved(&self, tag: MemoryTag, size: usize) {
+        if size == 0 {
+            return;
+        }
+        self.release_reserved_allocation(tag, size);
     }
 
     fn free(&self, ptr: *mut u8, _tag: MemoryTag, _size: usize) {

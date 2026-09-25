@@ -1,0 +1,2 @@
+EXPLAIN (COMPILE) / schema 2 / ForcedCompile
+admission=NotExecuted execution=NotExecuted

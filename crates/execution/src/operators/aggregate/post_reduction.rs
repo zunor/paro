@@ -490,10 +490,13 @@ impl PostAggregateFilterLocal {
         let predicate = if predicates.len() == 1 {
             predicates.pop().expect("one post-aggregate predicate")
         } else {
-            Expression::Conjunction(ConjunctionExpression {
-                conjunction_type: ConjunctionType::And,
-                children: predicates,
-            })
+            Expression::Conjunction(
+                ConjunctionExpression {
+                    conjunction_type: ConjunctionType::And,
+                    children: predicates,
+                }
+                .into(),
+            )
         };
         Ok(Self {
             executor: ExpressionExecutor::with_expressions_for_session(
@@ -618,27 +621,31 @@ mod tests {
             .expect("decimal sum has a closed partial merge");
         PostAggregateReductionSpec {
             aggregate_types: vec![decimal.clone()].into_boxed_slice(),
-            reducers: vec![Expression::Aggregate(AggregateExpression::new(
-                merge,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
+            reducers: vec![Expression::Aggregate(
+                AggregateExpression::new(
+                    merge,
+                    vec![Expression::Reference(
+                        ReferenceExpression::new(0, decimal.clone()).into(),
+                    )],
                     decimal.clone(),
-                ))],
-                decimal.clone(),
-            ))]
+                )
+                .into(),
+            )]
             .into_boxed_slice(),
             reducer_types: vec![decimal.clone()].into_boxed_slice(),
-            scalar_expressions: vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                decimal.clone(),
-            ))]
+            scalar_expressions: vec![Expression::Reference(
+                ReferenceExpression::new(0, decimal.clone()).into(),
+            )]
             .into_boxed_slice(),
             scalar_types: vec![decimal.clone()].into_boxed_slice(),
-            predicate: Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::GreaterThan,
-                Expression::Reference(ReferenceExpression::new(0, decimal.clone())),
-                Expression::Reference(ReferenceExpression::new(1, decimal)),
-            )),
+            predicate: Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::GreaterThan,
+                    Expression::Reference(ReferenceExpression::new(0, decimal.clone()).into()),
+                    Expression::Reference(ReferenceExpression::new(1, decimal).into()),
+                )
+                .into(),
+            ),
             input_rollup_sources: None,
         }
     }
@@ -652,20 +659,19 @@ mod tests {
         let Expression::Aggregate(bound) = &mut aggregate else {
             panic!("test post reducer must be an aggregate");
         };
-        bound.children = vec![Expression::Reference(ReferenceExpression::new(
-            1,
-            decimal.clone(),
-        ))];
+        bound.children = vec![Expression::Reference(
+            ReferenceExpression::new(1, decimal.clone()).into(),
+        )];
         AggregateSpec {
             grouping_key_count: 1,
+            initial_lookup_hash_key_count: 1,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([LogicalType::Integer, decimal.clone()]),
-            groups: Box::new([Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::Integer,
-            ))]),
+            groups: Box::new([Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            )]),
             group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
             grouping_sets: Box::new([]),
             aggregates: Box::new([aggregate]),
@@ -675,6 +681,7 @@ mod tests {
             aggregate_orders: Box::new([Box::new([])]),
             post_reduction: Some(post),
             having_filter,
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
             perfect_hash: None,
             output_names: Box::new(["key".to_string(), "value".to_string()]),
             output_types: Box::new([LogicalType::Integer, decimal]),
@@ -822,17 +829,25 @@ mod tests {
         let (abs, _) = get_abs_functions()
             .bind(&[LogicalType::BigInt])
             .expect("bind abs(bigint)");
-        spec.scalar_expressions = Box::new([Expression::Function(FunctionExpression::new(
-            abs,
-            vec![Expression::Reference(ReferenceExpression::new(0, decimal))],
-            LogicalType::BigInt,
-        ))]);
+        spec.scalar_expressions = Box::new([Expression::Function(
+            FunctionExpression::new(
+                abs,
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, decimal).into(),
+                )],
+                LogicalType::BigInt,
+            )
+            .into(),
+        )]);
         spec.scalar_types = Box::new([LogicalType::BigInt]);
-        spec.predicate = Expression::Operator(OperatorExpression::new_unary(
-            OperatorType::IsNotNull,
-            Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt)),
-            LogicalType::Boolean,
-        ));
+        spec.predicate = Expression::Operator(
+            OperatorExpression::new_unary(
+                OperatorType::IsNotNull,
+                Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt).into()),
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
 
         let error = reducer_init_error(&spec, &query);
         assert!(
@@ -846,14 +861,20 @@ mod tests {
         let query = query_context();
         let mut spec = decimal_sum_reduction_spec();
         let hidden_type = spec.scalar_types[0].clone();
-        spec.predicate = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::Reference(ReferenceExpression::new(1, hidden_type)),
-            Expression::Constant(ConstantExpression::new(
-                Value::BigInt(1),
-                LogicalType::BigInt,
-            )),
-        ));
+        // Bypass the checked constructor deliberately: this test exercises
+        // the runtime boundary's defense against corrupted physical input.
+        spec.predicate = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(Expression::Reference(
+                    ReferenceExpression::new(1, hidden_type).into(),
+                )),
+                right: Box::new(Expression::Constant(
+                    ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt).into(),
+                )),
+                comparison_type: ComparisonType::Equal,
+            }
+            .into(),
+        );
 
         let error = reducer_init_error(&spec, &query);
         assert!(
@@ -865,14 +886,16 @@ mod tests {
     #[test]
     fn aggregate_runtime_boundary_rejects_having_reference_outside_its_domain() {
         let post = decimal_sum_reduction_spec();
-        let having = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
-            Expression::Constant(ConstantExpression::new(
-                Value::BigInt(1),
-                LogicalType::BigInt,
-            )),
-        ));
+        let having = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt).into()),
+                Expression::Constant(
+                    ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt).into(),
+                ),
+            )
+            .into(),
+        );
         let spec = aggregate_spec_with_post(post, Box::new([having]));
 
         let error = spec
@@ -891,16 +914,18 @@ mod tests {
         let query = query_context();
         let mut spec = decimal_sum_reduction_spec();
         let collation = LogicalType::VarcharCollation("C".to_string());
-        spec.scalar_expressions = Box::new([Expression::Constant(ConstantExpression::new(
-            Value::Varchar("anchor".to_string()),
-            collation.clone(),
-        ))]);
+        spec.scalar_expressions = Box::new([Expression::Constant(
+            ConstantExpression::new(Value::Varchar("anchor".to_string()), collation.clone()).into(),
+        )]);
         spec.scalar_types = Box::new([collation.clone()]);
-        spec.predicate = Expression::Operator(OperatorExpression::new_unary(
-            OperatorType::IsNotNull,
-            Expression::Reference(ReferenceExpression::new(1, collation.clone())),
-            LogicalType::Boolean,
-        ));
+        spec.predicate = Expression::Operator(
+            OperatorExpression::new_unary(
+                OperatorType::IsNotNull,
+                Expression::Reference(ReferenceExpression::new(1, collation.clone()).into()),
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
 
         let scalars = PostAggregateReducer::try_new(&spec, &query)
             .expect("typed reducer")

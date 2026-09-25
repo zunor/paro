@@ -6,10 +6,10 @@ use std::collections::HashSet;
 use paro_common::error::{self as paro_error, Result};
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
-use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::logical::operator::{ColumnBinding, Join, LogicalOperator};
+use paro_planner::logical::plan::OwnedLogicalPlan;
 
-pub fn verify_logical_plan(_bind_context: &BindContext, plan: &LogicalPlan) -> Result<()> {
+pub fn verify_logical_plan(_bind_context: &BindContext, plan: &OwnedLogicalPlan) -> Result<()> {
     verify_plan(_bind_context, &plan.operator)
 }
 
@@ -24,14 +24,14 @@ struct Verifier {
     seen_table_indices: HashSet<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GraphProjectionScope {
     materialized_table_indices: HashSet<usize>,
     carrier_bindings: Vec<ColumnBinding>,
 }
 
 impl GraphProjectionScope {
-    fn from_plan(plan: &LogicalPlan) -> Option<Self> {
+    fn from_plan(plan: &OwnedLogicalPlan) -> Option<Self> {
         match &plan.operator {
             LogicalOperator::GraphScan(scan) => Some(Self {
                 materialized_table_indices: HashSet::from([scan.table_index]),
@@ -84,11 +84,19 @@ impl Verifier {
         Ok(())
     }
 
-    fn verify_logical_plan(&mut self, plan: &LogicalPlan) -> Result<()> {
+    fn verify_logical_plan(&mut self, plan: &OwnedLogicalPlan) -> Result<()> {
         self.verify_operator(&plan.operator)
     }
 
     fn verify_operator_invariants(&self, op: &LogicalOperator) -> Result<()> {
+        self.verify_operator_invariants_with_scope(op, None)
+    }
+
+    fn verify_operator_invariants_with_scope(
+        &self,
+        op: &LogicalOperator,
+        graph_scope: Option<&GraphProjectionScope>,
+    ) -> Result<()> {
         let binding_len = op.get_column_bindings().len();
         let type_len = op.types().len();
         if binding_len != type_len {
@@ -131,7 +139,7 @@ impl Verifier {
                     let mut virtual_rowids = 0usize;
                     for (idx, source) in get.column_sources.iter().enumerate() {
                         match source {
-                            paro_planner::operator::GetColumnSource::Stored { column_id } => {
+                            paro_planner::logical::operator::GetColumnSource::Stored { column_id } => {
                                 if *column_id >= table_col_count {
                                     return Err(paro_error::internal(format!(
                                         "Get stored column id {column_id} out of range (table columns={table_col_count})"
@@ -143,7 +151,7 @@ impl Verifier {
                                     ));
                                 }
                             }
-                            paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                            paro_planner::logical::operator::GetColumnSource::MatchedUtf8Prefix {
                                 source_column,
                                 byte_width,
                             } => {
@@ -161,7 +169,7 @@ impl Verifier {
                                     ));
                                 }
                             }
-                            paro_planner::operator::GetColumnSource::VirtualRowId => {
+                            paro_planner::logical::operator::GetColumnSource::VirtualRowId => {
                                 virtual_rowids += 1;
                                 if get.column_types[idx] != paro_common::types::LogicalType::BigInt
                                     || get.returned_types[idx]
@@ -215,9 +223,13 @@ impl Verifier {
                         )));
                     }
                 }
-                if let Some(scope) = GraphProjectionScope::from_plan(proj.child.as_ref()) {
+                let owned_scope = graph_scope
+                    .is_none()
+                    .then(|| GraphProjectionScope::from_plan(proj.child.as_ref()))
+                    .flatten();
+                if let Some(scope) = graph_scope.or(owned_scope.as_ref()) {
                     for expression in &proj.expressions {
-                        self.verify_graph_projection_bindings(expression, &scope)?;
+                        self.verify_graph_projection_bindings(expression, scope)?;
                     }
                 } else {
                     let child_bindings = proj.child.get_column_bindings();
@@ -529,9 +541,9 @@ impl Verifier {
                 )?;
                 if matches!(
                     cj.join_type,
-                    paro_planner::operator::JoinType::Semi
-                        | paro_planner::operator::JoinType::Anti
-                        | paro_planner::operator::JoinType::Mark
+                    paro_planner::logical::operator::JoinType::Semi
+                        | paro_planner::logical::operator::JoinType::Anti
+                        | paro_planner::logical::operator::JoinType::Mark
                 ) && !cj.right_projection_map.is_none()
                 {
                     return Err(paro_error::internal(
@@ -540,8 +552,8 @@ impl Verifier {
                 }
                 if matches!(
                     cj.join_type,
-                    paro_planner::operator::JoinType::RightSemi
-                        | paro_planner::operator::JoinType::RightAnti
+                    paro_planner::logical::operator::JoinType::RightSemi
+                        | paro_planner::logical::operator::JoinType::RightAnti
                 ) && !cj.left_projection_map.is_none()
                 {
                     return Err(paro_error::internal(
@@ -574,9 +586,9 @@ impl Verifier {
                 )?;
                 if matches!(
                     aj.join_type,
-                    paro_planner::operator::JoinType::Semi
-                        | paro_planner::operator::JoinType::Anti
-                        | paro_planner::operator::JoinType::Mark
+                    paro_planner::logical::operator::JoinType::Semi
+                        | paro_planner::logical::operator::JoinType::Anti
+                        | paro_planner::logical::operator::JoinType::Mark
                 ) && !aj.right_projection_map.is_none()
                 {
                     return Err(paro_error::internal(
@@ -585,8 +597,8 @@ impl Verifier {
                 }
                 if matches!(
                     aj.join_type,
-                    paro_planner::operator::JoinType::RightSemi
-                        | paro_planner::operator::JoinType::RightAnti
+                    paro_planner::logical::operator::JoinType::RightSemi
+                        | paro_planner::logical::operator::JoinType::RightAnti
                 ) && !aj.left_projection_map.is_none()
                 {
                     return Err(paro_error::internal(
@@ -601,7 +613,7 @@ impl Verifier {
 
     fn verify_projection_map(
         label: &str,
-        projection_map: &paro_planner::operator::ProjectionMap,
+        projection_map: &paro_planner::logical::operator::ProjectionMap,
         child_width: usize,
     ) -> Result<()> {
         let Some(indices) = projection_map.as_columns() else {

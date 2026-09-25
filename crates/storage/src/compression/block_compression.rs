@@ -35,6 +35,35 @@ pub trait BlockCompressionCodec: Send + Sync {
     /// Decompressed data as a new Vec
     fn decompress(&self, input: &[u8], uncompressed_size: usize) -> Result<Vec<u8>>;
 
+    /// Decompress into an exact-size caller-owned destination.
+    ///
+    /// The default keeps existing codecs source-compatible while allowing
+    /// codecs with a native bounded-output API to avoid an intermediate Vec.
+    fn decompress_into(
+        &self,
+        input: &[u8],
+        uncompressed_size: usize,
+        output: &mut [u8],
+    ) -> Result<()> {
+        if output.len() != uncompressed_size {
+            return Err(paro_common::error::invalid_input(format!(
+                "decompression destination size {} does not match expected size {}",
+                output.len(),
+                uncompressed_size
+            )));
+        }
+        let decompressed = self.decompress(input, uncompressed_size)?;
+        if decompressed.len() != uncompressed_size {
+            return Err(paro_common::error::data_corrupted(format!(
+                "decompressed size {} does not match expected size {}",
+                decompressed.len(),
+                uncompressed_size
+            )));
+        }
+        output.copy_from_slice(&decompressed);
+        Ok(())
+    }
+
     /// Get maximum possible compressed size for given input length.
     ///
     /// Used for pre-allocating output buffers.

@@ -20,6 +20,8 @@ pub enum StatementSource {
 
 #[derive(Debug, Clone, Default)]
 pub struct StatementOptions {
+    /// Request-owned observer, absent on ordinary compilation. Never a search hint.
+    pub compile_capture: Option<std::sync::Arc<crate::compile_diagnostics::CompileCapture>>,
     pub statement_format: Option<String>,
     pub explain_output: Option<ExplainOutputType>,
     pub source: StatementSource,

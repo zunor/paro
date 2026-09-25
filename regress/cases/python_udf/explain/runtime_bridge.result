@@ -16,23 +16,23 @@ QUERY PLAN
 ORDER_BY  (rows=2)
   Sort Key: py_explain(v) ASC NULLS LAST
   ->  PROJECTION  (rows=2)
-    Output: py_explain(v)
-    ->  EXTERNAL_PROJECT  (rows=2)
-      ->  PROJECTION  (rows=2)
-        Output: v
-        ->  VALUES  (rows=2)
+        Output: py_explain(v)
+        ->  EXTERNAL_PROJECT  (rows=2)
+              ->  PROJECTION  (rows=2)
+                    Output: v
+                    ->  VALUES  (rows=2)
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_routine_ids,explain_external_runtime
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_routine_ids,explain_external_runtime,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT py_explain(v)
 FROM (VALUES (1), (2)) AS t(v)
 ORDER BY 1;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 VALUES (actual time=<time-range> rows=2 loops=<loops>)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
-  TRANSFORM #2 EXTERNAL_PROJECT (actual time=<time-range> rows=2 loops=<loops>)
-  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
+  SOURCE #0 VALUES (actual time=<time-range> rows=2 loops=<loops>) logical_node_id=16
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=2 loops=<loops>) logical_node_id=17
+  TRANSFORM #2 EXTERNAL_PROJECT (actual time=<time-range> rows=2 loops=<loops>) logical_node_id=18
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=2 loops=<loops>) logical_node_id=19
   SINK #4 SORT_BUILD (actual time=<time-range> rows=2 loops=<loops> peak_memory_bytes=<bytes>)
 PIPELINE 1
   SOURCE #5 SORT_EMIT (actual time=<time-range> rows=2 loops=<loops>)

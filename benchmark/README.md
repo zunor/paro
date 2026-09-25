@@ -21,7 +21,8 @@ benchmark/
 ├── policies/                # Gate policy TOML files
 ├── baselines/               # Gate measurement references
 ├── suites/                  # Checked-in workload/query selections for CI
-└── report/                  # Runtime outputs (result.json, summary.md)
+├── report/                  # Legacy/default output paths; inspect each CLI
+└── runs/                    # Ignored, explicitly owned exploratory run roots
 ```
 
 ## Prerequisites
@@ -43,6 +44,38 @@ make -C benchmark ping
 ```
 
 ## Quick Start
+
+Use the selected checkout, not a hard-coded main-worktree path. Before builds,
+fixture setup or writes, inspect its HEAD/status and the ownership of the
+server, data directory and outputs. Preserve unrelated user changes. Controlled
+code comparisons need identified, isolated sources; a dirty-tree pilot is not
+automatically clean control/probe evidence. Reuse agreed worktrees rather than
+creating another large build/data copy by default.
+
+There are two workflows in this framework, not two benchmark implementations:
+
+- Engineering gates and ordinary exploratory comparisons:
+  [paro-benchmark](../.agents/skills/paro-benchmark/SKILL.md).
+- Formal release, parity, non-inferiority and model-quality certification:
+  [paro-evidence](../.agents/skills/paro-evidence/SKILL.md) and `corpora/`.
+
+Raw data stays under an explicitly owned ignored `runs/<run-id>/` or external
+run root; use supported output flags and check nested writers. Review and
+remove disposable runs, normally within 14 days, without automatic deletion
+of active runs or unique unresolved reproducers. Git normally keeps at most a
+page of consequential conclusions, not routine logs, traces or every pilot.
+Historical records are indexed in [evidence/README.md](evidence/README.md).
+
+Skills are optional contributor guidance; the CLI and contracts in this
+repository remain usable without an agent installation. Discover commands with
+`make -C benchmark help`, the selected Python's `runner.py --help` and the
+intended subcommand's `--help`. Check Make expansion with `make -n`; a copied
+skill option list is not the CLI schema. Install declared dependencies only
+when needed for the authorized run, without silently upgrading pinned tools.
+
+For the external optimizer-correctness repositories and the mandatory JOB →
+CEB → TPC-DS → TPC-H → LDBC SNB BI sequence, see
+[`CORPORA.md`](CORPORA.md).
 
 Run all workloads:
 
@@ -110,6 +143,14 @@ Suite manifests keep their explicit `[[include]]` order. Keep tight-memory
 workloads early there as well.
 
 ## Baseline Workflow
+
+Checking a gate does not authorize changing its reference or policy. The bless
+examples below are for explicitly authorized baseline maintenance only, after
+the selected policy's correctness, plan, environment and calibration guards.
+Missing references or failing results are not an instruction to bless. Policy
+evolution requires its own reviewed version change; do not use it to disguise a
+regression. SQL `.result` updates, archive publication and data/history cleanup
+are separate actions, not implied by a benchmark request.
 
 Current project policy:
 - Generic median-latency baseline comparison has been removed.
@@ -247,7 +288,7 @@ Notes:
 - `gate check` reads the calibration manifest, verifies checksums, and uses a
   local 72-hour cache only when the archive is unavailable. Corrupt archive
   objects are reported instead of hidden by cache fallback. Archive outages or
-  missing calibration are surfaced in `benchmark/report/gate.json` and the gate
+missing calibration are surfaced in the run-owned `gate.json` and the gate
   summary; hard gates degrade to soft for archive/calibration availability
   problems. Policy or fingerprint mismatches still fail before gate evaluation.
 - When calibration is ready, the evaluator consumes archive calibration content
@@ -341,12 +382,49 @@ The operator runtime SQL gate requires RSS sampling for memory coverage. The
 CLI accepts `PID=<pid>` through Make, `--pid <pid>` through `runner.py gate`,
 or `PARO_PID` / `.ci/parod.pid` when `--pid auto` is used.
 
-## Output Files
+## Output ownership
 
-After each run:
-- `benchmark/report/result.json`: full structured report
-- `benchmark/report/summary.md`: compact human-readable report
-- `benchmark/report/gate.json`: performance gate outcome and archive health
+Every runner or gate invocation allocates one exclusive RunId below
+`benchmark/report/<RunId>/` (override the parent with `--report-root` or
+`REPORT_ROOT`; provide `--run-id`/`RUN_ID` only for a fresh, unused identity).
+Reusing an existing RunId is an error. A source invocation owns
+`sources/<SourceId>/attempts/<AttemptId>/`; its `result.json`, `summary.md`,
+`failure.json`, and `attempt.json` cannot be written by another source or
+retry. The run `manifest.json` records Running/Completed/Failed/Cancelled and
+all attempts, so a failed first sample remains available when a quorum retry
+is started.
+
+Gate output is the run-owned `gate.json`. Archive objects remain append-only
+and are separate from the live run directory. There is no `report/result.json`,
+`report/summary.md`, `report/gate.json`, `latest` alias, or source-name-cleaned
+fallback path. `make` and `runner.py` use the same `REPORT_ROOT`/`RUN_ID`
+configuration.
+
+`--collect-receipts` (or `BENCH_COLLECT_RECEIPTS=1`) reads the bounded
+`paro_optimizers()` post-statement channel after timed execution. It never
+executes or compiles the target again and is recorded in the payload config.
+Each query carries either a verified artifact/actual-admission association or
+an explicit `Uncovered` reason; missing receipts never delete timings or slow
+samples. This is a normal receipt side channel, not Detail capture, and does
+not enable statement traces or `.parod.log` collection.
+
+Run registration freezes the campaign budget before source execution using the
+convergence formula (64 MiB total, 200,000-byte Summary cap). Over-budget new
+cells are rejected without discarding existing attempts. Filesystem isolation
+does not make shared CPU, memory, I/O, server, or fixture state comparable;
+confirmation runs still serialize unless their experiment registers isolation.
+
+Filesystem isolation does not imply measurement isolation. Competing CPU,
+memory, I/O or shared fixture state can invalidate a comparison even with
+different report paths. Serialize performance runs on shared resources unless
+the registered experiment explicitly controls that interference. Declared
+mixed-concurrency workloads are distinct from accidental concurrent runners.
+
+For controlled experiments, retain all normal samples and explicit exclusions,
+keep diagnostic cohorts separate, and apply the repository's
+[comparison validity rules](../.agents/skills/paro-evidence/SKILL.md#comparison-validity).
+Use the actual RunOutput/typed-receipt validators for the chosen collector;
+missing coverage cannot be inferred from another collector's support.
 
 If a query opts into explain sidecars, the JSON report also includes `explain_profile` with flattened operator rows.
 If memory collection is enabled, the JSON report additionally includes `memory_tags` and `spill_metrics`, and the Markdown summary adds explain / tag-delta / spill-delta sections.

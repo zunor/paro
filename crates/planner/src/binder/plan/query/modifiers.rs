@@ -6,7 +6,7 @@
 use crate::binder::ir::BoundQueryModifiers;
 use crate::binder::Binder;
 use crate::expression::{ColumnRefExpression, Expression};
-use crate::operator::{Limit, LogicalOperator, Order, Projection};
+use crate::logical::operator::{Limit, LogicalOperator, Order, Projection};
 use paro_common::error::{self as paro_error, Result};
 
 impl Binder {
@@ -30,10 +30,10 @@ impl Binder {
         }
 
         if let Some(limit) = node.limit {
-            root = LogicalOperator::Limit(
+            root = LogicalOperator::Limit(Box::new(
                 Limit::new(self.wrap_plan(root), limit.limit, limit.offset)
                     .with_hnsw_options(node.hnsw_options),
-            );
+            ));
         }
 
         if let Some(projection_index) = node.prune_index {
@@ -49,10 +49,9 @@ impl Binder {
                 .iter()
                 .enumerate()
                 .map(|(index, return_type)| {
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        bindings[index],
-                        return_type.clone(),
-                    ))
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(bindings[index], return_type.clone()).into(),
+                    )
                 })
                 .collect();
             root = LogicalOperator::Projection(

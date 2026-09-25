@@ -32,6 +32,29 @@ pub(crate) fn decompress_size_prepended_exact(
     input: &[u8],
     expected_size: usize,
 ) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(expected_size).map_err(|error| {
+        paro_error::out_of_memory(format!(
+            "Failed to reserve {expected_size} bytes for LZ4 decompression: {error}"
+        ))
+    })?;
+    output.resize(expected_size, 0);
+    decompress_size_prepended_into(input, expected_size, &mut output)?;
+    Ok(output)
+}
+
+pub(crate) fn decompress_size_prepended_into(
+    input: &[u8],
+    expected_size: usize,
+    output: &mut [u8],
+) -> Result<()> {
+    if output.len() != expected_size {
+        return Err(paro_error::invalid_input(format!(
+            "LZ4 destination size {} does not match expected size {}",
+            output.len(),
+            expected_size
+        )));
+    }
     let size_prefix = input
         .get(..4)
         .ok_or_else(|| paro_error::data_corrupted("LZ4 block is shorter than its size prefix"))?;
@@ -43,23 +66,15 @@ pub(crate) fn decompress_size_prepended_exact(
         )));
     }
 
-    let mut output = Vec::new();
-    output.try_reserve_exact(expected_size).map_err(|error| {
-        paro_error::out_of_memory(format!(
-            "Failed to reserve {expected_size} bytes for LZ4 decompression: {error}"
-        ))
+    let decoded_size = lz4_flex::block::decompress_into(&input[4..], output).map_err(|error| {
+        paro_error::data_corrupted(format!("LZ4 decompression failed: {error}"))
     })?;
-    output.resize(expected_size, 0);
-    let decoded_size =
-        lz4_flex::block::decompress_into(&input[4..], &mut output).map_err(|error| {
-            paro_error::data_corrupted(format!("LZ4 decompression failed: {error}"))
-        })?;
     if decoded_size != expected_size {
         return Err(paro_error::data_corrupted(format!(
             "LZ4 decoded size {decoded_size} does not match expected size {expected_size}"
         )));
     }
-    Ok(output)
+    Ok(())
 }
 
 impl BlockCompressionCodec for Lz4BlockCompression {
@@ -71,6 +86,15 @@ impl BlockCompressionCodec for Lz4BlockCompression {
 
     fn decompress(&self, input: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
         decompress_size_prepended_exact(input, uncompressed_size)
+    }
+
+    fn decompress_into(
+        &self,
+        input: &[u8],
+        uncompressed_size: usize,
+        output: &mut [u8],
+    ) -> Result<()> {
+        decompress_size_prepended_into(input, uncompressed_size, output)
     }
 
     fn max_compressed_len(&self, input_len: usize) -> usize {

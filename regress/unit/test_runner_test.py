@@ -10,6 +10,51 @@ from harness.executor import ExecutionResult, QueryOutput
 from harness.parser import Block
 
 
+def test_restart_discovers_original_cwd_without_splitting_spaces(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    owned = tmp_path / "owned data"
+    owned.mkdir()
+    monkeypatch.setattr(Path, "exists", lambda path: False)
+    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout=f"p123\nfcwd\nn{owned}\n"))
+    assert runner._discover_process_cwd(123) == owned
+
+
+def test_restart_rejects_missing_cwd_before_stopping_server(monkeypatch):
+    from types import SimpleNamespace
+    import pytest
+    monkeypatch.setattr(Path, "exists", lambda path: False)
+    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=1, stdout=""))
+    with pytest.raises(runner.ExecutionError, match="working directory"):
+        runner._discover_process_cwd(123)
+
+
+def test_optimizer_verifier_is_reapplied_to_each_connection(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    (tmp_path / "config.toml").write_text("[connection]\n[test]\n")
+    config = runner.resolve_config(runner.parse_args(["--optimizer-verify", "on"]),
+                                   env={}, root_dir=tmp_path)
+    statements = []
+
+    class Connection:
+        autocommit = False
+        def cursor(self):
+            return self
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def execute(self, sql):
+            statements.append(sql)
+
+    monkeypatch.setattr(runner, "_import_psycopg",
+                        lambda: SimpleNamespace(connect=lambda **kwargs: Connection()))
+    for _ in range(3):
+        assert runner._open_connection(config).autocommit
+    assert statements == ["SET optimizer_verify = true"] * 3
+
+
 def test_discover_case_files_and_filter(tmp_path: Path) -> None:
     cases = tmp_path / "cases"
     (cases / "dml" / "select").mkdir(parents=True)
@@ -26,6 +71,21 @@ def test_discover_case_files_and_filter(tmp_path: Path) -> None:
 
     filtered = runner.discover_case_files(cases, filter_pattern="where")
     assert filtered == [sql_c]
+
+
+def test_explicit_report_directory_is_owned_and_never_replaces_existing(tmp_path):
+    import pytest
+    (tmp_path / "config.toml").write_text("[connection]\n[test]\n")
+    output = tmp_path / "owned-output"
+    args = runner.parse_args(["--report-dir", str(output)])
+    config = runner.resolve_config(args, env={}, root_dir=tmp_path)
+    assert config.report_dir == output
+    output.mkdir()
+    marker = output / "keep.txt"
+    marker.write_text("user material")
+    with pytest.raises(runner.RunnerError, match="must not already exist"):
+        runner.resolve_config(args, env={}, root_dir=tmp_path)
+    assert marker.read_text() == "user material"
 
 
 def test_resolve_config_precedence(tmp_path: Path) -> None:
@@ -232,6 +292,8 @@ def test_prepare_case_blocks_stages_fixture_and_rewrites_sql(tmp_path: Path) -> 
     ]
 
     prepared = runner._prepare_case_blocks(case_path, blocks, config)
+    assert prepared[0].transcript_sql == blocks[0].sql
+    assert prepared[0].source_sql == blocks[0].sql
 
     staged_root = config.staged_fixtures_dir / "python_udf" / "fixture_case" / "python_udf" / "modules" / "basic_math"
     assert staged_root.exists()

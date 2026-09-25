@@ -8,12 +8,14 @@ from __future__ import annotations
 from contextlib import suppress
 from dataclasses import dataclass, field
 import json
+import re
 import subprocess
 import threading
 import time as time_module
 from typing import Any, Mapping
 
 from .loader import QueryDef, WorkloadDef
+from .receipt_contract import associate_typed_receipts, uncovered_receipt
 from .result_protocol import normalize_row_v1
 from .validator import BenchmarkValidator
 
@@ -53,9 +55,14 @@ class QueryExecutionResult:
     explain_profile_execution_time_ms: float | None = None
     explain_profile_overhead_ratio: float | None = None
     operator_profiles: list[dict[str, Any]] = field(default_factory=list)
+    receipt_association: dict[str, Any] | None = None
+    receipt_associations: list[dict[str, Any]] = field(default_factory=list)
     rss_before_kb: int | None = None
     rss_after_kb: int | None = None
     rss_peak_kb: int | None = None
+    relative_median_baseline: str | None = None
+    relative_median_ratio: float | None = None
+    relative_median_limit: float | None = None
     error: str | None = None
 
 
@@ -83,6 +90,7 @@ class BenchmarkExecutor:
         timeout_seconds: int,
         collect_memory: bool,
         profile_pid: int = 0,
+        collect_compile_receipts: bool = False,
     ):
         self._connection = dict(connection)
         self._iterations = max(int(iterations), 1)
@@ -90,6 +98,7 @@ class BenchmarkExecutor:
         self._timeout_seconds = max(int(timeout_seconds), 1)
         self._collect_memory = bool(collect_memory)
         self._profile_pid = max(int(profile_pid), 0)
+        self._collect_compile_receipts = bool(collect_compile_receipts)
 
     def connection_factory(self) -> Any:
         try:
@@ -151,18 +160,26 @@ class BenchmarkExecutor:
                     # Timeout closes connection. Remaining queries are skipped for this workload.
                     conn = None
                     break
-        else:
-            for query in workload.queries:
-                result.queries.append(
-                    QueryExecutionResult(
-                        id=query.id,
-                        validate_mode=query.validate,
-                        expected=query.expected,
-                        validation_result="FAIL",
-                        validation_detail="setup/build failed",
-                        error="SKIPPED: setup/build stage failed",
-                    )
+            self._apply_relative_latency_guards(workload, result)
+        # Every planned query retains its coordinate, even when setup failed
+        # or a timed-out query closed the connection. Missing queries must not
+        # silently shift the following registered samples onto another query.
+        skipped_reason = (
+            "setup/build stage failed"
+            if result.setup_status == "FAIL" or result.build_status == "FAIL"
+            else "an earlier query closed the connection"
+        )
+        for query in workload.queries[len(result.queries):]:
+            result.queries.append(
+                QueryExecutionResult(
+                    id=query.id,
+                    validate_mode=query.validate,
+                    expected=query.expected,
+                    validation_result="FAIL",
+                    validation_detail=skipped_reason,
+                    error=f"SKIPPED: {skipped_reason}",
                 )
+            )
 
         teardown_conn = None
         try:
@@ -177,6 +194,46 @@ class BenchmarkExecutor:
                 _safe_close(teardown_conn)
 
         return result
+
+    def _apply_relative_latency_guards(
+        self,
+        workload: WorkloadDef,
+        result: WorkloadExecutionResult,
+    ) -> None:
+        definitions = {query.id: query for query in workload.queries}
+        measurements = {query.id: query for query in result.queries}
+        for query_id, query_result in measurements.items():
+            definition = definitions[query_id]
+            baseline_id = definition.max_median_ratio_to
+            limit = definition.max_median_ratio
+            if baseline_id is None or limit is None:
+                continue
+            query_result.relative_median_baseline = baseline_id
+            query_result.relative_median_limit = limit
+            baseline = measurements.get(baseline_id)
+            current_median = _median(query_result.samples_ms)
+            baseline_median = _median(baseline.samples_ms) if baseline is not None else None
+            if (
+                baseline is None
+                or baseline.error is not None
+                or baseline.validation_result != "PASS"
+                or current_median is None
+                or baseline_median is None
+                or baseline_median <= 0.0
+            ):
+                query_result.validation_result = "FAIL"
+                query_result.validation_detail = (
+                    f"relative median baseline '{baseline_id}' is unavailable"
+                )
+                continue
+            ratio = current_median / baseline_median
+            query_result.relative_median_ratio = ratio
+            if ratio > limit:
+                query_result.validation_result = "FAIL"
+                query_result.validation_detail = (
+                    f"median ratio {ratio:.3f} exceeds {limit:.3f} "
+                    f"relative to '{baseline_id}'"
+                )
 
     def _validate_workload_requirements(self, conn: Any, workload: WorkloadDef) -> None:
         required = workload.minimum_server_buffer_pool_bytes
@@ -207,6 +264,11 @@ class BenchmarkExecutor:
             validate_mode=query.validate,
             expected=query.expected,
         )
+        # This list is owned by the query result from the first timed sample,
+        # not copied only after the whole loop succeeds.  A later sample may
+        # fail or cancel; that must not erase receipts and timings already
+        # sealed for earlier samples.
+        sample_receipts: list[dict[str, Any]] = []
 
         try:
             if query.setup_sql:
@@ -227,13 +289,34 @@ class BenchmarkExecutor:
             if self._profile_pid > 0:
                 query_result.rss_before_kb = _read_process_rss_kb(self._profile_pid)
 
+            receipt_before_execution_ids: set[int] | None = None
+            if self._collect_compile_receipts:
+                try:
+                    receipt_before_execution_ids = self._snapshot_compile_execution_ids(conn)
+                except Exception:
+                    # Receipt coverage is an independent observation.  A
+                    # failed pre-snapshot must not turn the timed SQL sample
+                    # into a query failure.
+                    receipt_before_execution_ids = None
+
             last_rows: list[tuple[Any, ...]] = []
             for _ in range(self._iterations):
                 rss_sampler = RssSampler(self._profile_pid)
                 rss_sampler.start()
                 start = time_module.perf_counter()
+                rows: list[tuple[Any, ...]] | None = None
+                # Cancellation can be represented by a BaseException (for
+                # example asyncio.CancelledError) rather than an Exception.
+                # Capture it only after the timer/finally boundary has closed;
+                # KeyboardInterrupt/SystemExit still escape so the process is
+                # not made falsely successful by the benchmark harness.
+                execution_error: BaseException | None = None
                 try:
                     rows = self._execute_sql(conn, query.sql, fetch=True)
+                except BaseException as exc:
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    execution_error = exc
                 finally:
                     elapsed_ms = (time_module.perf_counter() - start) * 1000.0
                     rss_sampler.stop()
@@ -243,7 +326,29 @@ class BenchmarkExecutor:
                         query_result.rss_peak_kb or 0,
                         rss_sampler.peak_kb,
                     )
+                if execution_error is not None:
+                    if self._collect_compile_receipts:
+                        sample_receipts.append(uncovered_receipt(
+                            "timed execution failed before receipt: "
+                            f"{_format_error(execution_error)}"
+                        ))
+                        query_result.receipt_associations = list(sample_receipts)
+                        query_result.receipt_association = sample_receipts[0]
+                    raise execution_error
+                assert rows is not None
                 last_rows = rows
+                if self._collect_compile_receipts:
+                    sample_receipts.append(
+                        self._collect_compile_receipt(
+                            conn,
+                            before_execution_ids=receipt_before_execution_ids,
+                            query_fingerprint=_statement_fingerprint(query.sql),
+                        )
+                    )
+                    try:
+                        receipt_before_execution_ids = self._snapshot_compile_execution_ids(conn)
+                    except Exception:
+                        receipt_before_execution_ids = None
 
             if self._collect_memory:
                 query_result.memory_tags_after = self._fetch_memory_tag_rows(conn)
@@ -257,6 +362,9 @@ class BenchmarkExecutor:
             outcome = validator.validate_query(query, query_result.result_rows)
             query_result.validation_result = outcome.status
             query_result.validation_detail = outcome.detail
+            if self._collect_compile_receipts:
+                query_result.receipt_associations = sample_receipts
+                query_result.receipt_association = sample_receipts[0] if sample_receipts else None
             self._collect_explain_profile(conn, query, query_result)
         except QueryTimeoutError as exc:
             query_result.error = f"TIMEOUT: {exc}"
@@ -264,22 +372,123 @@ class BenchmarkExecutor:
             query_result.validation_detail = str(exc)
             query_result.explain_profile_status = "SKIP"
             query_result.explain_profile_detail = "primary query timed out"
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             query_result.error = _format_error(exc)
             query_result.validation_result = "FAIL"
             query_result.validation_detail = _format_error(exc)
             query_result.explain_profile_status = "SKIP"
             query_result.explain_profile_detail = "primary query failed"
         finally:
+            if self._collect_compile_receipts:
+                query_result.receipt_associations = list(sample_receipts)
+                query_result.receipt_association = sample_receipts[0] if sample_receipts else None
             if query.teardown_sql:
                 try:
                     self._execute_script(conn, query.teardown_sql)
-                except Exception as exc:
+                except BaseException as exc:
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        raise
                     if query_result.error is None:
                         query_result.error = f"QUERY TEARDOWN: {_format_error(exc)}"
                         query_result.validation_result = "FAIL"
                         query_result.validation_detail = _format_error(exc)
         return query_result
+
+    def _collect_compile_receipt(
+        self,
+        conn: Any,
+        *,
+        before_execution_ids: set[int] | None = None,
+        query_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        """Read the bounded post-statement receipt channel.
+
+        This is deliberately outside the timed loop and never asks the
+        server to compile or execute the target again.  A missing or
+        ambiguous receipt is Uncovered, not a synthetic zero and not a
+        reason to discard the normal timing sample.
+        """
+        try:
+            columns, rows = self._read_compile_channel(conn)
+        except Exception as exc:
+            return uncovered_receipt(
+                f"receipt channel unavailable: {_format_error(exc)}"
+            )
+
+        indexes = {name.rsplit(".", 1)[-1]: index for index, name in enumerate(columns)}
+        required = {"record_type", "record_id", "payload_json"}
+        if not required.issubset(indexes):
+            return uncovered_receipt(
+                "typed receipt channel schema is missing required columns"
+            )
+
+        cache_decisions: dict[int, dict[str, Any]] = {}
+        execution_records: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            record_type = str(row[indexes["record_type"]])
+            record_id = row[indexes["record_id"]]
+            payload = row[indexes["payload_json"]]
+            if not payload:
+                continue
+            try:
+                decoded = json.loads(str(payload))
+            except (TypeError, ValueError):
+                continue
+            if record_type == "statement_cache" and isinstance(decoded, dict):
+                decision_id = decoded.get("decision_id")
+                if (
+                    isinstance(decision_id, int)
+                    and not isinstance(decision_id, bool)
+                    and record_id == decision_id
+                ):
+                    cache_decisions[decision_id] = decoded
+            elif record_type == "execution_receipt" and isinstance(decoded, dict):
+                execution_id = decoded.get("execution_id")
+                if (
+                    isinstance(execution_id, int)
+                    and not isinstance(execution_id, bool)
+                    and record_id == execution_id
+                ):
+                    execution_records[execution_id] = decoded
+
+        return associate_typed_receipts(
+            cache_decisions,
+            execution_records,
+            before_execution_ids=before_execution_ids,
+            query_fingerprint=query_fingerprint,
+        )
+
+    def _read_compile_channel(
+        self, conn: Any
+    ) -> tuple[list[str], list[tuple[Any, ...]]]:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM paro_optimizers()")
+            columns = [
+                getattr(column, "name", str(column))
+                for column in cursor.description or ()
+            ]
+            return columns, cursor.fetchall()
+
+    def _snapshot_compile_execution_ids(self, conn: Any) -> set[int] | None:
+        columns, rows = self._read_compile_channel(conn)
+        indexes = {name.rsplit(".", 1)[-1]: index for index, name in enumerate(columns)}
+        if not {"record_type", "payload_json"}.issubset(indexes):
+            return None
+        result: set[int] = set()
+        for row in rows:
+            if row[indexes["record_type"]] != "execution_receipt":
+                continue
+            payload = row[indexes["payload_json"]]
+            try:
+                decoded = json.loads(str(payload))
+            except (TypeError, ValueError):
+                continue
+            execution_id = decoded.get("execution_id") if isinstance(decoded, dict) else None
+            if isinstance(execution_id, int) and not isinstance(execution_id, bool):
+                result.add(execution_id)
+        return result
 
     def _collect_explain_profile(
         self,
@@ -328,12 +537,21 @@ class BenchmarkExecutor:
     def _fetch_explain_profile_json(self, conn: Any, sql: str) -> str:
         explain_sql = _build_explain_analyze_sql(sql)
         rows = self._execute_sql(conn, explain_sql, fetch=True)
-        if not rows or not rows[0]:
-            raise ValueError("EXPLAIN ANALYZE FORMAT JSON returned no rows")
-        raw = rows[0][0]
-        if not isinstance(raw, str) or not raw.strip():
-            raise ValueError("EXPLAIN ANALYZE FORMAT JSON returned empty payload")
-        return raw
+        if not rows:
+            raise ValueError("EXPLAIN ANALYZE returned no rows")
+        payload_lines: list[str] = []
+        for row in rows:
+            if not row:
+                continue
+            payload = row[0]
+            if isinstance(payload, str) and payload.strip():
+                payload_lines.append(payload)
+        if not payload_lines:
+            raise ValueError("EXPLAIN ANALYZE returned an empty payload")
+        # JSON is normally one row; Paro's text renderer returns one row per
+        # plan/profile line.  Joining here keeps the wire-format distinction
+        # out of the executor and lets the parser below handle both forms.
+        return "\n".join(payload_lines)
 
     def _execute_script(self, conn: Any, script: str) -> None:
         for statement in _split_sql_statements(script):
@@ -462,7 +680,12 @@ def _extract_explain_execution_time_ms(raw_json: str) -> float | None:
     try:
         document = json.loads(raw_json)
     except json.JSONDecodeError:
-        return None
+        match = re.search(
+            r"^\s*Execution Time:\s*([0-9]+(?:\.[0-9]+)?)\s*ms\s*$",
+            raw_json,
+            flags=re.MULTILINE,
+        )
+        return float(match.group(1)) if match else None
     if not isinstance(document, dict):
         return None
     summary = document.get("summary")
@@ -536,8 +759,8 @@ def _read_process_rss_kb(pid: int) -> int | None:
 def _flatten_explain_profile(raw_json: str) -> list[dict[str, Any]]:
     try:
         document = json.loads(raw_json)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid explain JSON: {exc}") from exc
+    except json.JSONDecodeError:
+        return _flatten_explain_profile_text(raw_json)
     if not isinstance(document, dict):
         raise ValueError("explain JSON document must be an object")
     operators = document.get("operators")
@@ -552,6 +775,7 @@ def _flatten_explain_profile(raw_json: str) -> list[dict[str, Any]]:
             profiles.append(
                 _operator_profile_entry(
                     node_id=_optional_int(operator.get("runtime_id")),
+                    logical_node_id=_optional_int(operator.get("logical_node_id")),
                     operator=str(operator.get("operator", "")),
                     tree_path=str(index),
                     actual_map=actual_map,
@@ -601,6 +825,7 @@ def _document_profile_fields(document: Mapping[str, Any]) -> dict[str, Any]:
 def _operator_profile_entry(
     *,
     node_id: int | None,
+    logical_node_id: int | None,
     operator: str,
     tree_path: str,
     actual_map: Mapping[str, Any],
@@ -608,6 +833,7 @@ def _operator_profile_entry(
 ) -> dict[str, Any]:
     return {
         "node_id": node_id,
+        "logical_node_id": logical_node_id,
         "operator": operator,
         "tree_path": tree_path,
         "rows": _optional_int(actual_map.get("rows")),
@@ -623,6 +849,9 @@ def _operator_profile_entry(
         "scheduler_morsel_count": _optional_int(actual_map.get("scheduler_morsel_count")),
         "scheduler_ready_time_us": _optional_int(actual_map.get("scheduler_ready_time_us")),
         "scheduler_wait_time_us": _optional_int(actual_map.get("scheduler_wait_time_us")),
+        "aggregate_hash_max_radix_partition_skew_percent": _optional_int(
+            actual_map.get("aggregate_hash_max_radix_partition_skew_percent")
+        ),
         "output_backpressure_count": _optional_int(
             actual_map.get("output_backpressure_count")
         ),
@@ -652,6 +881,7 @@ def _append_operator_profile(
     profiles.append(
         _operator_profile_entry(
             node_id=_optional_int(node.get("node_id")),
+            logical_node_id=_optional_int(node.get("logical_node_id")),
             operator=str(node.get("operator", "")),
             tree_path=tree_path,
             actual_map=actual_map,
@@ -665,6 +895,121 @@ def _append_operator_profile(
     for index, child in enumerate(children):
         if isinstance(child, dict):
             _append_operator_profile(child, profiles, f"{tree_path}/{index}", profile_fields)
+
+
+_TEXT_OPERATOR_RE = re.compile(
+    r"^\s+(SOURCE|TRANSFORM|SINK)\s+#(\d+)\s+([^ ]+)"
+    r"(?:\s+(\(.*\)))?(?:\s+logical_node_id=(\d+))?\s*$"
+)
+_TEXT_PIPELINE_RE = re.compile(r"^PIPELINE\s+(\d+)\s*$")
+
+
+def _flatten_explain_profile_text(raw_text: str) -> list[dict[str, Any]]:
+    lines = raw_text.splitlines()
+    profile_fields = _text_profile_fields(lines)
+    profiles: list[dict[str, Any]] = []
+    pipeline_id: str | None = None
+    for line in lines:
+        pipeline_match = _TEXT_PIPELINE_RE.match(line.strip())
+        if pipeline_match:
+            pipeline_id = pipeline_match.group(1)
+            continue
+        operator_match = _TEXT_OPERATOR_RE.match(line)
+        if not operator_match:
+            continue
+        role, node_id, operator, actual_suffix, logical_node_id = operator_match.groups()
+        actual_map = _parse_text_actual_suffix(actual_suffix)
+        tree_path = f"{pipeline_id or '0'}/{role.lower()}/{node_id}"
+        profiles.append(
+            _operator_profile_entry(
+                node_id=int(node_id),
+                logical_node_id=int(logical_node_id) if logical_node_id is not None else None,
+                operator=operator,
+                tree_path=tree_path,
+                actual_map=actual_map,
+                profile_fields=profile_fields,
+            )
+        )
+    if not profiles and not any(line.startswith("UTILITY ") for line in lines):
+        raise ValueError("explain text payload contains no pipeline operators")
+    return profiles
+
+
+def _parse_text_actual_suffix(suffix: str | None) -> dict[str, Any]:
+    if not suffix:
+        return {}
+    body = suffix.strip()
+    if not (body.startswith("(") and body.endswith(")")):
+        return {}
+    body = body[1:-1]
+    actual: dict[str, Any] = {}
+    time_match = re.search(
+        r"\bactual\s+time=([+-]?[0-9]+(?:\.[0-9]+)?)\.\.([+-]?[0-9]+(?:\.[0-9]+)?)",
+        body,
+    )
+    if time_match:
+        actual["startup_time_ms"] = float(time_match.group(1))
+        actual["total_time_ms"] = float(time_match.group(2))
+    for key, value in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)", body):
+        if key == "time":
+            continue
+        parsed: int | float | str
+        try:
+            if any(character in value for character in ".eE"):
+                parsed = float(value)
+            else:
+                parsed = int(value)
+        except ValueError:
+            parsed = value
+        actual[key] = parsed
+    return actual
+
+
+def _text_profile_fields(lines: list[str]) -> dict[str, Any]:
+    profile_values: dict[str, Any] = {}
+    memory_values: dict[str, Any] = {}
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("PROFILE "):
+            profile_values = _parse_text_key_values(stripped[len("PROFILE ") :])
+        elif stripped.startswith("MEMORY_PROFILE "):
+            memory_values = _parse_text_key_values(stripped[len("MEMORY_PROFILE ") :])
+    return {
+        "profile_schema_version": _optional_int(profile_values.get("schema_version")),
+        "query_id": _optional_int(profile_values.get("query_id")),
+        "profile_event_count": _optional_int(profile_values.get("events")),
+        "profile_parallelism": _optional_int(profile_values.get("parallelism")),
+        "profile_observed_workers": _optional_int(profile_values.get("workers")),
+        "profile_worker_utilization": _optional_float(
+            profile_values.get("worker_utilization")
+        ),
+        "profile_ready_time_us": _optional_int(profile_values.get("ready_time_us")),
+        "profile_wait_time_us": _optional_int(profile_values.get("wait_time_us")),
+        "profile_backpressure_count": _optional_int(profile_values.get("backpressure")),
+        "profile_runtime_filter_installed_count": _optional_int(
+            profile_values.get("runtime_filter_installed")
+        ),
+        "profile_runtime_filter_no_wait_count": _optional_int(
+            profile_values.get("runtime_filter_no_wait")
+        ),
+        "profile_grant_bytes": _optional_int(memory_values.get("grant_bytes")),
+        "profile_revoked_bytes": _optional_int(memory_values.get("revoked_bytes")),
+        "profile_spill_bytes": _optional_int(memory_values.get("spill_bytes")),
+        "profile_yield_latency_us": _optional_int(memory_values.get("yield_latency_us")),
+    }
+
+
+def _parse_text_key_values(payload: str) -> dict[str, int | float | str]:
+    values: dict[str, int | float | str] = {}
+    for key, value in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)", payload):
+        try:
+            if any(character in value for character in ".eE"):
+                values[key] = float(value)
+            else:
+                values[key] = int(value)
+        except ValueError:
+            values[key] = value
+    return values
 
 
 def _optional_int(value: Any) -> int | None:
@@ -778,7 +1123,7 @@ def _split_sql_statements(script: str) -> list[str]:
     return statements
 
 
-def _format_error(exc: Exception) -> str:
+def _format_error(exc: BaseException) -> str:
     diag = getattr(exc, "diag", None)
     primary = getattr(diag, "message_primary", None) or str(exc)
     primary = str(primary).splitlines()[0]
@@ -799,6 +1144,94 @@ def _format_error(exc: Exception) -> str:
     if suffixes:
         return f"{type(exc).__name__}: {primary} ({'; '.join(suffixes)})"
     return f"{type(exc).__name__}: {primary}"
+
+
+def _statement_fingerprint(sql: str) -> int:
+    """Match the Rust statement identity only as a receipt consistency check."""
+    result = 0xCBF29CE484222325
+    for byte in sql.encode("utf-8"):
+        result ^= byte
+        result = (result * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return result
+
+
+def _decode_receipt_word(value: int, unit: str, *, field: str) -> int:
+    if unit == "identity_word" or field.endswith("_hi") or field.endswith("_lo"):
+        return value & ((1 << 64) - 1)
+    return value
+
+
+def _receipt_identity(values: Mapping[str, int]) -> dict[str, Any] | None:
+    fields = (
+        "identity_schema_version",
+        "artifact_hi",
+        "artifact_lo",
+        "structure_hi",
+        "structure_lo",
+        "dependencies_hi",
+        "dependencies_lo",
+    )
+    if any(field not in values for field in fields):
+        return None
+    return {
+        "schema_version": values["identity_schema_version"],
+        "artifact": [values["artifact_hi"], values["artifact_lo"]],
+        "structure": [values["structure_hi"], values["structure_lo"]],
+        "dependencies": [values["dependencies_hi"], values["dependencies_lo"]],
+    }
+
+
+def _receipt_identity_key(values: Mapping[str, int]) -> tuple[int, ...] | None:
+    identity = _receipt_identity(values)
+    if identity is None:
+        return None
+    return (
+        identity["schema_version"],
+        *identity["artifact"],
+        *identity["structure"],
+        *identity["dependencies"],
+    )
+
+
+def _receipt_fingerprint(values: Mapping[str, int], prefix: str) -> list[int] | None:
+    high = values.get(f"{prefix}_hi")
+    low = values.get(f"{prefix}_lo")
+    if high is None or low is None:
+        return None
+    return [high, low]
+
+
+def _optional_class(value: int | None) -> int | None:
+    if value is None or value == (1 << 32) - 1:
+        return None
+    return value
+
+
+def _admission_name(value: int | None) -> str | None:
+    return {1: "Selected", 2: "Infeasible", 3: "Failed"}.get(value)
+
+
+def _fallback_name(value: int | None) -> str | None:
+    return {
+        1: "LowerResourceClass",
+        2: "ExternalCapacity",
+        3: "DependencyChanged",
+    }.get(value)
+
+
+def _terminal_name(value: int | None) -> str | None:
+    return {
+        0: "NotExecuted",
+        1: "Running",
+        2: "Completed",
+        3: "Failed",
+        4: "Cancelled",
+        5: "Dropped",
+    }.get(value)
+
+
+def _image_name(value: int | None) -> str | None:
+    return {0: "NotReady", 1: "Ready"}.get(value)
 
 
 def _safe_close(conn: Any) -> None:

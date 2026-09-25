@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::binder::ir::BoundQuery;
 use crate::binder::ir::BoundStatementKind;
 use crate::binder::Binder;
-use crate::operator::insert::{InsertOnConflict, InsertOnConflictAction};
+use crate::logical::operator::insert::{InsertOnConflict, InsertOnConflictAction};
 use paro_catalog::entry::ConstraintType;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::error::{self as paro_error, Result};

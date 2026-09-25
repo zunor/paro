@@ -66,6 +66,10 @@ impl AliasLookup {
 /// - Expanded column indices for UNNEST operations
 #[derive(Debug, Default, Clone)]
 pub struct SelectBindState {
+    /// Result-column namespace for a complete ORDER BY name. Unlike aliases
+    /// used inside expressions, implicit output names are not visible in WHERE,
+    /// GROUP BY or another SELECT item. None records an ambiguous output name.
+    order_output_names: HashMap<String, Option<(usize, Option<String>)>>,
     /// Map from alias (case-insensitive) to SELECT list index.
     ///
     pub alias_map: HashMap<String, usize>,
@@ -111,6 +115,46 @@ pub struct SelectBindState {
 }
 
 impl SelectBindState {
+    pub fn add_order_output_name(
+        &mut self,
+        name: &str,
+        quoted: bool,
+        index: usize,
+        column_identity: Option<String>,
+    ) {
+        let key = if quoted {
+            name.to_owned()
+        } else {
+            name.to_lowercase()
+        };
+        self.order_output_names
+            .entry(key)
+            .and_modify(|entry| {
+                // Repeated references to exactly the same source column are
+                // interchangeable. Arbitrary expressions (notably volatile
+                // ones) do not acquire that proof from their display text.
+                if !matches!(entry, Some((_, Some(existing))) if Some(existing.as_str()) == column_identity.as_deref()) {
+                    *entry = None;
+                }
+            })
+            .or_insert(Some((index, column_identity)));
+    }
+
+    pub fn order_output_index(&self, name: &str, quoted: bool) -> Result<Option<usize>> {
+        let key = if quoted {
+            name.to_owned()
+        } else {
+            name.to_lowercase()
+        };
+        match self.order_output_names.get(&key) {
+            Some(Some((index, _))) => Ok(Some(*index)),
+            Some(None) => Err(paro_error::syntax(format!(
+                "ORDER BY output name \"{name}\" is ambiguous"
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// Create a new SelectBindState.
     pub fn new() -> Self {
         Self::default()

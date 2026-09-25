@@ -155,6 +155,188 @@ fn prepare_execute_deallocate_updates_metadata() {
     );
 }
 
+async fn run_prepared_aggregate_domain_remains_valid_after_dml() {
+    let base_dir = create_unique_test_dir("prepared_statement_runtime", "aggregate_domain_dml");
+    let instance = create_persistent_instance(&base_dir);
+    let mut session = Session::new(1, Arc::clone(&instance));
+    let mut sink = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE prepared_domain_t (v INT)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO prepared_domain_t VALUES (1), (2)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "PREPARE prepared_domain AS SELECT v, COUNT(*) FROM prepared_domain_t GROUP BY v ORDER BY v",
+    )
+    .await;
+
+    exec_ok(&mut session, &mut sink, "EXECUTE prepared_domain").await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1, 2]);
+    assert_eq!(query_i64_col(&sink, 1), vec![1, 1]);
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO prepared_domain_t VALUES (100000)",
+    )
+    .await;
+    exec_ok(&mut session, &mut sink, "EXECUTE prepared_domain").await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1, 2, 100000]);
+    assert_eq!(query_i64_col(&sink, 1), vec![1, 1, 1]);
+
+    drop(session);
+    instance
+        .database_registry()
+        .get_database("postgres")
+        .expect("default database")
+        .close(DatabaseCloseAction::Checkpoint)
+        .expect("close prepared aggregate test database");
+    drop(instance);
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn prepared_aggregate_domain_remains_valid_after_dml() {
+    run_async_test_with_large_stack(
+        "prepared-aggregate-domain-dml",
+        run_prepared_aggregate_domain_remains_valid_after_dml(),
+    );
+}
+
+async fn run_prepared_join_observes_new_keys_after_dml() {
+    let base_dir = create_unique_test_dir("prepared_statement_runtime", "join_new_keys");
+    let instance = create_persistent_instance(&base_dir);
+    let mut session = Session::new(1, Arc::clone(&instance));
+    let mut sink = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE prepared_range_source (k INT)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE prepared_range_target (k INT)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO prepared_range_source VALUES \
+         (1),(2),(1),(2),(1),(2),(1),(2),(1),(2),\
+         (1),(2),(1),(2),(1),(2),(1),(2),(1),(2)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO prepared_range_target VALUES (1), (2), (100)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "PREPARE prepared_range AS \
+         SELECT t.k, COUNT(*) \
+         FROM prepared_range_source s \
+         JOIN prepared_range_target t ON s.k = t.k \
+         GROUP BY t.k ORDER BY t.k",
+    )
+    .await;
+
+    exec_ok(&mut session, &mut sink, "EXECUTE prepared_range").await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1, 2]);
+    assert_eq!(query_i64_col(&sink, 1), vec![10, 10]);
+
+    // Snapshot-local key domains are estimates, never correctness proofs in a
+    // cached physical plan. A newly visible source key must remain joinable.
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO prepared_range_source VALUES (100)",
+    )
+    .await;
+    exec_ok(&mut session, &mut sink, "EXECUTE prepared_range").await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1, 2, 100]);
+    assert_eq!(query_i64_col(&sink, 1), vec![10, 10, 1]);
+
+    drop(session);
+    instance
+        .database_registry()
+        .get_database("postgres")
+        .expect("default database")
+        .close(DatabaseCloseAction::Checkpoint)
+        .expect("close prepared join range test database");
+    drop(instance);
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn prepared_join_observes_new_keys_after_dml() {
+    run_async_test_with_large_stack(
+        "prepared-join-new-keys",
+        run_prepared_join_observes_new_keys_after_dml(),
+    );
+}
+
+async fn run_low_memory_grouped_average_uses_one_resource_contract() {
+    let base_dir = create_unique_test_dir("prepared_statement_runtime", "aggregate_low_memory");
+    let instance = create_persistent_instance(&base_dir);
+    let mut session = Session::new(1, Arc::clone(&instance));
+    let mut sink = CollectingSink::new();
+
+    exec_ok(&mut session, &mut sink, "SET memory_limit = '4MB'").await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE low_memory_average_t (i INT)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO low_memory_average_t SELECT i::INT FROM generate_series(1, 80000) AS t(i)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT COUNT(*) FROM (SELECT AVG(i) FROM low_memory_average_t GROUP BY i) AS grouped",
+    )
+    .await;
+    assert_eq!(query_i64_col(&sink, 0), vec![80_000]);
+
+    drop(session);
+    instance
+        .database_registry()
+        .get_database("postgres")
+        .expect("default database")
+        .close(DatabaseCloseAction::Checkpoint)
+        .expect("close low-memory aggregate test database");
+    drop(instance);
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn low_memory_grouped_average_uses_one_resource_contract() {
+    run_async_test_with_large_stack(
+        "low-memory-grouped-average-resource-contract",
+        run_low_memory_grouped_average_uses_one_resource_contract(),
+    );
+}
+
 #[tokio::test]
 async fn execute_accepts_expressions_and_returns_underlying_completion() {
     let instance = Instance::new_in_memory();
@@ -382,7 +564,9 @@ async fn cancelled_declare_cursor_does_not_poison_future_cursor_scope() {
         "INSERT INTO cursor_cancel_t VALUES (1), (2), (3)",
     )
     .await;
-    exec_ok(&mut session, &mut sink, "SET statement_timeout = 1").await;
+    // This test injects cancellation through ToggleTimeoutDriver. Do not race
+    // normal setup/cleanup against a real 1 ms monotonic statement deadline.
+    exec_ok(&mut session, &mut sink, "SET statement_timeout = 60000").await;
 
     driver.enable();
     let err = exec_err(
@@ -425,7 +609,8 @@ async fn cancelled_fetch_keeps_cursor_cleanup_paths_usable() {
         "INSERT INTO cursor_fetch_cancel_t VALUES (1), (2), (3)",
     )
     .await;
-    exec_ok(&mut session, &mut sink, "SET statement_timeout = 1").await;
+    // The driver injects the timeout at FETCH; setup must not expire first.
+    exec_ok(&mut session, &mut sink, "SET statement_timeout = 60000").await;
     exec_ok(
         &mut session,
         &mut sink,

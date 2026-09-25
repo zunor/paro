@@ -14,13 +14,13 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value as RuntimeValue;
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::RoutineCallIdentity;
-use paro_external::routine::spec::RoutineSemantics;
 use paro_external::routine::spec::{
     PythonEntrypointRef, RoutineImplementationRef, RoutineReturn, RoutineSpec,
 };
 use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
 use paro_external::runtime::host::default_python_binary;
-use paro_planner::operator::external_project::ExternalProjectExpression;
+use paro_planner::logical::operator::external_project::ExternalProjectExpression;
+use paro_planner::physical::ExternalRoutineDescriptor;
 use serde_json::{json, Value as JsonValue};
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
@@ -28,20 +28,6 @@ use crate::memory_runtime::OperatorMemoryScope;
 use crate::runtime::QueryRuntimeContext;
 
 use super::batching::SubmissionBatchPolicy;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalRoutineDescriptor {
-    pub label: String,
-    pub identity: RoutineCallIdentity,
-    pub semantics: RoutineSemantics,
-    pub spec: Option<RoutineSpec>,
-}
-
-impl ExternalRoutineDescriptor {
-    pub fn identity_label(&self) -> String {
-        format_identity_label(&self.identity, &self.label)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeBridgeExplainInfo {
@@ -359,7 +345,9 @@ impl ExternalRuntimeBridge {
         submission: &ProjectSubmission<'_>,
         memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
-        self.project_executor.execute(ctx, submission, memory)
+        self.dispatch(ctx, || {
+            self.project_executor.execute(ctx, submission, memory)
+        })
     }
 
     pub fn execute_table(
@@ -368,7 +356,32 @@ impl ExternalRuntimeBridge {
         submission: &TableSubmission<'_>,
         memory: &OperatorMemoryScope<'_>,
     ) -> Result<RuntimeBridgeOutcome> {
-        self.table_executor.execute(ctx, submission, memory)
+        self.dispatch(ctx, || self.table_executor.execute(ctx, submission, memory))
+    }
+
+    fn dispatch(
+        &self,
+        ctx: &QueryRuntimeContext,
+        execute: impl FnOnce() -> Result<RuntimeBridgeOutcome>,
+    ) -> Result<RuntimeBridgeOutcome> {
+        let gate = ctx.memory.external_dispatch_gate().ok_or_else(|| {
+            paro_error::internal("external runtime dispatch requires an admitted worker-slot lease")
+        })?;
+        let waiting_since = Instant::now();
+        let _permit = gate.acquire();
+        let wait_us = waiting_since.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        let mut outcome = execute()?;
+        let response = match &mut outcome {
+            RuntimeBridgeOutcome::Ready(response) | RuntimeBridgeOutcome::Blocked(response) => {
+                response
+            }
+        };
+        response.metrics.worker_acquire_time_us = response
+            .metrics
+            .worker_acquire_time_us
+            .saturating_add(wait_us);
+        response.metrics.queue_wait_us = response.metrics.queue_wait_us.saturating_add(wait_us);
+        Ok(outcome)
     }
 }
 
@@ -775,10 +788,13 @@ except Exception as exc:
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalProjectExecutor, ExternalRoutineDescriptor, ProjectSubmission, TestProjectExecutor,
+        ExternalProjectExecutor, ExternalRoutineDescriptor, ExternalRuntimeBridge,
+        ProjectSubmission, PythonProcessTableExecutor, RuntimeBridgeExplainInfo,
+        TestProjectExecutor,
     };
     use crate::memory_runtime::{
-        LocalMemoryGrant, OperatorMemoryAccount, OperatorMemoryScope, QueryMemoryPool,
+        ExecutionLease, LocalMemoryGrant, OperatorMemoryAccount, OperatorMemoryScope,
+        QueryMemoryPool,
     };
     use crate::operators::external::batching::SubmissionBatchPolicy;
     use crate::runtime::{ParameterBindings, QueryOutputPort, QueryRuntimeContext};
@@ -794,12 +810,14 @@ mod tests {
     use paro_external::routine::spec::{
         RoutineNullPolicy, RoutineSemantics, RoutineSideEffects, RoutineStability, RowSemantics,
     };
+    use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
     use paro_external::runtime::host::{
-        ExternalRuntimeHost, PythonRuntimeProbe, PythonRuntimeProbeResult,
+        ExternalRuntimeHost, PythonRuntimeProbe, PythonRuntimeProbeResult, PythonRuntimeProvider,
     };
     use paro_function::scalar::ScalarFunction;
     use paro_planner::expression::{Expression, FunctionExpression, ReferenceExpression};
-    use paro_planner::operator::external_project::ExternalProjectExpression;
+    use paro_planner::logical::operator::external_project::ExternalProjectExpression;
+    use paro_planner::physical::{ExecutionResourceContract, ResourceGrantClassId};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -862,10 +880,9 @@ mod tests {
                     LogicalType::Integer,
                     add_one,
                 ),
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
                 LogicalType::Integer,
             )
             .with_routine_meta(BoundRoutineCallMeta {
@@ -880,7 +897,8 @@ mod tests {
                     row_semantics: RowSemantics::RowPreserving,
                 },
                 spec: None,
-            }),
+            })
+            .into(),
         );
 
         ExternalProjectExpression {
@@ -922,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluating_project_executor_executes_generated_columns() {
+    fn runtime_bridge_requires_and_consumes_an_external_worker_lease() {
         let ctx = test_ctx();
         let input = Chunk::from_vectors(
             vec![paro_common::test_utils::test_i32_vector_with_allocator(
@@ -953,8 +971,42 @@ mod tests {
             },
         };
 
-        let response = match TestProjectExecutor
-            .execute(&ctx, &submission, &test_operator_memory_scope())
+        let bridge = ExternalRuntimeBridge::new(
+            RuntimeBridgeExplainInfo::default_python_process(),
+            ExternalDispatchPolicy::default(),
+            Arc::new(TestProjectExecutor),
+            Arc::new(PythonProcessTableExecutor),
+        );
+        let error = bridge
+            .execute_project(&ctx, &submission, &test_operator_memory_scope())
+            .expect_err("dispatch without an admitted worker slot must fail");
+        assert!(error.to_string().contains("worker-slot lease"));
+
+        let host = ExternalRuntimeHost::ready_stub();
+        let lease = host
+            .try_acquire_execution_slots(1, 1)
+            .unwrap()
+            .expect("test query should acquire a worker slot");
+        ctx.memory
+            .install_execution_lease(
+                ExecutionLease::new(
+                    ExecutionResourceContract {
+                        class: ResourceGrantClassId::new(0),
+                        minimum_memory_bytes: 0,
+                        working_set_memory_bytes: 0,
+                        memory_ceiling_bytes: u64::try_from(ctx.memory.capacity_bytes())
+                            .unwrap_or(u64::MAX),
+                        memory_completion: paro_planner::physical::MemoryCompletion::Guaranteed,
+                        max_parallel_tasks: 1,
+                        external_worker_slots: 1,
+                    },
+                    Some(lease),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let response = match bridge
+            .execute_project(&ctx, &submission, &test_operator_memory_scope())
             .expect("project bridge should succeed")
         {
             super::RuntimeBridgeOutcome::Ready(response) => response,

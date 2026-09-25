@@ -5,7 +5,7 @@
 
 use crate::binder::Binder;
 use crate::expression::*;
-use crate::operator::{
+use crate::logical::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, CrossProduct, Join, JoinComparisonType,
     JoinCondition, JoinType, Limit, LogicalOperator, Projection,
 };
@@ -30,10 +30,9 @@ impl Binder {
             )));
         };
 
-        Ok(Expression::ColumnRef(ColumnRefExpression::new(
-            binding,
-            return_type,
-        )))
+        Ok(Expression::ColumnRef(
+            ColumnRefExpression::new(binding, return_type).into(),
+        ))
     }
 
     pub(crate) fn plan_current_layer_subqueries_in_list(
@@ -131,12 +130,16 @@ impl Binder {
                 subquery_plan,
                 root,
                 &subquery.children,
+                &subquery.child_types,
+                &subquery.child_targets,
                 subquery.comparison_type,
             ),
             SubqueryType::All => self.plan_uncorrelated_all(
                 subquery_plan,
                 root,
                 &subquery.children,
+                &subquery.child_types,
+                &subquery.child_targets,
                 subquery.comparison_type,
             ),
         }
@@ -148,12 +151,15 @@ impl Binder {
         root: &mut LogicalOperator,
         subquery_type: SubqueryType,
     ) -> Result<Expression> {
-        let limit_expr = Expression::Constant(ConstantExpression {
-            value: Value::BigInt(1),
-            return_type: LogicalType::BigInt,
-        });
+        let limit_expr = Expression::Constant(
+            ConstantExpression {
+                value: Value::BigInt(1),
+                return_type: LogicalType::BigInt,
+            }
+            .into(),
+        );
         let limited = Limit::new(self.wrap_plan(subquery_plan), Some(limit_expr), None);
-        let plan = LogicalOperator::Limit(limited);
+        let plan = LogicalOperator::Limit(Box::new(limited));
 
         let count_star = get_count_star_function();
         let count_agg = AggregateExpression::new(count_star, vec![], LogicalType::BigInt);
@@ -167,19 +173,22 @@ impl Binder {
             self.wrap_plan(plan),
             Vec::new(),
             Vec::new(),
-            vec![Expression::Aggregate(count_agg)],
+            vec![Expression::Aggregate(count_agg.into())],
             vec![],
         );
-        let plan = LogicalOperator::Aggregate(aggregate);
+        let plan = LogicalOperator::Aggregate(Box::new(aggregate));
 
-        let count_ref = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(aggregate_index, 0),
-            LogicalType::BigInt,
-        ));
-        let one = Expression::Constant(ConstantExpression {
-            value: Value::BigInt(1),
-            return_type: LogicalType::BigInt,
-        });
+        let count_ref = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(aggregate_index, 0), LogicalType::BigInt)
+                .into(),
+        );
+        let one = Expression::Constant(
+            ConstantExpression {
+                value: Value::BigInt(1),
+                return_type: LogicalType::BigInt,
+            }
+            .into(),
+        );
 
         let comparison_type = match subquery_type {
             SubqueryType::Exists => ComparisonType::Equal,
@@ -187,8 +196,9 @@ impl Binder {
             _ => unreachable!(),
         };
 
-        let comparison =
-            Expression::Comparison(ComparisonExpression::new(comparison_type, count_ref, one));
+        let comparison = Expression::Comparison(
+            ComparisonExpression::new(comparison_type, count_ref, one).into(),
+        );
 
         let projection_index = self.bind_context.generate_table_index();
         let projection = Projection::new(projection_index, self.wrap_plan(plan), vec![comparison]);
@@ -200,10 +210,13 @@ impl Binder {
             self.wrap_plan(plan),
         )));
 
-        Ok(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(projection_index, 0),
-            LogicalType::Boolean,
-        )))
+        Ok(Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(projection_index, 0),
+                LogicalType::Boolean,
+            )
+            .into(),
+        ))
     }
 
     fn plan_uncorrelated_scalar(
@@ -246,27 +259,30 @@ impl Binder {
             Vec::new(),
             Vec::new(),
             vec![
-                Expression::Aggregate(first_agg),
-                Expression::Aggregate(count_agg),
+                Expression::Aggregate(first_agg.into()),
+                Expression::Aggregate(count_agg.into()),
             ],
             vec![],
         );
-        let plan = LogicalOperator::Aggregate(aggregate);
+        let plan = LogicalOperator::Aggregate(Box::new(aggregate));
 
         let projection_index = self.bind_context.generate_table_index();
-        let first_ref = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(aggregate_index, 0),
-            return_type.clone(),
-        ));
-        let count_ref = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(aggregate_index, 1),
-            LogicalType::BigInt,
-        ));
-        let checked_value = Expression::Operator(OperatorExpression::new(
-            OperatorType::ErrorIfMultipleRows,
-            vec![first_ref, count_ref],
-            return_type.clone(),
-        ));
+        let first_ref = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(aggregate_index, 0), return_type.clone())
+                .into(),
+        );
+        let count_ref = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(aggregate_index, 1), LogicalType::BigInt)
+                .into(),
+        );
+        let checked_value = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::ErrorIfMultipleRows,
+                vec![first_ref, count_ref],
+                return_type.clone(),
+            )
+            .into(),
+        );
         let projection =
             Projection::new(projection_index, self.wrap_plan(plan), vec![checked_value]);
         let plan = LogicalOperator::Projection(projection);
@@ -277,10 +293,10 @@ impl Binder {
             self.wrap_plan(plan),
         )));
 
-        Ok(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(projection_index, 0),
-            return_type.clone(),
-        )))
+        Ok(Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(projection_index, 0), return_type.clone())
+                .into(),
+        ))
     }
 
     fn plan_uncorrelated_any(
@@ -288,6 +304,8 @@ impl Binder {
         subquery_plan: LogicalOperator,
         root: &mut LogicalOperator,
         children: &[Expression],
+        child_types: &[LogicalType],
+        child_targets: &[LogicalType],
         comparison_type: ComparisonType,
     ) -> Result<Expression> {
         if children.is_empty() {
@@ -304,13 +322,29 @@ impl Binder {
                 subquery_types.len()
             )));
         }
+        if child_types.len() != children.len() || child_targets.len() != children.len() {
+            return Err(paro_error::internal(
+                "Binder must preserve aligned source and target types for ANY/IN operands",
+            ));
+        }
 
         let mark_index = self.bind_context.generate_table_index();
 
         let mut conditions = Vec::new();
         for (i, child) in children.iter().enumerate() {
+            if subquery_types[i] != child_types[i] {
+                return Err(paro_error::internal(format!(
+                    "ANY/IN subquery output type drift at column {i}: bound={}, planned={}",
+                    child_types[i], subquery_types[i],
+                )));
+            }
             let right =
-                Self::subquery_output_column_ref(&subquery_plan, i, subquery_types[i].clone())?;
+                Self::subquery_output_column_ref(&subquery_plan, i, child_types[i].clone())?;
+            let right = CastExpression::add_cast_if_needed(
+                right,
+                child_targets[i].clone(),
+                self.cast_functions.as_ref(),
+            )?;
 
             let join_comparison = match comparison_type {
                 ComparisonType::Equal => JoinComparisonType::Equal,
@@ -337,10 +371,10 @@ impl Binder {
 
         *root = LogicalOperator::Join(Join::Comparison(mark_join));
 
-        Ok(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(mark_index, 0),
-            LogicalType::Boolean,
-        )))
+        Ok(Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(mark_index, 0), LogicalType::Boolean)
+                .into(),
+        ))
     }
 
     fn plan_uncorrelated_all(
@@ -348,6 +382,8 @@ impl Binder {
         subquery_plan: LogicalOperator,
         root: &mut LogicalOperator,
         children: &[Expression],
+        child_types: &[LogicalType],
+        child_targets: &[LogicalType],
         comparison_type: ComparisonType,
     ) -> Result<Expression> {
         let inverted_comparison = match comparison_type {
@@ -361,19 +397,26 @@ impl Binder {
             ComparisonType::NotDistinctFrom => ComparisonType::DistinctFrom,
         };
 
-        let any_result =
-            self.plan_uncorrelated_any(subquery_plan, root, children, inverted_comparison)?;
+        let any_result = self.plan_uncorrelated_any(
+            subquery_plan,
+            root,
+            children,
+            child_types,
+            child_targets,
+            inverted_comparison,
+        )?;
 
-        let false_const = Expression::Constant(ConstantExpression {
-            value: Value::Boolean(false),
-            return_type: LogicalType::Boolean,
-        });
+        let false_const = Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(false),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
 
-        Ok(Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            any_result,
-            false_const,
-        )))
+        Ok(Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, any_result, false_const).into(),
+        ))
     }
 
     pub fn contains_subquery(expr: &Expression) -> bool {
@@ -395,7 +438,7 @@ impl Binder {
 mod tests {
     use super::*;
     use crate::binder::test_utils::test_session as binder_test_session;
-    use crate::planner::Planner;
+    use crate::binder::Planner;
     use paro_context::StatementContext;
     use std::process::Output;
 
@@ -416,7 +459,10 @@ mod tests {
         let mut planner = Planner::new(session);
         let statement = paro_parser::parse_one(sql).expect("parse").stmt;
         planner.create_plan(statement).expect("planner create_plan");
-        planner.take_plan().expect("planned logical plan").operator
+        planner
+            .take_plan()
+            .expect("planned logical plan")
+            .into_operator()
     }
 
     fn binder_planned_logical_operator(sql: &str) -> LogicalOperator {
@@ -429,7 +475,7 @@ mod tests {
         binder
             .create_plan(bound)
             .expect("binder create_plan without final flatten")
-            .operator
+            .into_operator()
     }
 
     fn flattened_logical_operator(sql: &str) -> LogicalOperator {
@@ -445,7 +491,7 @@ mod tests {
         binder
             .flatten_dependent_joins(plan)
             .expect("flatten dependent joins")
-            .operator
+            .into_operator()
     }
 
     fn nested_case_sql(case: &str) -> &'static str {
@@ -728,7 +774,35 @@ mod tests {
     fn uncorrelated_any_with_correlated_scalar_plans_all_correlation_layers() {
         let plan =
             planned_logical_operator(nested_case_sql("uncorrelated_any_with_correlated_scalar"));
-        crate::verify::verify_physical_planner_invariants(&plan)
+        crate::logical::verify::verify_physical_planner_invariants(&plan)
             .expect("all nested correlation must be flattened before physical planning");
+    }
+
+    #[test]
+    fn uncorrelated_any_casts_both_join_operands_to_the_bound_domain() {
+        let plan = binder_planned_logical_operator(
+            "SELECT CAST(1 AS BIGINT) IN (\
+                 SELECT CAST(x AS INTEGER) FROM (VALUES (1)) AS t(x)\
+             )",
+        );
+        crate::logical::verify::verify_physical_planner_invariants(&plan)
+            .expect("ANY lowering must retain the binder's common comparison type");
+
+        let mut pending = vec![&plan];
+        let condition = loop {
+            let operator = pending
+                .pop()
+                .expect("uncorrelated ANY must emit a mark join");
+            if let LogicalOperator::Join(Join::Comparison(join)) = operator {
+                if join.join_type == JoinType::Mark {
+                    break join.conditions.first().expect("ANY comparison condition");
+                }
+            }
+            pending.extend(operator.children().into_iter().map(|child| &child.operator));
+        };
+
+        assert_eq!(condition.left.return_type(), LogicalType::BigInt);
+        assert_eq!(condition.right.return_type(), LogicalType::BigInt);
+        assert!(matches!(&condition.right, Expression::Cast(_)));
     }
 }

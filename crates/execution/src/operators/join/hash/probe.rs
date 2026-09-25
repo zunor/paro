@@ -5,7 +5,9 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
-use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{
+    AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics,
+};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::join::hash::hashing::compute_hashes_for_keys_into;
@@ -19,7 +21,7 @@ use crate::operators::join::hash::source_predicate::ReductionSourcePredicateStat
 use crate::operators::join::hash::spill::build_probe_spill_chunk_into;
 use crate::operators::join::state::ReductionProbeMode;
 use crate::operators::output::ensure_transform_output;
-use crate::physical::specs::HashReductionCascadeSpec;
+use crate::physical::specs::{HashReductionCascadeSpec, OutputPermutation};
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle, JoinProbeSpillBuffer};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::state::{
@@ -32,12 +34,15 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct HashJoinProbeTransformExec {
     pub handle: HandleRef<JoinBuildHandle>,
+    pub covering_runtime_filter_key: Option<usize>,
     pub join_type: JoinType,
     pub anti_join_mode: AntiJoinMode,
+    pub mark_semantics: MarkJoinSemantics,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,
     pub left_projection: Box<[usize]>,
+    pub output_permutation: OutputPermutation,
     pub output_types: Box<[LogicalType]>,
     pub reduction_cascade: Option<HashReductionCascadeSpec>,
 }
@@ -240,7 +245,8 @@ impl HashJoinProbeTransformExec {
                 self.join_type,
                 input,
                 &self.left_projection,
-                &self.output_types,
+                &self.output_permutation,
+                hash_table.build_output_types(),
                 output,
             )?;
             return if emitted > 0 {
@@ -248,6 +254,23 @@ impl HashJoinProbeTransformExec {
             } else {
                 Ok(TransformPoll::NeedMoreInput)
             };
+        }
+
+        if self
+            .covering_runtime_filter_key
+            .is_some_and(|key_index| global.handle.runtime_filter_key_is_exact(key_index))
+        {
+            if input.is_empty() {
+                output.try_set_cardinality(0)?;
+                return Ok(TransformPoll::NeedMoreInput);
+            }
+            emit_runtime_filter_covered_probe(
+                input,
+                &self.left_projection,
+                &self.output_permutation,
+                output,
+            )?;
+            return Ok(TransformPoll::Output);
         }
 
         if let Some(cascade) = &self.reduction_cascade {
@@ -494,12 +517,14 @@ impl HashJoinProbeTransformExec {
                 let count = scan_hash_join_results(
                     self.join_type,
                     self.anti_join_mode,
+                    self.mark_semantics,
                     probe_keys,
                     input,
                     output,
                     &hash_table,
                     scan_structure,
                     &self.left_projection,
+                    &self.output_permutation,
                     local.residual.as_mut(),
                     ctx.query,
                 )?;
@@ -550,5 +575,106 @@ impl HashJoinProbeTransformExec {
         _global: &TransformGlobal,
     ) -> Result<TransformFinishPoll> {
         Ok(TransformFinishPoll::Done)
+    }
+}
+
+fn emit_runtime_filter_covered_probe(
+    input: &Chunk,
+    left_projection: &[usize],
+    output_permutation: &OutputPermutation,
+    output: &mut Chunk,
+) -> Result<()> {
+    if output.column_count() != left_projection.len() {
+        return Err(paro_error::internal(format!(
+            "runtime-filter-covered join output has {} columns for {} probe projections",
+            output.column_count(),
+            left_projection.len()
+        )));
+    }
+    if !output_permutation.is_identity() {
+        return Err(paro_error::internal(
+            "runtime-filter-covered probe requires an identity join output permutation",
+        ));
+    }
+    for (natural_idx, &input_idx) in left_projection.iter().enumerate() {
+        let column = input.column(input_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "runtime-filter-covered join projection index {input_idx} exceeds {} columns",
+                input.column_count()
+            ))
+        })?;
+        if output.data[natural_idx].logical_type() != column.logical_type() {
+            return Err(paro_error::internal(
+                "runtime-filter-covered join projection type mismatch",
+            ));
+        }
+        output.data[natural_idx] = Arc::clone(column);
+    }
+    output.try_set_cardinality(input.size())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_common::runtime_value::Value;
+
+    #[test]
+    fn covered_probe_reorders_columns_without_copying_vectors() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let mut input = Chunk::try_initialize(
+            &[LogicalType::Integer, LogicalType::BigInt],
+            2,
+            allocator.clone(),
+        )
+        .unwrap();
+        input.try_set_cardinality(2).unwrap();
+        input.set_value(0, 0, &Value::Integer(10)).unwrap();
+        input.set_value(0, 1, &Value::Integer(20)).unwrap();
+        input.set_value(1, 0, &Value::BigInt(100)).unwrap();
+        input.set_value(1, 1, &Value::BigInt(200)).unwrap();
+
+        let mut output =
+            Chunk::try_initialize(&[LogicalType::BigInt, LogicalType::Integer], 2, allocator)
+                .unwrap();
+        emit_runtime_filter_covered_probe(
+            &input,
+            &[1, 0],
+            &OutputPermutation::identity(2),
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(output.size(), 2);
+        assert!(Arc::ptr_eq(
+            output.column(0).unwrap(),
+            input.column(1).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            output.column(1).unwrap(),
+            input.column(0).unwrap()
+        ));
+    }
+
+    #[test]
+    fn covered_probe_rejects_a_non_identity_join_layout() {
+        let mut output = Chunk::try_initialize(
+            &[LogicalType::Integer, LogicalType::Integer],
+            1,
+            paro_common::test_utils::test_allocator(),
+        )
+        .unwrap();
+        let error = emit_runtime_filter_covered_probe(
+            &Chunk::try_initialize(
+                &[LogicalType::Integer, LogicalType::Integer],
+                1,
+                paro_common::test_utils::test_allocator(),
+            )
+            .unwrap(),
+            &[0, 1],
+            &OutputPermutation::from_forward([1, 0]).unwrap(),
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires an identity"));
     }
 }

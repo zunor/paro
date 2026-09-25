@@ -95,6 +95,14 @@ vectors while integrity failure telemetry identifies the required rebuild.
 Paro does not infer missing fields, translate the previous graph format, or
 silently rebuild an index during a foreground query.
 
+Vector Top-K queries now require exact results by default, independently of
+whether an HNSW index exists. Applications that explicitly accept the
+cost-based exact/approximate choice can opt in for a session with
+`SET vector_search_objective = 'cost_optimized'`; a query-level search hint,
+when present, remains the more specific semantic contract. This setting is an
+accuracy policy rather than an implementation toggle: `exact` prevents an
+approximate provider from satisfying the root physical-property goal.
+
 Search manifest v4 is shared by every search provider. FullText and Sparse
 search definitions must also be recreated after upgrading;
 their provider artifacts may be unchanged internally, but their old manifest

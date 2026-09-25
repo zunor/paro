@@ -10,17 +10,19 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_function::window::WindowFunctionType;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::{JoinComparisonType, JoinType};
+use paro_planner::logical::operator::join::{JoinComparisonType, JoinType};
 
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::plan::PhysicalPlan;
-use crate::physical::properties::{NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec};
+use crate::physical::properties::{
+    NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec, PipelineOperatorLineage,
+};
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ClassicIeJoinSpec, CrossProductSpec, DelimJoinSideSpec, DelimJoinSpec,
-    DelimScanTarget, ExternalTableSpec, HashJoinSpec, MaterializedCteSpec, NestedLoopJoinSpec,
-    PartitionAggregateWindowSpec, PhysicalNodeKind, RecursiveCteSpec, SetOperationInputSide,
-    SetOperationSpec, SortRangeJoinSpec, SortSpec, TopNSpec, WindowSpec,
+    DelimScanTarget, EmptyResultSpec, ExternalTableSpec, HashJoinSpec, MaterializedCteSpec,
+    NestedLoopJoinSpec, PartitionAggregateWindowSpec, PhysicalNodeKind, RecursiveCteSpec,
+    SetOperationInputSide, SetOperationSpec, SortRangeJoinSpec, SortSpec, TopNSpec, WindowSpec,
 };
 
 use super::graph::{
@@ -36,10 +38,10 @@ use super::graph::{
     PipelineGraph, PipelineId, PipelineRoot, PipelineSpec, PipelineSubgraphRoot, RecursiveCteDedup,
     RecursiveCteRegion, RecursiveTableAppendSinkSpec, RecursiveTableScanSourceSpec,
     RecursiveTermination, RowsetDynamicRuntimeFilterSpec, RowsetDynamicScalarFilterSpec,
-    RowsetSourceSpec, ScalarFilterSemantics, SetOperationEmitSourceSpec, SetOperationInputSinkSpec,
-    SharedSinkId, SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec,
-    SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec, TransformSpec,
-    UngroupedAggregateEmitSourceSpec, UngroupedAggregateSinkSpec, UpdateSinkSpec,
+    RowsetSourceSpec, RuntimeFilterApplication, ScalarFilterSemantics, SetOperationEmitSourceSpec,
+    SetOperationInputSinkSpec, SharedSinkId, SinkSharing, SinkSpec, SortBuildSinkSpec,
+    SortEmitSourceSpec, SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec,
+    TransformSpec, UngroupedAggregateEmitSourceSpec, UngroupedAggregateSinkSpec, UpdateSinkSpec,
     WindowBuildSinkSpec, WindowEmitSourceSpec,
 };
 use super::handles::{BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind};
@@ -50,6 +52,8 @@ pub struct PipelineLowerer<'a> {
     handles: BreakerHandleCatalogBuilder,
     next_shared_sink: usize,
     post_join_fanout_cache: Vec<Option<bool>>,
+    runtime_filter_handles: HashMap<crate::physical::Fingerprint, BreakerHandleId>,
+    runtime_filter_owners: HashMap<crate::physical::Fingerprint, PhysicalPlanNodeId>,
     cte_handles: HashMap<usize, BreakerHandleId>,
     cte_producers: HashMap<BreakerHandleId, PipelineId>,
     recursive_cte_handles: HashMap<usize, BreakerHandleId>,
@@ -71,14 +75,46 @@ pub(crate) struct PendingProbeDependency {
     pub(crate) kind: DependencyKind,
 }
 
+/// An alternate source for a hash join embedded in a fused probe chain.
+///
+/// A spillable join can switch to external execution after the pipeline graph
+/// has been lowered. Its initial probe transform then only partitions input;
+/// the rows resume at `transform_offset` when the replay source runs. Keeping
+/// these continuations explicit makes every runtime branch part of the graph
+/// without giving up left-deep probe fusion in the common in-memory case.
+pub(crate) struct PendingHashJoinReplay {
+    pub(crate) source: HashJoinSpillReplaySourceSpec,
+    pub(crate) handle: super::handles::BreakerHandleId,
+    pub(crate) transform_offset: usize,
+}
+
+pub(crate) struct CollectedProbeChain {
+    pub(crate) source: SourceSpec,
+    pub(crate) transforms: Vec<TransformSpec>,
+    pub(crate) pending_builds: Vec<PendingProbeDependency>,
+    pub(crate) pending_replays: Vec<PendingHashJoinReplay>,
+}
+
 pub(crate) struct BreakerProbeSource {
     pub(crate) source: SourceSpec,
     pub(crate) dependencies: Vec<PendingProbeDependency>,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PipelineChain {
     pub(crate) entry: PipelineId,
     pub(crate) tail: PipelineId,
+}
+
+/// One leaf of an already-selected physical `UNION ALL` probe subtree.
+///
+/// Pipeline lowering may schedule these sources independently against one
+/// shared hash-build handle. This is execution decomposition only: it neither
+/// creates another logical join nor changes the Memo winner.
+#[derive(Debug, Clone)]
+struct UnionAllProbeSource {
+    root: PhysicalPlanNodeId,
+    transforms: Vec<TransformSpec>,
 }
 
 impl<'a> PipelineLowerer<'a> {
@@ -88,6 +124,8 @@ impl<'a> PipelineLowerer<'a> {
             handles: BreakerHandleCatalogBuilder::default(),
             next_shared_sink: 0,
             post_join_fanout_cache: vec![None; plan.nodes.len()],
+            runtime_filter_handles: HashMap::new(),
+            runtime_filter_owners: HashMap::new(),
             cte_handles: HashMap::new(),
             cte_producers: HashMap::new(),
             recursive_cte_handles: HashMap::new(),
@@ -162,6 +200,7 @@ mod breaker_lowering;
 mod classic_ie_join;
 mod cte;
 mod dispatch;
+mod enforcer;
 mod external;
 mod helpers;
 mod join_breakers;

@@ -1607,6 +1607,8 @@ pub enum BinaryOperator {
     Xor,
     Like(Option<String>),
     NotLike(Option<String>),
+    ILike,
+    NotILike,
     LikeAny(Option<String>),
     Regexp,
     RLike,
@@ -1650,7 +1652,7 @@ impl BinaryOperator {
             BinaryOperator::Multiply => "*".to_string(),
             BinaryOperator::Divide => "/".to_string(),
             BinaryOperator::Modulo => "%".to_string(),
-            BinaryOperator::StringConcat => "concat".to_string(),
+            BinaryOperator::StringConcat => "string_concat".to_string(),
             BinaryOperator::BitwiseOr => "bit_or".to_string(),
             BinaryOperator::BitwiseAnd => "bit_and".to_string(),
             BinaryOperator::BitwiseXor => "bit_xor".to_string(),
@@ -1663,6 +1665,7 @@ impl BinaryOperator {
             BinaryOperator::NegInnerProduct => "neg_inner_product".to_string(),
             BinaryOperator::LikeAny(_) => "like_any".to_string(),
             BinaryOperator::Like(_) => "like".to_string(),
+            BinaryOperator::ILike => "ilike".to_string(),
             BinaryOperator::RegexpMatch => "regexp".to_string(),
             BinaryOperator::RegexpNotMatch => "not_regexp".to_string(),
             BinaryOperator::RegexpMatchInsensitive => "regexp_insensitive".to_string(),
@@ -1740,6 +1743,12 @@ impl Display for BinaryOperator {
             }
             BinaryOperator::NotLike(_) => {
                 write!(f, "NOT LIKE")
+            }
+            BinaryOperator::ILike => {
+                write!(f, "ILIKE")
+            }
+            BinaryOperator::NotILike => {
+                write!(f, "NOT ILIKE")
             }
             BinaryOperator::Regexp => {
                 write!(f, "REGEXP")

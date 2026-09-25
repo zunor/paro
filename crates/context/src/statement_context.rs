@@ -3,9 +3,10 @@
 
 use crate::{
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot, DdlApplyContext, EffectiveSettings,
-    QueryResources, RuntimeLimits, SessionMetadataProvider, SessionRandom, StatementAuthContext,
-    StatementCancellation, StatementEnvironment, StatementInput, StatementOptions,
-    StatementTimeContext, StatementView, TransactionView, TxnAdmissionState, WriteGuard,
+    QueryResources, RuntimeLimits, SessionDiagnostics, SessionMetadataProvider, SessionRandom,
+    StatementAuthContext, StatementCancellation, StatementEnvironment, StatementInput,
+    StatementOptions, StatementTimeContext, StatementTrace, StatementView, TransactionView,
+    TxnAdmissionState, WriteGuard,
 };
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::mvcc::CatalogSnapshot;
@@ -25,7 +26,52 @@ pub struct CompileEnvironmentKey {
     pub search_path: Vec<CatalogSearchEntry>,
     pub visible_generation: u64,
     pub catalog_epochs: Vec<(u64, u64)>,
-    pub settings_fingerprint: u64,
+    pub planning_settings_fingerprint: u64,
+    /// Conservative identity: byte-level changes may miss the cache even if
+    /// the selected class is unchanged. This is not a resource reservation.
+    pub compile_resources: crate::CompileResources,
+    pub expected_grant: Option<crate::CompileGrant>,
+    pub grant_limits: (usize, usize),
+}
+
+/// The binding namespace captured together by both live and frozen sessions.
+pub struct CompileNamespace<'a> {
+    pub database: &'a str,
+    pub schema: &'a str,
+    pub search_path: &'a [CatalogSearchEntry],
+}
+
+impl CompileEnvironmentKey {
+    /// Capture every input that can change binding or physical planning.
+    ///
+    /// Live sessions and frozen statement snapshots deliberately share this
+    /// constructor. Adding a plan-affecting input therefore changes one
+    /// contract and forces every capture site to supply it at compile time;
+    /// cache-key construction must never drift silently between the two.
+    pub fn capture(
+        namespace: CompileNamespace<'_>,
+        visible_generation: u64,
+        catalog_epochs: impl IntoIterator<Item = (u64, u64)>,
+        settings: &EffectiveSettings,
+        limits: &RuntimeLimits,
+        compile_resources: crate::CompileResources,
+    ) -> Self {
+        let mut catalog_epochs = catalog_epochs.into_iter().collect::<Vec<_>>();
+        catalog_epochs.sort_unstable_by_key(|(database_id, _)| *database_id);
+        Self {
+            current_database: namespace.database.to_string(),
+            current_schema: namespace.schema.to_string(),
+            search_path: namespace.search_path.to_vec(),
+            visible_generation,
+            catalog_epochs,
+            planning_settings_fingerprint: settings.planning_fingerprint(),
+            // The staged planner produces one operating point. Runtime
+            // admission must honor this exact operating point.
+            expected_grant: compile_resources.expected_grant(limits.max_memory, limits.max_threads),
+            compile_resources,
+            grant_limits: (limits.max_memory, limits.max_threads),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -41,10 +87,17 @@ pub struct StatementContext {
     pub random: Arc<SessionRandom>,
     pub databases: Arc<AttachedDatabaseDirectory>,
     pub limits: RuntimeLimits,
+    pub compile_resources: crate::CompileResources,
     pub cancellation: StatementCancellation,
     pub services: Arc<QueryResources>,
+    /// Pins acquired by this statement, including its compilation phase.
+    pub graph_snapshots: crate::StatementGraphSnapshots,
     pub graph_registry: Arc<dyn crate::GraphRegistry>,
     pub session_metadata: Arc<dyn SessionMetadataProvider>,
+    /// Mutable diagnostics owned by this client session, never by the process.
+    pub diagnostics: Arc<SessionDiagnostics>,
+    /// Optional phase recorder shared by compiler, admission and execution.
+    pub statement_trace: Option<Arc<StatementTrace>>,
 }
 
 impl std::fmt::Debug for StatementContext {
@@ -59,6 +112,18 @@ impl std::fmt::Debug for StatementContext {
 }
 
 impl StatementContext {
+    pub fn graph_snapshot(
+        &self,
+        id: &GraphId,
+    ) -> Option<paro_storage::index::graph::GraphReadSnapshot> {
+        self.graph_snapshots
+            .read(self.services.graph_index.as_ref(), id)
+    }
+
+    pub fn statement_trace(&self) -> Option<Arc<StatementTrace>> {
+        self.statement_trace.clone()
+    }
+
     pub fn current_database(&self) -> &str {
         &self.env.current_database
     }
@@ -119,6 +184,14 @@ impl StatementContext {
             .map(|provider| provider.status())
     }
 
+    pub fn python_execution_slot_limit(&self) -> u16 {
+        self.services
+            .python_runtime
+            .as_ref()
+            .map(|provider| provider.execution_slot_limit())
+            .unwrap_or(0)
+    }
+
     pub fn ensure_python_runtime_ready_for_ddl(&self) -> paro_common::error::Result<()> {
         if let Some(provider) = &self.services.python_runtime {
             provider.ensure_ready_for_ddl()
@@ -133,6 +206,17 @@ impl StatementContext {
         } else {
             Ok(())
         }
+    }
+
+    pub fn try_acquire_python_worker_slots(
+        &self,
+        query_id: u64,
+        slots: u16,
+    ) -> paro_common::error::Result<Option<paro_external::runtime::host::ExternalWorkerLease>> {
+        let Some(provider) = &self.services.python_runtime else {
+            return Ok(None);
+        };
+        provider.try_acquire_execution_slots(query_id, slots)
     }
 
     pub fn observe_python_runtime_failure(&self, message: &str) {
@@ -261,18 +345,20 @@ impl StatementContext {
     }
 
     pub fn compile_environment_key(&self) -> CompileEnvironmentKey {
-        CompileEnvironmentKey {
-            current_database: self.env.current_database.clone(),
-            current_schema: self.env.current_schema.clone(),
-            search_path: self.env.search_path.clone(),
-            visible_generation: self.databases.visible_generation,
-            catalog_epochs: self
-                .databases
+        CompileEnvironmentKey::capture(
+            CompileNamespace {
+                database: &self.env.current_database,
+                schema: &self.env.current_schema,
+                search_path: &self.env.search_path,
+            },
+            self.databases.visible_generation,
+            self.databases
                 .iter()
-                .map(|database| (database.id(), database.catalog_epoch()))
-                .collect(),
-            settings_fingerprint: self.settings.fingerprint(),
-        }
+                .map(|database| (database.id(), database.catalog_epoch())),
+            self.settings.as_ref(),
+            &self.limits,
+            self.compile_resources,
+        )
     }
 
     pub fn graph_id(
@@ -289,7 +375,26 @@ impl StatementContext {
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use crate::TestStatementContextBuilder;
+    use crate::{CompileEnvironmentKey, TestStatementContextBuilder};
+
+    #[test]
+    fn compile_environment_canonicalizes_catalog_identity_order() {
+        let context = TestStatementContextBuilder::minimal().build();
+        let key = CompileEnvironmentKey::capture(
+            super::CompileNamespace {
+                database: "paro",
+                schema: "public",
+                search_path: &[],
+            },
+            17,
+            [(9, 90), (2, 20), (5, 50)],
+            context.settings.as_ref(),
+            &context.limits,
+            context.compile_resources,
+        );
+
+        assert_eq!(key.catalog_epochs, [(2, 20), (5, 50), (9, 90)]);
+    }
 
     #[test]
     fn compile_environment_keeps_the_frozen_catalog_epoch() {

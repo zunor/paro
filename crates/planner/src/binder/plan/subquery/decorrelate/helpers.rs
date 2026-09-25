@@ -4,9 +4,9 @@
 //! Shared helpers for dependent-join decorrelation (pushdown + lateral flatten).
 
 use crate::binder::Binder;
-use crate::expression::{ConstantExpression, Expression};
-use crate::operator::{Filter, JoinType, LogicalOperator};
-use crate::plan::LogicalPlan;
+use crate::expression::Expression;
+use crate::logical::operator::{Filter, JoinType, LogicalOperator};
+use crate::logical::plan::OwnedLogicalPlan;
 use paro_common::runtime_value::Value;
 
 pub(super) fn can_push_to_left_child(join_type: JoinType) -> bool {
@@ -23,7 +23,11 @@ pub(super) fn can_push_to_right_child(join_type: JoinType) -> bool {
     )
 }
 
-pub(super) fn push_filter_to_child(binder: &Binder, child: &mut LogicalPlan, expr: Expression) {
+pub(super) fn push_filter_to_child(
+    binder: &Binder,
+    child: &mut OwnedLogicalPlan,
+    expr: Expression,
+) {
     match &mut child.operator {
         LogicalOperator::Filter(filter) => filter.expressions.push(expr),
         _ => {
@@ -37,9 +41,6 @@ pub(super) fn push_filter_to_child(binder: &Binder, child: &mut LogicalPlan, exp
 pub(super) fn should_eliminate_join_condition(expr: &Expression) -> bool {
     matches!(
         expr,
-        Expression::Constant(ConstantExpression {
-            value: Value::Boolean(true),
-            ..
-        })
+        Expression::Constant(constant) if constant.value == Value::Boolean(true)
     )
 }

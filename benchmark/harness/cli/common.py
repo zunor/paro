@@ -27,6 +27,7 @@ from ..performance_gate import (
 )
 from ..performance_gate.policy import GatePolicy
 from ..process_probe import ProcessProbeError, resolve_parod_process
+from ..run_output import RunOutput, RunOutputError
 from ..sources import SourceContext, SourceMeasurement, default_registry
 
 
@@ -155,6 +156,21 @@ def requires_fresh_runtime(policy: GatePolicy) -> bool:
     return any(source.measurement_class == "sql_macro" for source in policy.sources)
 
 
+def ensure_run_output(
+    run_output: RunOutput | None,
+    *,
+    root_dir: Path,
+    args: argparse.Namespace,
+) -> RunOutput:
+    """Give direct subcommand callers the same owner as the CLI dispatcher."""
+    if run_output is not None:
+        return run_output
+    return RunOutput.create(
+        resolve_report_root(root_dir, args),
+        run_id=getattr(args, "run_id", None),
+    )
+
+
 def minimum_sample_count(policy: GatePolicy, source_name: str) -> int:
     source = next((item for item in policy.sources if item.name == source_name), None)
     if source is None:
@@ -172,11 +188,17 @@ def run_sources(
     runner_module: object,
     pid: int,
     retry_query_keys_by_source=None,
+    run_output: RunOutput | None = None,
 ) -> list[SourceMeasurement]:
+    active_run = run_output or RunOutput.create(
+        resolve_report_root(root_dir, args),
+        run_id=getattr(args, "run_id", None),
+    )
     include_sources = frozenset(args.include_source)
     skip_sources = frozenset(args.skip_source)
     registry = default_registry()
     measurements = []
+    failures: list[str] = []
     for source in policy.sources:
         if include_sources and source.name not in include_sources:
             continue
@@ -188,20 +210,90 @@ def run_sources(
             retry_keys = retry_query_keys_by_source.get(source.name, frozenset())
             if not retry_keys:
                 continue
+        try:
+            configured_arm = getattr(args, "arm_id", None)
+            attempt = active_run.begin_attempt(
+                source.name,
+                query_case=source.name,
+                arm_id=configured_arm or source.name,
+            )
+        except RunOutputError as exc:
+            raise GateCommandError(str(exc)) from exc
         source_context = SourceContext(
             root_dir=root_dir,
             pid=pid,
             runner_module=runner_module,
             retry_query_keys=retry_keys,
             minimum_sample_count=minimum_sample_count(policy, source.name),
+            run_output=active_run,
+            attempt=attempt,
         )
         try:
-            measurements.append(adapter.execute(source, source_context))
-        except NotImplementedError as exc:
-            raise GateCommandError(str(exc)) from exc
-        except ValueError as exc:
-            raise GateCommandError(str(exc)) from exc
+            measurement = adapter.execute(source, source_context)
+        except KeyboardInterrupt as exc:
+            attempt.write_failure(status="Cancelled", error="source execution cancelled")
+            attempt.seal(status="Cancelled", failure_path=attempt.failure_path)
+            active_run.finalize(status="Cancelled")
+            raise
+        except Exception as exc:
+            failure = _record_source_failure(attempt, source, exc)
+            measurements.append(failure)
+            failures.append(f"{source.name}: {exc}")
+            continue
+        measurement = replace(
+            measurement,
+            run_id=active_run.run_id,
+            source_id=attempt.source_id,
+            attempt_id=attempt.attempt_id,
+            query_case=attempt.query_case,
+            arm_id=attempt.arm_id,
+            attempt_status="Failed" if measurement.failed else "Completed",
+        )
+        attempt.seal(
+            status="Failed" if measurement.failed else "Completed",
+            result_path=measurement.result_path,
+            summary_path=measurement.summary_path,
+        )
+        measurements.append(measurement)
+    if failures:
+        raise GateCommandError("source attempts failed; preserved under the run output: " + "; ".join(failures))
     return measurements
+
+
+def resolve_report_root(root_dir: Path, args: argparse.Namespace) -> Path:
+    value = getattr(args, "report_root", None)
+    if value is None:
+        return root_dir / "report"
+    path = Path(value)
+    return path if path.is_absolute() else (Path.cwd() / path).resolve()
+
+
+def _record_source_failure(attempt, source, error: Exception) -> SourceMeasurement:
+    summary = attempt.summary_path
+    summary_text = (
+        f"# Source attempt failed\n\n- source: `{source.name}`\n"
+        f"- status: `Failed`\n- error: `{type(error).__name__}: {error}`\n"
+    )
+    attempt.control_writer().write_text("summary.md", summary_text, overwrite=False)
+    failure = attempt.write_failure(status="Failed", error=f"{type(error).__name__}: {error}")
+    attempt.seal(status="Failed", summary_path=summary, failure_path=failure)
+    return SourceMeasurement(
+        source=source,
+        payload={
+            "schema_version": 1,
+            "status": "Failed",
+            "error": f"{type(error).__name__}: {error}",
+        },
+        result_path=failure,
+        summary_path=summary,
+        failed=True,
+        run_id=attempt.run.run_id,
+        source_id=attempt.source_id,
+        attempt_id=attempt.attempt_id,
+        query_case=attempt.query_case,
+        arm_id=attempt.arm_id,
+        attempt_status="Failed",
+    )
 
 
 def policy_for_source_family(policy: GatePolicy, source_count: int) -> GatePolicy:

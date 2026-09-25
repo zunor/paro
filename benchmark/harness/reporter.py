@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from .evidence_schema import EVIDENCE_SCHEMA_VERSION
+
 from datetime import datetime
 import json
 import math
@@ -18,10 +20,34 @@ from typing import TYPE_CHECKING, Any
 
 from .executor import QueryExecutionResult, WorkloadExecutionResult
 from .performance_gate import GateOutcome
+from .run_output import CellWriter, ControlWriter, RunOutput
+from .receipt_contract import (
+    EVIDENCE_SCHEMA_VERSION,
+    uncovered_receipt,
+    validate_benchmark_payload,
+    validate_summary_bytes,
+)
 from .runtime_contract import runtime_contract_payload
 
 if TYPE_CHECKING:
     from .archive.calibration import ArchiveHealth
+
+
+def _registered_sample_ids(
+    run_output: RunOutput,
+    *,
+    query_case: str | None,
+    arm_id: str | None,
+) -> list[str]:
+    if not query_case or not arm_id:
+        raise ValueError("owned benchmark payload requires query_case and arm_id")
+    cell_id = f"{query_case}--{arm_id}"
+    for cell in run_output._manifest.get("registration", {}).get("cells", []):
+        if cell.get("cell_id") == cell_id:
+            sample_ids = cell.get("sample_ids")
+            if isinstance(sample_ids, list) and sample_ids:
+                return list(sample_ids)
+    raise ValueError(f"benchmark payload has no registered cell: {cell_id}")
 
 
 class BenchmarkReporter:
@@ -38,9 +64,16 @@ class BenchmarkReporter:
         timeout_seconds: int,
         collect_memory: bool,
         collect_explain_profile: bool,
+        collect_compile_receipts: bool = False,
+        run_output: RunOutput | None = None,
+        source_id: str | None = None,
+        attempt_id: str | None = None,
+        query_case: str | None = None,
+        arm_id: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "version": 2,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "version": EVIDENCE_SCHEMA_VERSION,
             "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
             "git": self._collect_git_info(),
             "system": self._collect_system_info(),
@@ -51,15 +84,41 @@ class BenchmarkReporter:
                 "timeout_seconds": timeout_seconds,
                 "collect_memory": collect_memory,
                 "collect_explain_profile": collect_explain_profile,
+                "collect_compile_receipts": collect_compile_receipts,
             },
             "workloads": [],
         }
+        registered_sample_ids: list[str] | None = None
+        sample_cursor = 0
+        if run_output is not None:
+            registered_sample_ids = _registered_sample_ids(
+                run_output, query_case=query_case, arm_id=arm_id
+            )
+            payload["ownership"] = {
+                "schema_version": EVIDENCE_SCHEMA_VERSION,
+                "run_id": run_output.run_id,
+                "campaign_id": run_output.campaign_id,
+                "source_id": source_id,
+                "attempt_id": attempt_id,
+                "query_case": query_case,
+                "arm_id": arm_id,
+                "sample_ids": registered_sample_ids,
+                "artifact": "result.json",
+                "receipt_channel": "paro_optimizers_post_statement",
+                "receipt_statuses": ["Verified", "Uncovered"],
+            }
 
         for workload in workloads:
             workload_entry: dict[str, Any] = {
                 "name": workload.name,
                 "params": workload.params,
                 "build_time_ms": workload.build_time_ms,
+                "setup_status": workload.setup_status,
+                "setup_error": workload.setup_error,
+                "build_status": workload.build_status,
+                "build_error": workload.build_error,
+                "teardown_status": workload.teardown_status,
+                "teardown_error": workload.teardown_error,
                 "queries": [],
             }
             for query in workload.queries:
@@ -84,15 +143,83 @@ class BenchmarkReporter:
                     }
                 memory_tags = _build_memory_tags_payload(query)
                 spill_metrics = _build_spill_metrics_payload(query)
+                receipt_associations = list(query.receipt_associations)
+                if registered_sample_ids is not None:
+                    sample_count = len(query.samples_ms)
+                    if len(receipt_associations) > sample_count:
+                        raise ValueError(
+                            f"query {query.id} has more receipts than timed samples"
+                        )
+                    if not receipt_associations:
+                        receipt_associations = [
+                            uncovered_receipt(
+                                "normal sample has no post-statement receipt"
+                            )
+                            for _ in range(sample_count)
+                        ]
+                    elif len(receipt_associations) < sample_count:
+                        receipt_associations.extend(
+                            uncovered_receipt(
+                                "normal sample receipt was not observable"
+                            )
+                            for _ in range(
+                                sample_count - len(receipt_associations)
+                            )
+                        )
+                    planned_count = max(iterations, 1)
+                    if sample_count > planned_count:
+                        raise ValueError("query produced more samples than registered")
+                    if sample_count < planned_count:
+                        if not query.error and query.validation_result != "FAIL":
+                            raise ValueError("successful query did not collect every registered sample")
+                        receipt_associations.extend(
+                            uncovered_receipt("registered sample was not collected after query/setup failure")
+                            for _ in range(planned_count - sample_count)
+                        )
+                    end = sample_cursor + len(receipt_associations)
+                    if end > len(registered_sample_ids):
+                        raise ValueError(
+                            "registered sample_ids do not cover benchmark samples"
+                        )
+                    bound_receipts = []
+                    for sample_id, receipt in zip(
+                        registered_sample_ids[sample_cursor:end],
+                        receipt_associations,
+                        strict=True,
+                    ):
+                        if not isinstance(receipt, dict):
+                            raise ValueError(
+                                f"query {query.id} has a non-object receipt"
+                            )
+                        bound = dict(receipt)
+                        for key, value in (
+                            ("sample_id", sample_id),
+                            ("query_case", query_case),
+                            ("arm_id", arm_id),
+                        ):
+                            if key in bound and bound[key] != value:
+                                raise ValueError(
+                                    f"query {query.id} receipt disagrees with {key}"
+                                )
+                            bound[key] = value
+                        bound_receipts.append(bound)
+                    receipt_associations = bound_receipts
+                    sample_cursor = end
                 query_entry: dict[str, Any] = {
                     "id": query.id,
                     "validate_mode": query.validate_mode,
                     "samples_ms": query.samples_ms,
+                    "uncollected_samples": max(0, max(iterations, 1) - len(query.samples_ms)),
                     "stats": stats,
                     "memory": memory,
                     "rss": rss,
                     "memory_tags": memory_tags,
                     "spill_metrics": spill_metrics,
+                    "relative_median": {
+                        "baseline": query.relative_median_baseline,
+                        "ratio": query.relative_median_ratio,
+                        "limit": query.relative_median_limit,
+                    },
                     "validation": {
                         "result": query.validation_result,
                         "detail": query.validation_detail,
@@ -108,20 +235,127 @@ class BenchmarkReporter:
                         "raw_json": query.explain_profile_raw_json,
                         "operators": query.operator_profiles,
                     },
+                    "compile_receipts": receipt_associations,
                     "error": query.error,
                 }
                 workload_entry["queries"].append(query_entry)
             payload["workloads"].append(workload_entry)
+        if registered_sample_ids is not None and sample_cursor != len(registered_sample_ids):
+            raise ValueError(
+                "registered sample_ids do not match the number of timed samples"
+            )
         return payload
 
-    def write_reports(self, payload: dict[str, Any], output_path: Path) -> tuple[Path, Path]:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
+    @staticmethod
+    def attach_run_ownership(
+        payload: dict[str, Any],
+        run_output: RunOutput,
+        *,
+        source_id: str | None = None,
+        attempt_id: str | None = None,
+        query_case: str | None = None,
+        arm_id: str | None = None,
+    ) -> dict[str, Any]:
+        sample_ids = _registered_sample_ids(
+            run_output, query_case=query_case, arm_id=arm_id
         )
-        summary_path = output_path.with_name("summary.md")
-        summary_path.write_text(self._render_summary_markdown(payload), encoding="utf-8")
+        sample_cursor = 0
+        for workload in payload.get("workloads", []):
+            for query in workload.get("queries", []):
+                if not isinstance(query, dict):
+                    raise ValueError("benchmark workload query must be an object")
+                raw_receipts = query.get("compile_receipts")
+                if raw_receipts is None:
+                    raw_receipt = query.pop("compile_receipt", None)
+                    raw_receipts = [] if raw_receipt is None else [raw_receipt]
+                if not isinstance(raw_receipts, list):
+                    raise ValueError("query compile receipts must be a list")
+                sample_values = query.get("samples_ms")
+                sample_count = (
+                    len(sample_values)
+                    if isinstance(sample_values, list) and sample_values
+                    else int(query.get("samples_count", len(raw_receipts) or 1))
+                )
+                if sample_count < 1 or len(raw_receipts) > sample_count:
+                    raise ValueError("query receipt/sample cardinality is invalid")
+                if not raw_receipts:
+                    raw_receipts = [
+                        uncovered_receipt(
+                            "source produced no compile receipt for this sample"
+                        )
+                        for _ in range(sample_count)
+                    ]
+                elif len(raw_receipts) < sample_count:
+                    raw_receipts = [
+                        *raw_receipts,
+                        *(
+                            uncovered_receipt(
+                                "source compile receipt was not observable"
+                            )
+                            for _ in range(sample_count - len(raw_receipts))
+                        ),
+                    ]
+                end = sample_cursor + len(raw_receipts)
+                if end > len(sample_ids):
+                    raise ValueError("registered sample_ids do not cover payload samples")
+                bound_receipts = []
+                for sample_id, receipt in zip(
+                    sample_ids[sample_cursor:end], raw_receipts, strict=True
+                ):
+                    if not isinstance(receipt, dict):
+                        raise ValueError("query compile receipt must be an object")
+                    bound = dict(receipt)
+                    for key, value in (
+                        ("sample_id", sample_id),
+                        ("query_case", query_case),
+                        ("arm_id", arm_id),
+                    ):
+                        if key in bound and bound[key] != value:
+                            raise ValueError(f"receipt disagrees with {key}")
+                        bound[key] = value
+                    bound_receipts.append(bound)
+                query["compile_receipts"] = bound_receipts
+                sample_cursor = end
+        if sample_cursor != len(sample_ids):
+            raise ValueError("registered sample_ids do not match payload samples")
+        payload["version"] = EVIDENCE_SCHEMA_VERSION
+        payload["schema_version"] = EVIDENCE_SCHEMA_VERSION
+        payload["ownership"] = {
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "run_id": run_output.run_id,
+            "campaign_id": run_output.campaign_id,
+            "source_id": source_id,
+            "attempt_id": attempt_id,
+            "query_case": query_case,
+            "arm_id": arm_id,
+            "sample_ids": sample_ids,
+            "artifact": "result.json",
+            "receipt_channel": "not-configured",
+            "receipt_statuses": ["Uncovered"],
+        }
+        payload.setdefault("config", {})["collect_compile_receipts"] = False
+        return payload
+
+    def write_reports(
+        self,
+        payload: dict[str, Any],
+        writer: CellWriter,
+        *,
+        output_name: str = "result.json",
+    ) -> tuple[Path, Path]:
+        if payload.get("ownership") is not None:
+            validate_benchmark_payload(
+                payload,
+                # A normal timing sample remains valid when the bounded
+                # post-statement channel is unavailable.  The association is
+                # then explicitly Uncovered; only a certified consumer may
+                # ask validate_benchmark_payload(..., require_receipts=True).
+                require_receipts=False,
+            )
+        output_path = writer.write_json(output_name, payload, overwrite=False)
+        summary = self._render_summary_markdown(payload)
+        validate_summary_bytes(summary)
+        summary_path = writer.write_text("summary.md", summary, overwrite=False)
         return output_path, summary_path
 
     def print_terminal_summary(self, workloads: list[WorkloadExecutionResult], report_path: Path) -> None:
@@ -214,6 +448,8 @@ class BenchmarkReporter:
         self,
         summary_path: Path,
         outcome: GateOutcome,
+        *,
+        writer: CellWriter,
     ) -> None:
         if not outcome.entries and outcome.archive_health is None:
             return
@@ -245,8 +481,10 @@ class BenchmarkReporter:
                     status=status if entry.detail is None else f"{status}: {entry.detail}",
                 )
             )
-        with summary_path.open("a", encoding="utf-8") as fp:
-            fp.write("\n".join(lines) + "\n")
+        current = summary_path.read_text(encoding="utf-8")
+        updated = current + "\n".join(lines) + "\n"
+        validate_summary_bytes(updated)
+        writer.write_text("summary.md", updated, overwrite=True)
 
     def write_gate_report(
         self,
@@ -254,18 +492,17 @@ class BenchmarkReporter:
         gate: str,
         outcomes: list[GateOutcome],
         archive_health: Any | None = None,
+        writer: ControlWriter,
     ) -> Path:
-        path = self._root_dir / "report" / "gate.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "gate": gate,
             "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
             "outcomes": [_gate_outcome_payload(outcome) for outcome in outcomes],
         }
         if archive_health is not None:
             payload["archive"] = _archive_health_payload(archive_health)
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        path = writer.write_json("gate.json", payload, overwrite=False)
         return path
 
     def _print_archive_health(self, archive_health: "ArchiveHealth") -> None:

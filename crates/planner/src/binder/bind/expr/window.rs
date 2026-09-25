@@ -68,14 +68,17 @@ pub fn bind_window_expression(
         )?;
         let default_frame = WindowFrame::get_default_frame(&window_func);
         let frame = bind_window_frame(binder, spec.window_frame, default_frame)?;
-        return Ok(Expression::Window(WindowExpression::native(
-            window_func,
-            bound_args,
-            partitions,
-            orders,
-            frame,
-            ignore_nulls,
-        )));
+        return Ok(Expression::Window(
+            WindowExpression::native(
+                window_func,
+                bound_args,
+                partitions,
+                orders,
+                frame,
+                ignore_nulls,
+            )
+            .into(),
+        ));
     }
 
     if ignore_nulls {
@@ -101,9 +104,9 @@ pub fn bind_window_expression(
     )?;
     let frame = bind_window_frame(binder, spec.window_frame, WindowFrame::default())?;
 
-    Ok(Expression::Window(WindowExpression::aggregate(
-        aggregate, partitions, orders, frame,
-    )))
+    Ok(Expression::Window(
+        WindowExpression::aggregate(aggregate, partitions, orders, frame).into(),
+    ))
 }
 
 fn is_native_window_function(name: &str) -> bool {
@@ -372,8 +375,8 @@ fn bind_frame_offset(
 mod tests {
     use super::*;
     use crate::binder::test_utils::test_binder_with_search_path;
-    use crate::operator::LogicalOperator;
-    use crate::plan::LogicalPlan;
+    use crate::logical::operator::LogicalOperator;
+    use crate::logical::plan::OwnedLogicalPlan;
     use paro_catalog::collection::InstallMode;
     use paro_catalog::entry::{AggregateFunctionCatalogEntry, CatalogEntryEnum, CatalogType};
     use paro_catalog::search_path::CatalogSearchEntry;
@@ -384,7 +387,7 @@ mod tests {
     use paro_parser::ast::Literal;
     use std::sync::Arc;
 
-    fn bind_window_plan(sql: &str) -> Result<LogicalPlan> {
+    fn bind_window_plan(sql: &str) -> Result<OwnedLogicalPlan> {
         let mut binder =
             test_binder_with_search_path(vec![CatalogSearchEntry::schema_only("public")]);
         install_test_aggregate(&binder, get_min_function());

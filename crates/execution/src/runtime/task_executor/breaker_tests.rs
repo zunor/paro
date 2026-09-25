@@ -126,7 +126,7 @@ fn sort_breaker_graph(input_rows: Vec<Vec<Expression>>) -> PipelineGraph {
                     input_types: Box::new([LogicalType::Integer]),
                     output_names: Box::new(["v".to_string()]),
                     output_types: Box::new([LogicalType::Integer]),
-                    force_external: false,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -161,6 +161,7 @@ fn sort_breaker_graph(input_rows: Vec<Vec<Expression>>) -> PipelineGraph {
 fn topn_breaker_graph(input_rows: Vec<Vec<Expression>>, limit: usize) -> PipelineGraph {
     let spec = TopNSpec {
         orders: vec![order_by_ref(0, LogicalType::Integer)].into_boxed_slice(),
+        projection_map: Box::new([0]),
         limit,
         offset: 0,
         hnsw_options: Default::default(),
@@ -489,14 +490,16 @@ fn ungrouped_aggregate_having_can_suppress_its_single_row() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
     let mut spec = ungrouped_count_spec();
-    spec.having_filter = vec![Expression::Comparison(ComparisonExpression::new(
-        ComparisonType::GreaterThan,
-        reference(0, LogicalType::BigInt),
-        Expression::Constant(ConstantExpression::new(
-            Value::BigInt(3),
-            LogicalType::BigInt,
-        )),
-    ))]
+    spec.having_filter = vec![Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            reference(0, LogicalType::BigInt),
+            Expression::Constant(
+                ConstantExpression::new(Value::BigInt(3), LogicalType::BigInt).into(),
+            ),
+        )
+        .into(),
+    )]
     .into_boxed_slice();
     let graph = aggregate_breaker_graph(
         SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec {
@@ -586,7 +589,8 @@ fn hash_aggregate_breaker_spills_payload_partitions_when_forced_external() {
             parallel_scheduler: false,
         },
     );
-    let spec = grouped_count_spec(None);
+    let mut spec = grouped_count_spec(None);
+    spec.spill_policy = crate::physical::specs::SpillExecutionPolicy::ForcedExternal;
     let graph = aggregate_breaker_graph(
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
@@ -772,7 +776,15 @@ fn perfect_hash_aggregate_breaker_groups_and_emits_counts() {
     let spec = grouped_count_spec(Some(PerfectHashAggregatePlan {
         group_minima: vec![1].into_boxed_slice(),
         group_cardinalities: vec![4].into_boxed_slice(),
-        max_local_tables: 1,
+        resource: paro_planner::physical::PerfectHashResourceContract {
+            slots: 4,
+            table_bytes_upper: usize::MAX,
+            memory: paro_planner::physical::ExecutionMemoryContract {
+                fixed_non_revocable_bytes: u64::MAX,
+                max_concurrent_tasks: 1,
+                ..Default::default()
+            },
+        },
     }));
     let graph = aggregate_breaker_graph(
         SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec {
@@ -835,6 +847,7 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
 
     let spec = AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -843,34 +856,51 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
         group_key_encodings: Box::new([crate::physical::specs::GroupKeyEncoding::Identity]),
         grouping_sets: Box::new([]),
         aggregates: Box::new([
-            Expression::Aggregate(AggregateExpression::new(
-                narrow_sum,
-                vec![reference(1, narrow_type.clone())],
-                wide_type.clone(),
-            )),
-            Expression::Aggregate(AggregateExpression::new(
-                wide_sum,
-                vec![reference(2, wide_type.clone())],
-                wide_type.clone(),
-            )),
+            Expression::Aggregate(
+                AggregateExpression::new(
+                    narrow_sum,
+                    vec![reference(1, narrow_type.clone())],
+                    wide_type.clone(),
+                )
+                .into(),
+            ),
+            Expression::Aggregate(
+                AggregateExpression::new(
+                    wide_sum,
+                    vec![reference(2, wide_type.clone())],
+                    wide_type.clone(),
+                )
+                .into(),
+            ),
         ]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([1]), Box::new([2])]),
         aggregate_filters: Box::new([None, None]),
         aggregate_orders: Box::new([Box::new([]), Box::new([])]),
         post_reduction: None,
-        having_filter: Box::new([Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            reference(0, wide_type.clone()),
-            Expression::Constant(ConstantExpression::new(
-                Value::Decimal(10, 38, 0),
-                wide_type.clone(),
-            )),
-        ))]),
+        having_filter: Box::new([Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                reference(0, wide_type.clone()),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Decimal(10, 38, 0), wide_type.clone()).into(),
+                ),
+            )
+            .into(),
+        )]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([2]),
-            max_local_tables: 1,
+            resource: paro_planner::physical::PerfectHashResourceContract {
+                slots: 2,
+                table_bytes_upper: usize::MAX,
+                memory: paro_planner::physical::ExecutionMemoryContract {
+                    fixed_non_revocable_bytes: u64::MAX,
+                    max_concurrent_tasks: 1,
+                    ..Default::default()
+                },
+            },
         }),
         output_names: Box::new([
             "k".to_string(),
@@ -884,10 +914,9 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
         let LogicalType::Decimal { precision, scale } = ty else {
             unreachable!("test decimal constant requires DECIMAL type")
         };
-        Expression::Constant(ConstantExpression::new(
-            Value::Decimal(value, *precision, *scale),
-            ty.clone(),
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Decimal(value, *precision, *scale), ty.clone()).into(),
+        )
     };
 
     let output = QueryOutputPort::unbounded();
@@ -967,7 +996,15 @@ fn perfect_hash_post_reduction_retains_every_global_maximum_tie() {
         Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([4]),
-            max_local_tables: 1,
+            resource: paro_planner::physical::PerfectHashResourceContract {
+                slots: 4,
+                table_bytes_upper: usize::MAX,
+                memory: paro_planner::physical::ExecutionMemoryContract {
+                    fixed_non_revocable_bytes: u64::MAX,
+                    max_concurrent_tasks: 1,
+                    ..Default::default()
+                },
+            },
         }),
         Box::new([]),
     );
@@ -1078,7 +1115,8 @@ fn external_hash_post_reduction_filters_against_the_global_spilled_domain() {
             parallel_scheduler: false,
         },
     );
-    let spec = grouped_sum_post_max_spec(LogicalType::Integer, None, Box::new([]));
+    let mut spec = grouped_sum_post_max_spec(LogicalType::Integer, None, Box::new([]));
+    spec.spill_policy = crate::physical::specs::SpillExecutionPolicy::ForcedExternal;
     let graph = aggregate_breaker_graph(
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
@@ -1127,11 +1165,14 @@ fn external_hash_post_reduction_filters_against_the_global_spilled_domain() {
 fn post_reduction_precedes_having_and_both_reject_null_predicates() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
-    let having = Expression::Comparison(ComparisonExpression::new(
-        ComparisonType::LessThan,
-        reference(0, LogicalType::BigInt),
-        bigint_constant(100),
-    ));
+    let having = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::LessThan,
+            reference(0, LogicalType::BigInt),
+            bigint_constant(100),
+        )
+        .into(),
+    );
     let spec = grouped_sum_post_max_spec(LogicalType::Integer, None, Box::new([having]));
     let graph = aggregate_breaker_graph(
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {

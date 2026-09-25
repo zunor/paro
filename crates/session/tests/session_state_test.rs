@@ -33,7 +33,9 @@ async fn test_reset_session_state_preserves_active_statement_scope() {
             result_schema: Vec::new(),
             generic_plan: None,
             generic_plan_uses: 0,
+            compile_decision_id: None,
             source: PreparedStatementSource::Sql,
+            statement_trace: None,
         });
     session.state.enable_profiler();
     session

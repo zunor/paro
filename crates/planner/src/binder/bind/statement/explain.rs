@@ -7,7 +7,7 @@
 
 use crate::binder::ir::BoundStatementKind;
 use crate::binder::Binder;
-use crate::operator::{
+use crate::logical::operator::{
     Explain, ExplainDetail, ExplainFormat, ExplainMode, ExplainSpec, LogicalOperator,
 };
 use paro_common::error::{self as paro_error, Result};
@@ -61,6 +61,15 @@ fn bind_explain_impl(
     for option in &options {
         match option {
             ExplainOption::Verbose => detail.verbose = true,
+            ExplainOption::Compile
+            | ExplainOption::Analyze
+            | ExplainOption::Detail
+            | ExplainOption::FormatText
+            | ExplainOption::FormatJson => {
+                return Err(paro_error::not_supported(
+                    "EXPLAIN (COMPILE) requires the simple-query request entry",
+                ));
+            }
             ExplainOption::Logical | ExplainOption::Optimized | ExplainOption::Decorrelated => {
                 return Err(paro_error::not_implemented(format!(
                     "EXPLAIN option {:?} is not supported yet",
@@ -90,7 +99,7 @@ fn bind_explain_impl(
     // 1) Bind the inner statement.
     let bound_inner = binder.bind_statement_kind(query)?;
 
-    // 2) Create the inner logical plan (root [`LogicalPlan`]).
+    // 2) Create the inner logical plan (root [`OwnedLogicalPlan`]).
     let child_plan = binder.create_plan(bound_inner)?;
 
     // 3) Wrap it in Explain and return BoundStatementKind::Explain.

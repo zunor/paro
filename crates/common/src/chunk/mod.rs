@@ -8,4 +8,4 @@ mod ops;
 #[cfg(test)]
 mod tests;
 
-pub use chunk::Chunk;
+pub use chunk::{Chunk, ChunkView};

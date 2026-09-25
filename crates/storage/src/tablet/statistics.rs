@@ -84,14 +84,21 @@ impl TabletStatistics {
             match index.get(&col_stats.column_id) {
                 Some(&idx) => {
                     let entry = &mut self.columns[idx];
-                    entry.stats.merge(&col_stats.stats);
+                    entry.stats.merge_with_coverage(
+                        &col_stats.stats,
+                        entry.num_rows,
+                        col_stats.num_rows,
+                    );
                     entry.null_count += col_stats.null_count;
                     entry.num_rows += col_stats.num_rows;
                 }
                 None => {
                     self.columns.push(TabletColumnStatistics::new(
                         col_stats.column_id,
-                        col_stats.stats.clone(),
+                        col_stats
+                            .stats
+                            .clone()
+                            .with_observation_coverage(col_stats.num_rows),
                         col_stats.null_count,
                         col_stats.num_rows,
                     ));
@@ -115,12 +122,23 @@ impl TabletStatistics {
             let rowset_stats = rowset.statistics()?;
 
             for col in rowset_stats.columns() {
-                let entry = columns_map.entry(col.column_id).or_insert_with(|| {
-                    TabletColumnStatistics::new(col.column_id, col.stats.clone(), 0, 0)
-                });
-                entry.stats.merge(&col.stats);
-                entry.null_count += col.null_count;
-                entry.num_rows += col.num_rows;
+                if let Some(entry) = columns_map.get_mut(&col.column_id) {
+                    entry
+                        .stats
+                        .merge_with_coverage(&col.stats, entry.num_rows, col.num_rows);
+                    entry.null_count += col.null_count;
+                    entry.num_rows += col.num_rows;
+                } else {
+                    columns_map.insert(
+                        col.column_id,
+                        TabletColumnStatistics::new(
+                            col.column_id,
+                            col.stats.clone().with_observation_coverage(col.num_rows),
+                            col.null_count,
+                            col.num_rows,
+                        ),
+                    );
+                }
             }
         }
 

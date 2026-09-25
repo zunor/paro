@@ -8,8 +8,8 @@ use crate::binder::plan::subquery::{
 };
 use crate::binder::Binder;
 use crate::expression::{
-    CastExpression, ComparisonType, ConstantExpression, Expression, OperatorExpression,
-    OperatorType, SubqueryExpression, SubqueryPlanningState, SubqueryType,
+    CastExpression, ComparisonType, ConstantExpression, Expression, OperatorType,
+    SubqueryExpression, SubqueryPlanningState, SubqueryType,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -21,17 +21,15 @@ fn should_extract_struct_children(child: &Expression, subquery_types: &[LogicalT
     if !matches!(child.return_type(), LogicalType::Struct(_)) {
         return false;
     }
-    let Expression::Operator(OperatorExpression {
-        operator_type: OperatorType::StructConstructor,
-        children,
-        ..
-    }) = child
-    else {
+    let Expression::Operator(operator) = child else {
         return false;
     };
+    if operator.operator_type != OperatorType::StructConstructor {
+        return false;
+    }
     if subquery_types.len() == 1
         && matches!(subquery_types.first(), Some(LogicalType::Struct(_)))
-        && children.len() != subquery_types.len()
+        && operator.children.len() != subquery_types.len()
     {
         return false;
     }
@@ -42,32 +40,41 @@ fn should_extract_struct_children(child: &Expression, subquery_types: &[LogicalT
 fn extract_subquery_children(child: Expression, subquery_types: &[LogicalType]) -> Vec<Expression> {
     if should_extract_struct_children(&child, subquery_types) {
         match child {
-            Expression::Operator(OperatorExpression { children, .. }) => children,
+            Expression::Operator(operator) => operator.into_inner().children,
             _ => unreachable!(),
         }
-    } else if let Expression::Constant(ConstantExpression {
-        value: Value::Struct(children, fields),
-        ..
-    }) = child
+    } else if matches!(&child, Expression::Constant(constant) if matches!(constant.value, Value::Struct(..)))
     {
+        let Expression::Constant(constant) = child else {
+            unreachable!()
+        };
+        let Value::Struct(children, fields) = constant.into_inner().value else {
+            unreachable!()
+        };
         // Tuple constants get constant-folded during binding. Re-expand them here so
         // multi-column IN/ANY can still line up with subquery output columns.
         if subquery_types.len() == 1
             && matches!(subquery_types.first(), Some(LogicalType::Struct(_)))
         {
-            vec![Expression::Constant(ConstantExpression {
-                value: Value::Struct(children, fields.clone()),
-                return_type: LogicalType::Struct(fields),
-            })]
+            vec![Expression::Constant(
+                ConstantExpression {
+                    value: Value::Struct(children, fields.clone()),
+                    return_type: LogicalType::Struct(fields),
+                }
+                .into(),
+            )]
         } else {
             children
                 .into_iter()
                 .zip(fields)
                 .map(|(value, (_name, ty))| {
-                    Expression::Constant(ConstantExpression {
-                        value,
-                        return_type: ty,
-                    })
+                    Expression::Constant(
+                        ConstantExpression {
+                            value,
+                            return_type: ty,
+                        }
+                        .into(),
+                    )
                 })
                 .collect()
         }
@@ -171,18 +178,21 @@ pub fn bind_subquery_expression(
 
     let comparison = comparison_type.unwrap_or(ComparisonType::Equal);
 
-    Ok(Expression::Subquery(SubqueryExpression {
-        subquery_type,
-        subquery: Arc::new(bound_node),
-        children,
-        child_types,
-        child_targets,
-        comparison_type: comparison,
-        return_type,
-        correlated_columns,
-        bind_snapshot,
-        planning_state: SubqueryPlanningState::Unplanned,
-    }))
+    Ok(Expression::Subquery(
+        SubqueryExpression {
+            subquery_type,
+            subquery: Arc::new(bound_node),
+            children,
+            child_types,
+            child_targets,
+            comparison_type: comparison,
+            return_type,
+            correlated_columns,
+            bind_snapshot,
+            planning_state: SubqueryPlanningState::Unplanned,
+        }
+        .into(),
+    ))
 }
 
 #[cfg(test)]
@@ -190,7 +200,6 @@ mod tests {
     use super::*;
     use crate::binder::bind::expr;
     use crate::binder::test_utils::test_binder;
-    use crate::expression::{CastExpression, ColumnRefExpression};
     use paro_common::types::LogicalType;
 
     fn parse_expr_sql(sql: &str) -> paro_parser::ast::Expr {
@@ -230,8 +239,8 @@ mod tests {
             .expect("bind correlated column");
 
         match bound {
-            Expression::ColumnRef(ColumnRefExpression { depth, .. }) => {
-                assert_eq!(depth, 2);
+            Expression::ColumnRef(column) => {
+                assert_eq!(column.depth, 2);
             }
             other => panic!("expected column ref, got {other:?}"),
         }
@@ -260,10 +269,7 @@ mod tests {
                     }
                 );
                 assert_eq!(subquery.child_targets[1], LogicalType::Varchar);
-                assert!(matches!(
-                    subquery.children[0],
-                    Expression::Cast(CastExpression { .. })
-                ));
+                assert!(matches!(subquery.children[0], Expression::Cast(_)));
             }
             other => panic!("expected subquery expression, got {other:?}"),
         }

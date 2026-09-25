@@ -12,7 +12,7 @@ pub use shared::BindShared;
 pub use snapshot::BindSnapshot;
 
 use crate::binder::ir::CTEBindState;
-use crate::plan::PlanNodeId;
+use crate::logical::plan::PlanNodeId;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_parser::ast::{ColumnID, ColumnRef, Expr, Identifier};
@@ -86,6 +86,16 @@ impl BindContext {
 
     pub fn shared(&self) -> &Arc<BindShared> {
         &self.shared
+    }
+
+    /// Clone the visible binding state while giving plan-node allocation its
+    /// own namespace. Independent regional plans may reuse the same table
+    /// and CTE indices, but work performed in one region must not advance the
+    /// allocator used by another planning operation.
+    pub fn with_independent_plan_ids(&self) -> Self {
+        let mut context = self.clone();
+        context.shared = Arc::new(BindShared::new());
+        context
     }
 
     pub fn generate_table_index(&self) -> usize {

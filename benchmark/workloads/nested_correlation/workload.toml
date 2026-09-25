@@ -12,10 +12,10 @@ file = "sql/q_three_level_scalar_explain.sql"
 validate = "text_contains_all"
 expected = [
   "DELIM_JOIN",
-  "Join Type: LEFT",
+  "Join Type: SINGLE",
   "Output: (SELECT (SELECT d.score",
-  "Aggregates: first(#1)",
-  "Filter: #0 = #2",
+  "Join Condition: o.grp IS NOT DISTINCT FROM grp",
+  "Filter: d.grp = grp",
 ]
 
 [[query]]
@@ -24,7 +24,7 @@ file = "sql/q_four_level_exists_explain.sql"
 validate = "text_contains_all"
 expected = [
   "Join Type: MARK",
-  "Join Condition: #1 IS NOT DISTINCT FROM #0, #2 IS NOT DISTINCT FROM #1",
-  "Filter: #2 >= #1",
-  "Aggregates: first(#2)",
+  "Join Condition: o.grp IS NOT DISTINCT FROM __corr_1, o.threshold IS NOT DISTINCT FROM __corr_2",
+  "Filter: nested.top_score >= threshold",
+  "Join Type: SINGLE",
 ]

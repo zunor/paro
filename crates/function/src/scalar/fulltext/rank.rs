@@ -12,7 +12,7 @@ use crate::{ScalarFunction, ScalarFunctionSet};
 
 use super::fallback::{
     default_tokenizer, parse_legacy_query, parse_serialized_tsquery, score_query,
-    tokenize_serialized_tsvector, FullTextScoreMode,
+    tokenize_serialized_tsvector, DocumentScoreMode,
 };
 
 fn bm25_fn(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
@@ -24,15 +24,15 @@ fn bm25_score_internal_fn(
     _state: &dyn ExpressionState,
     result: &mut Vector,
 ) -> Result<()> {
-    evaluate_internal_score_fallback(input, result, FullTextScoreMode::Bm25)
+    evaluate_internal_score_fallback(input, result, DocumentScoreMode::RankV1)
 }
 
 fn ts_rank_fn(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    evaluate_internal_score_fallback(input, result, FullTextScoreMode::Bm25)
+    evaluate_internal_score_fallback(input, result, DocumentScoreMode::RankV1)
 }
 
 fn ts_rank_cd_fn(input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    evaluate_internal_score_fallback(input, result, FullTextScoreMode::CoverDensity)
+    evaluate_internal_score_fallback(input, result, DocumentScoreMode::CoverDensityV1)
 }
 
 fn evaluate_legacy_bm25_fallback(input: &Chunk, result: &mut Vector) -> Result<()> {
@@ -67,7 +67,7 @@ fn evaluate_legacy_bm25_fallback(input: &Chunk, result: &mut Vector) -> Result<(
 
         let text = text_vec.get_string(i).unwrap_or_default();
         let tokens = tokenizer.tokenize_to_vec(text);
-        let score = score_query(&tokens, query, FullTextScoreMode::Bm25);
+        let score = score_query(&tokens, query, DocumentScoreMode::RankV1);
         result.set_f32(i, score);
     }
 
@@ -77,7 +77,7 @@ fn evaluate_legacy_bm25_fallback(input: &Chunk, result: &mut Vector) -> Result<(
 fn evaluate_internal_score_fallback(
     input: &Chunk,
     result: &mut Vector,
-    mode: FullTextScoreMode,
+    mode: DocumentScoreMode,
 ) -> Result<()> {
     let count = input.size();
     result.set_count(count);

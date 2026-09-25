@@ -3,11 +3,18 @@ name = "paro-server"
 version = { workspace = true }
 edition = { workspace = true }
 
+[features]
+default = []
+## Enables the optional process-wide allocation profiler.  Keep this disabled
+## for normal servers so the allocator fast path remains entirely untouched.
+alloc-metrics = ["paro-common/alloc-metrics"]
+
 [lints.clippy]
 manual-slice-fill = "allow"
 
 [dependencies]
 paro-common = { workspace = true }
+paro-context = { workspace = true }
 paro-catalog = { workspace = true }
 paro-session = { workspace = true }
 paro-instance = { workspace = true }
@@ -28,7 +35,9 @@ clap = { workspace = true }
 serde = { workspace = true }
 bytesize = { workspace = true }
 rand = "0.8"
+libc = "0.2"
 
 [dev-dependencies]
 paro-common = { workspace = true, features = ["test-support"] }
 tempfile = "3.8"
+serial_test = { workspace = true }

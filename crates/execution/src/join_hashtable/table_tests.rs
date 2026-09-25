@@ -18,28 +18,20 @@ fn create_test_buffer_pool() -> Arc<BufferPool> {
 
 fn equality_condition() -> JoinCondition {
     JoinCondition::new(
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(1),
-            LogicalType::Integer,
-        )),
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(1),
-            LogicalType::Integer,
-        )),
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+        ),
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+        ),
         JoinComparisonType::Equal,
     )
 }
 
 fn bigint_equality_condition() -> JoinCondition {
     JoinCondition::new(
-        Expression::Constant(ConstantExpression::new(
-            Value::BigInt(1),
-            LogicalType::BigInt,
-        )),
-        Expression::Constant(ConstantExpression::new(
-            Value::BigInt(1),
-            LogicalType::BigInt,
-        )),
+        Expression::Constant(ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt).into()),
+        Expression::Constant(ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt).into()),
         JoinComparisonType::Equal,
     )
 }
@@ -50,14 +42,12 @@ fn bigint_pair_equality_conditions() -> Vec<JoinCondition> {
 
 fn not_distinct_condition() -> JoinCondition {
     JoinCondition::new(
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(1),
-            LogicalType::Integer,
-        )),
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(1),
-            LogicalType::Integer,
-        )),
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+        ),
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+        ),
         JoinComparisonType::NotDistinctFrom,
     )
 }
@@ -554,7 +544,14 @@ fn ranked_build_time_index_links_duplicates_across_parallel_local_tables() {
     )
     .expect("output chunk");
     let count = scan
-        .next_inner_join(&probe, &probe, &mut output, &merged, &[0])
+        .next_inner_join(
+            &probe,
+            &probe,
+            &mut output,
+            &merged,
+            &[0],
+            &crate::physical::OutputPermutation::identity(2),
+        )
         .expect("scan duplicate matches");
     assert_eq!(count, 3);
     let mut payloads = (0..count)
@@ -592,7 +589,14 @@ fn duplicate_direct_integer_build_uses_exact_index_chains() {
     )
     .expect("output chunk");
     let count = scan
-        .next_inner_join(&probe, &probe, &mut output, &ht, &[0])
+        .next_inner_join(
+            &probe,
+            &probe,
+            &mut output,
+            &ht,
+            &[0],
+            &crate::physical::OutputPermutation::identity(2),
+        )
         .expect("scan duplicate matches");
     assert_eq!(count, 2);
 }
@@ -634,7 +638,14 @@ fn bigint_pair_build_uses_exact_index_and_preserves_duplicate_chains() {
     )
     .expect("output chunk");
     let count = scan
-        .next_inner_join(&probe, &probe, &mut output, &ht, &[0])
+        .next_inner_join(
+            &probe,
+            &probe,
+            &mut output,
+            &ht,
+            &[0],
+            &crate::physical::OutputPermutation::identity(2),
+        )
         .expect("scan pair matches");
     assert_eq!(count, 3);
     let mut payloads = (0..count)
@@ -642,6 +653,31 @@ fn bigint_pair_build_uses_exact_index_and_preserves_duplicate_chains() {
         .collect::<Vec<_>>();
     payloads.sort_unstable();
     assert_eq!(payloads, [10, 20, 30]);
+}
+
+#[test]
+fn bigint_pair_index_leaves_outer_join_null_keys_unindexed() {
+    let ht = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        bigint_pair_equality_conditions(),
+        vec![LogicalType::Integer],
+        JoinType::Outer,
+        JoinHashTableConfig::default(),
+    );
+    let keys =
+        chunk_from_optional_i64_columns(&[&[Some(1), None, Some(3)], &[Some(2), Some(2), None]]);
+    let payload = chunk_from_optional_i32(&[Some(10), Some(20), Some(30)]);
+
+    ht.build(&keys, &payload).expect("build nullable pair keys");
+    ht.finalize().expect("finalize nullable pair index");
+
+    assert!(ht.has_pair_integer_index());
+    let probe = chunk_from_optional_i64_columns(&[&[Some(1)], &[Some(2)]]);
+    let mut scan = ht.create_scan_structure().expect("scan state");
+    ht.probe(&probe, &mut scan, None, probe.size())
+        .expect("probe nullable pair index");
+    assert_eq!(scan.count, 1);
 }
 
 #[test]
@@ -870,7 +906,14 @@ fn test_not_distinct_from_keeps_null_keys_and_probe_matches_them() {
         VECTOR_SIZE,
     );
     let count = scan
-        .next_inner_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .next_inner_join(
+            &probe_keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &crate::physical::OutputPermutation::identity(2),
+        )
         .unwrap();
 
     assert_eq!(count, 1);
@@ -985,7 +1028,14 @@ fn test_probe_linear_probing_finds_rows_behind_salt_mismatch() {
         VECTOR_SIZE,
     );
     let count = scan
-        .next_inner_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .next_inner_join(
+            &probe_keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &crate::physical::OutputPermutation::identity(2),
+        )
         .unwrap();
 
     assert_eq!(count, 1);
@@ -1029,7 +1079,14 @@ fn inner_join_drains_probe_matches_larger_than_one_output_vector() {
     let mut emitted = 0;
     while !scan.finished {
         emitted += scan
-            .next_inner_join(&keys, &keys, &mut result, &table, &[0])
+            .next_inner_join(
+                &keys,
+                &keys,
+                &mut result,
+                &table,
+                &[0],
+                &crate::physical::OutputPermutation::identity(2),
+            )
             .unwrap();
     }
 

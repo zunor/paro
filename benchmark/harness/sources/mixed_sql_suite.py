@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from ..evidence_schema import EVIDENCE_SCHEMA_VERSION
+
 from dataclasses import dataclass
 from datetime import datetime
 from queue import SimpleQueue
@@ -40,8 +42,25 @@ class MixedSqlSuiteSource:
             raise ValueError(f"source '{source.name}' is missing suite")
 
         runner = context.runner_module
-        args = runner.BenchmarkInvocation(suite=source.suite, pid=context.pid)
+        args = runner.BenchmarkInvocation(
+            suite=source.suite,
+            pid=context.pid,
+            run_output=context.run_output,
+            query_case=context.attempt.query_case if context.attempt else source.name,
+            arm_id=context.attempt.arm_id if context.attempt else None,
+        )
         config = runner.resolve_config(args)
+        if context.run_output is not None and context.attempt is not None:
+            context.run_output.registration.cell(
+                # The payload has three scenario queries, each with one
+                # receipt slot per measured iteration.  Register the actual
+                # cell cardinality before any result bytes are published.
+                query_cases=3,
+                sample_rows=3 * max(config.iterations, 1),
+                product_receipts=3 * max(config.iterations, 1),
+                query_case=context.attempt.query_case,
+                arm_id=context.attempt.arm_id,
+            )
         workloads = runner.load_selected_workloads(config, args, {})
         if len(workloads) != 1:
             raise ValueError(
@@ -132,11 +151,24 @@ class MixedSqlSuiteSource:
             setup_error=setup_error,
             teardown_error=teardown_error,
         )
-        report_dir = context.root_dir / "report" / _safe_path_name(source.name)
+        report_dir = context.output_dir
         from ..reporter import BenchmarkReporter
 
         reporter = BenchmarkReporter(context.root_dir)
-        result_path, summary_path = reporter.write_reports(payload, report_dir / "result.json")
+        if context.run_output is not None:
+            reporter.attach_run_ownership(
+                payload,
+                context.run_output,
+                source_id=context.attempt.source_id if context.attempt else None,
+                attempt_id=context.attempt.attempt_id if context.attempt else None,
+                query_case=source.name,
+                arm_id=context.attempt.arm_id if context.attempt else None,
+            )
+        if context.attempt is None:
+            raise ValueError("mixed SQL source requires an owned attempt")
+        result_path, summary_path = reporter.write_reports(
+            payload, context.attempt.cell_writer()
+        )
         failed = bool(setup_error or teardown_error or any(s.error for s in scenarios))
         failed = failed or any(s.validation.get("result") != "PASS" for s in scenarios)
         return SourceMeasurement(
@@ -145,6 +177,12 @@ class MixedSqlSuiteSource:
             result_path=result_path,
             summary_path=summary_path,
             failed=failed,
+            run_id=context.run_output.run_id if context.run_output else None,
+            source_id=context.attempt.source_id if context.attempt else None,
+            attempt_id=context.attempt.attempt_id if context.attempt else None,
+            query_case=source.name,
+            arm_id=context.attempt.arm_id if context.attempt else None,
+            attempt_status="Completed" if not failed else "Failed",
         )
 
 
@@ -386,6 +424,11 @@ def _payload(
             "rss": scenario.rss,
             "validation": scenario.validation,
             "mixed": scenario.mixed,
+            "compile_receipt": {
+                "schema_version": EVIDENCE_SCHEMA_VERSION,
+                "status": "Uncovered",
+                "reason": "mixed scenario combines concurrent statements without one receipt identity",
+            },
             "error": scenario.error,
         }
         workload["queries"].append(query)

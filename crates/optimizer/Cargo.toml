@@ -3,6 +3,9 @@ name = "paro-optimizer"
 version = { workspace = true }
 edition = { workspace = true }
 
+[features]
+test-support = []
+
 [lints.clippy]
 empty-line-after-doc-comments = "allow"
 int-plus-one = "allow"
@@ -27,18 +30,23 @@ needless-lifetimes = "allow"
 [dependencies]
 paro-common = { workspace = true }
 paro-catalog = { workspace = true }
-paro-context = { workspace = true, features = ["test-support"] }
+paro-context = { workspace = true }
 paro-function = { workspace = true }
 paro-parser = { workspace = true }
 paro-planner = { workspace = true }
 paro-external = { workspace = true }
 paro-storage = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+smallvec = "1.13"
 tracing = { workspace = true }
 
 [dev-dependencies]
+paro-context = { workspace = true, features = ["test-support"] }
 paro-common = { workspace = true, features = ["test-support"] }
 divan = { workspace = true }
 
 [[bench]]
 name = "expression_rewriter"
 harness = false
+required-features = ["test-support"]

@@ -119,6 +119,22 @@ impl CommonBufferManager for StandardBufferManager {
         <BufferPool as CommonBufferManager>::allocate(&self.buffer_pool, tag, size)
     }
 
+    fn allocate_zeroed(&self, tag: MemoryTag, size: usize) -> Result<*mut u8> {
+        <BufferPool as CommonBufferManager>::allocate_zeroed(&self.buffer_pool, tag, size)
+    }
+
+    fn reserve(&self, tag: MemoryTag, size: usize) -> Result<Option<usize>> {
+        <BufferPool as CommonBufferManager>::reserve(&self.buffer_pool, tag, size)
+    }
+
+    fn allocate_reserved(&self, tag: MemoryTag, size: usize) -> Result<*mut u8> {
+        <BufferPool as CommonBufferManager>::allocate_reserved(&self.buffer_pool, tag, size)
+    }
+
+    fn release_reserved(&self, tag: MemoryTag, size: usize) {
+        <BufferPool as CommonBufferManager>::release_reserved(&self.buffer_pool, tag, size)
+    }
+
     fn free(&self, ptr: *mut u8, tag: MemoryTag, size: usize) {
         <BufferPool as CommonBufferManager>::free(&self.buffer_pool, ptr, tag, size)
     }

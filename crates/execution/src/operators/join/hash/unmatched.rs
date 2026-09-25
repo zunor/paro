@@ -7,13 +7,13 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
-use paro_planner::operator::join::JoinType;
+use paro_planner::logical::operator::join::JoinType;
 
 use crate::operators::join::join_result_helpers::{
-    construct_right_outer_scan_result, construct_semi_join_result,
+    construct_permuted_right_outer_scan_result, construct_semi_join_result,
 };
 use crate::operators::output::ensure_source_output;
-use crate::physical::specs::HashReductionCascadeSpec;
+use crate::physical::specs::{HashReductionCascadeSpec, OutputPermutation};
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
@@ -26,6 +26,7 @@ pub struct HashJoinUnmatchedSourceExec {
     pub handle: HandleRef<JoinBuildHandle>,
     pub join_type: JoinType,
     pub left_output_types: Box<[LogicalType]>,
+    pub output_permutation: OutputPermutation,
     pub output_types: Box<[LogicalType]>,
     pub reduction_cascade: Option<HashReductionCascadeSpec>,
 }
@@ -145,12 +146,13 @@ impl HashJoinUnmatchedSourceExec {
         let build_sel = SelectionVector::try_incremental(count, output.allocator().clone())?;
         let build_projection = (0..build_chunk.column_count()).collect::<Vec<_>>();
         match self.join_type {
-            JoinType::Right | JoinType::Outer => construct_right_outer_scan_result(
+            JoinType::Right | JoinType::Outer => construct_permuted_right_outer_scan_result(
                 &build_chunk,
                 &build_sel,
                 count,
                 &self.left_output_types,
                 &build_projection,
+                &self.output_permutation,
                 output,
             )?,
             JoinType::RightSemi | JoinType::RightAnti => construct_semi_join_result(
@@ -158,6 +160,7 @@ impl HashJoinUnmatchedSourceExec {
                 &build_sel,
                 count,
                 &build_projection,
+                &self.output_permutation,
                 output,
             )?,
             _ => unreachable!("unmatched source only emits right-side joins"),

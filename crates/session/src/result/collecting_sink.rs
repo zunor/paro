@@ -235,6 +235,21 @@ impl ResultSink for CollectingSink {
         Ok(())
     }
 
+    async fn push_diagnostic_chunk(
+        &mut self,
+        chunk: &Chunk,
+        owner: std::sync::Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+    ) -> Result<()> {
+        if let Some(result) = self.results.last_mut() {
+            let mut retained = chunk.try_deep_copy(chunk.allocator().clone())?;
+            for column in &mut retained.data {
+                *column = std::sync::Arc::new(column.reference_with_lifetime_owner(owner.clone()));
+            }
+            result.chunks.push(retained);
+        }
+        Ok(())
+    }
+
     async fn finish_result(&mut self, completion: &StatementCompletion) -> Result<()> {
         if self.building_result {
             // Complete the current result being built

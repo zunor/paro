@@ -1,7 +1,7 @@
 # Copyright 2024-2026 Zunor
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build release run test check header fmt fmt-check clippy actionlint memory-guards static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-calibrate bench-bisect bench-archive-manifest bench-archive-recompute-calibration bench-archive-finalize-calibration bench-test bench-setup bench-clean bench-ping test-benchmark performance-gate performance-gate-sql performance-gate-divan performance-gate-bless python-udf-setup python-udf-unit python-udf-regress python-udf-startup-smoke python-udf-ci
+.PHONY: build release run test check header fmt fmt-check clippy actionlint memory-guards optimizer-calibration static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-calibrate bench-bisect bench-archive-manifest bench-archive-recompute-calibration bench-archive-finalize-calibration bench-test bench-setup bench-clean bench-ping test-benchmark performance-gate performance-gate-sql performance-gate-divan performance-gate-bless python-udf-setup python-udf-unit python-udf-regress python-udf-startup-smoke python-udf-ci
 
 # Build the project
 build:
@@ -54,17 +54,31 @@ memory-guards:
 	python3 tools/ci/check_memory_runtime_api.py
 	python3 tools/ci/check_vector_copy_fallible_api.py
 
+# Ensure the production cost table is a complete, reproducible artifact of
+# its declared benchmark corpus rather than an independently edited literal.
+optimizer-calibration:
+	python3 tools/ci/generate_optimizer_calibration.py --check
+
+.PHONY: plan-boundaries
+plan-boundaries:
+	python3 tools/ci/check_plan_boundaries.py
+	python3 -m unittest discover -s tools/ci -p 'test_plan_boundaries.py'
+
 # Run the static checks used at the front of CI
 static:
-	@echo "══════ [1/5] header ══════"
+	@echo "══════ [1/7] header ══════"
 	$(MAKE) header
-	@echo "══════ [2/5] rustfmt ══════"
+	@echo "══════ [2/7] rustfmt ══════"
 	$(MAKE) fmt-check
-	@echo "══════ [3/5] memory guards ══════"
+	@echo "══════ [3/7] memory guards ══════"
 	$(MAKE) memory-guards
-	@echo "══════ [4/5] clippy ══════"
+	@echo "══════ [4/7] optimizer calibration ══════"
+	$(MAKE) optimizer-calibration
+	@echo "══════ [5/7] plan boundaries ══════"
+	$(MAKE) plan-boundaries
+	@echo "══════ [6/7] clippy ══════"
 	$(MAKE) clippy
-	@echo "══════ [5/5] actionlint ══════"
+	@echo "══════ [7/7] actionlint ══════"
 	$(MAKE) actionlint
 
 # Clean build artifacts
@@ -240,10 +254,16 @@ bench: ## Run benchmark (WORKLOAD= FILTER= SUITE= PARAMS= PID=)
 		$(if $(WORKLOAD),WORKLOAD=$(WORKLOAD)) \
 		$(if $(FILTER),FILTER=$(FILTER)) \
 		$(if $(PARAMS),PARAMS="$(PARAMS)") \
-		$(if $(PID),PID=$(PID))
+		$(if $(PID),PID=$(PID)) \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID)) \
+		$(if $(COLLECT_RECEIPTS),COLLECT_RECEIPTS=$(COLLECT_RECEIPTS))
 
 bench-ci: ## Run benchmark CI suite (default PARO_HOST/PARO_PORT = 127.0.0.1:6432)
-	@PARO_HOST=$(PARO_HOST) PARO_PORT=$(PARO_PORT) $(MAKE) -C benchmark ci
+	@PARO_HOST=$(PARO_HOST) PARO_PORT=$(PARO_PORT) $(MAKE) -C benchmark ci \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID)) \
+		$(if $(COLLECT_RECEIPTS),COLLECT_RECEIPTS=$(COLLECT_RECEIPTS))
 
 bench-check: ## Run benchmark performance gate (GATE= INCLUDE_SOURCE= BASELINE= POLICY= PID= ARCHIVE=)
 	@$(MAKE) -C benchmark check \
@@ -254,7 +274,9 @@ bench-check: ## Run benchmark performance gate (GATE= INCLUDE_SOURCE= BASELINE= 
 		$(if $(PID),PID=$(PID)) \
 		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
 		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE))) \
-		$(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES))
+		$(if $(QUORUM_RETRIES),QUORUM_RETRIES=$(QUORUM_RETRIES)) \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID))
 
 bench-bless: ## Update benchmark gate baseline (GATE= BASELINE= POLICY= PID= BLESS_RUNS= POLICY_EVOLUTION=1)
 	@$(MAKE) -C benchmark bless \
@@ -264,7 +286,9 @@ bench-bless: ## Update benchmark gate baseline (GATE= BASELINE= POLICY= PID= BLE
 		$(if $(INCLUDE_SOURCE),INCLUDE_SOURCE=$(INCLUDE_SOURCE)) \
 		$(if $(PID),PID=$(PID)) \
 		$(if $(BLESS_RUNS),BLESS_RUNS=$(BLESS_RUNS)) \
-		$(if $(POLICY_EVOLUTION),POLICY_EVOLUTION=$(POLICY_EVOLUTION))
+		$(if $(POLICY_EVOLUTION),POLICY_EVOLUTION=$(POLICY_EVOLUTION)) \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID))
 
 bench-calibrate: ## Append benchmark gate observations to archive (GATE= ARCHIVE= RUN_ID=)
 	@$(MAKE) -C benchmark calibrate \
@@ -275,7 +299,8 @@ bench-calibrate: ## Append benchmark gate observations to archive (GATE= ARCHIVE
 		$(if $(PID),PID=$(PID)) \
 		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
 		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE))) \
-		$(if $(RUN_ID),RUN_ID=$(RUN_ID))
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID)) \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT)))
 
 bench-bisect: ## Compare current checkout against archived gate result (GATE= AGAINST= ARCHIVE= PID=)
 	@$(MAKE) -C benchmark bisect \
@@ -285,7 +310,9 @@ bench-bisect: ## Compare current checkout against archived gate result (GATE= AG
 		$(if $(INCLUDE_SOURCE),INCLUDE_SOURCE=$(INCLUDE_SOURCE)) \
 		$(if $(PID),PID=$(PID)) \
 		$(if $(ARCHIVE),ARCHIVE=$(abspath $(ARCHIVE))) \
-		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE)))
+		$(if $(ARCHIVE_CACHE),ARCHIVE_CACHE=$(abspath $(ARCHIVE_CACHE))) \
+		$(if $(REPORT_ROOT),REPORT_ROOT=$(abspath $(REPORT_ROOT))) \
+		$(if $(RUN_ID),RUN_ID=$(RUN_ID))
 
 bench-archive-manifest: ## Rebuild benchmark archive manifest (ARCHIVE= GATE= PLATFORM= POLICY_VERSION=)
 	@$(MAKE) -C benchmark archive-manifest \

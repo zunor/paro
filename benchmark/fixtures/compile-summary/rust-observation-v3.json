@@ -1,0 +1,9 @@
+[
+  "NotExecuted",
+  "NotApplicable",
+  {"Observed": 0},
+  {"Observed": 18446744073709551615},
+  {"Uncovered": "NotInstrumented"},
+  {"Uncovered": "FutureBoundary"},
+  {"Uncovered": "Capacity"}
+]

@@ -24,7 +24,7 @@ use super::aggregate_kernel::{
     initialize_state_at_address, input_vectors_for_aggregate, update_filtered_states,
     update_states, with_aggregate_input_data, AggregatePayload,
 };
-use super::aggregate_object::AggregateObject;
+use super::aggregate_object::{compile_direct_update_program, AggregateObject};
 use super::aggregate_state::AggregateStateLayout;
 use super::perfect_hash_key::PerfectHashKeyDomain;
 
@@ -40,16 +40,11 @@ use key_encoding::{
 use key_encoding::{PreparedDictionaryKey, PreparedSlotEncoding};
 pub(crate) use reduction::ParallelPerfectAggregateMerge;
 use slot_bitmap::SlotBitmap;
-pub(crate) use support::compile_direct_update_program;
 use support::{
     accounted_vec_from_reservation, bytes_to_words, compact_state_addresses,
     direct_update_scratch_bytes, pointer_vector_from_slice, validate_addresses_vector,
     validate_aggregate_inputs, validate_filter,
 };
-
-pub(crate) fn perfect_hash_occupancy_bytes(slots: usize) -> Option<usize> {
-    SlotBitmap::storage_bytes(slots).ok()
-}
 
 /// Scan cursor for a perfect aggregate hash table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -147,6 +142,12 @@ pub struct PerfectAggregateHashTable {
 }
 
 impl PerfectAggregateHashTable {
+    pub(crate) fn fuse_disjoint_filter_group(&mut self, filter_inputs: &[usize]) -> bool {
+        self.direct_update_program
+            .as_mut()
+            .is_some_and(|program| program.fuse_disjoint_filter_group(filter_inputs))
+    }
+
     pub fn new(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
@@ -177,6 +178,31 @@ impl PerfectAggregateHashTable {
         group_cardinalities: Vec<usize>,
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
+    ) -> Result<Self> {
+        Self::new_with_memory_contract(
+            group_types,
+            aggregate_objects,
+            aggregate_inputs,
+            group_minima,
+            group_cardinalities,
+            allocator,
+            memory,
+            usize::MAX,
+        )
+    }
+
+    /// Materialize a planner-admitted direct-addressing table. The runtime
+    /// computes its exact allocator request and proves it stays within the
+    /// immutable planning envelope before reserving memory.
+    pub(crate) fn new_with_memory_contract(
+        group_types: Vec<LogicalType>,
+        aggregate_objects: Vec<AggregateObject>,
+        aggregate_inputs: Vec<Vec<usize>>,
+        group_minima: Vec<i128>,
+        group_cardinalities: Vec<usize>,
+        allocator: Arc<dyn Allocator>,
+        memory: MemoryAccountingContext,
+        planned_bytes_upper: usize,
     ) -> Result<Self> {
         if group_types.is_empty() {
             return Err(paro_error::internal(
@@ -230,6 +256,11 @@ impl PerfectAggregateHashTable {
             .and_then(|bytes| bytes.checked_add(occupancy_bytes))
             .and_then(|bytes| bytes.checked_add(direct_scratch_bytes))
             .ok_or_else(|| paro_error::internal("perfect aggregate reservation overflow"))?;
+        if reserved_bytes > planned_bytes_upper {
+            return Err(paro_error::internal(format!(
+                "perfect aggregate runtime layout exceeds its immutable resource contract: exact={reserved_bytes}, planned_upper={planned_bytes_upper}"
+            )));
+        }
         let reservation = memory.reserve_grant(reserved_bytes)?;
         let direct_update_scratch = match direct_update_program.as_ref() {
             Some(program) => program.try_create_scratch_with_grant(

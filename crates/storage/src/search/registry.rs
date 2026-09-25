@@ -214,6 +214,11 @@ impl std::fmt::Debug for SearchIndexRegistry {
 }
 
 impl SearchIndexRegistry {
+    /// Identity of the optimizer-visible definition and capability set.
+    pub(crate) fn planning_signature(&self) -> u64 {
+        self.view.load().planning_signature()
+    }
+
     fn disable_definition_capability(&self, definition_id: u64) -> Result<()> {
         self.update_registry_view(|view| {
             let Some(state) = view.definitions.get_mut(&definition_id) else {

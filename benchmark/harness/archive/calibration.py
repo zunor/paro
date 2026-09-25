@@ -409,10 +409,23 @@ def _archive_payload(
 
 
 def _measurement_payload(measurement: Any) -> dict[str, Any]:
+    receipt_statuses: dict[str, int] = {}
+    for workload in measurement.payload.get("workloads", []):
+        for query in workload.get("queries", []):
+            receipt = query.get("compile_receipt")
+            status = receipt.get("status", "Uncovered") if isinstance(receipt, dict) else "Uncovered"
+            receipt_statuses[status] = receipt_statuses.get(status, 0) + 1
     return {
         "name": measurement.source.name,
         "type": measurement.source.type,
         "measurement_class": measurement.source.measurement_class,
+        "ownership": {
+            "run_id": getattr(measurement, "run_id", None),
+            "source_id": getattr(measurement, "source_id", None),
+            "attempt_id": getattr(measurement, "attempt_id", None),
+            "attempt_status": getattr(measurement, "attempt_status", "Uncovered"),
+            "receipt_statuses": receipt_statuses,
+        },
         "payload": project_measurement_payload(measurement.payload),
     }
 

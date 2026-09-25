@@ -976,14 +976,14 @@ fn test_rowid_lookup_single_segment_restores_requested_order_without_flattening(
         paro_common::vector::VectorType::Dictionary
     );
 
-    let point_reader = crate::tablet::TabletRowIdReader::new(
+    let mut point_reader = crate::tablet::TabletRowIdReader::new(
         tablet.clone(),
         tablet.capture_consistent_rowsets(0).unwrap(),
         &[2, 0],
         Arc::new(paro_common::allocator::default_allocator()),
     )
     .unwrap();
-    let fetched = point_reader.get_by_rowids(&requested, &[2, 0]).unwrap();
+    let fetched = point_reader.get_by_rowids(&requested).unwrap();
     assert_eq!(fetched.size(), 4);
     assert_eq!(fetched.column_count(), 2);
     assert_eq!(fetched.column(0).unwrap().get_i32(0), Some(2));
@@ -997,6 +997,35 @@ fn test_rowid_lookup_single_segment_restores_requested_order_without_flattening(
     assert_eq!(
         fetched.column(0).unwrap().vector_type(),
         paro_common::vector::VectorType::Dictionary
+    );
+
+    // A sparse reader retains one segment-local cursor set and lookup scratch
+    // across batches of its immutable projection contract.
+    let repeated = point_reader
+        .get_by_rowids(&[raw_rowids[1], raw_rowids[0]])
+        .unwrap();
+    assert_eq!(repeated.column(0).unwrap().get_i32(0), Some(1));
+    assert_eq!(repeated.column(0).unwrap().get_i32(1), Some(0));
+    assert_eq!(repeated.column(1).unwrap().get_i64(0), Some(20));
+    assert_eq!(repeated.column(1).unwrap().get_i64(1), Some(10));
+
+    let mut ordered_reader = crate::tablet::TabletRowIdReader::new(
+        tablet.clone(),
+        tablet.capture_consistent_rowsets(0).unwrap(),
+        &[0],
+        Arc::new(paro_common::allocator::default_allocator()),
+    )
+    .unwrap();
+    let changed_projection = ordered_reader
+        .get_by_rowids(&[raw_rowids[0], raw_rowids[2]])
+        .unwrap();
+    assert_eq!(changed_projection.column_count(), 1);
+    assert_eq!(changed_projection.column(0).unwrap().get_i64(0), Some(10));
+    assert_eq!(changed_projection.column(0).unwrap().get_i64(1), Some(30));
+    assert_eq!(
+        changed_projection.column(0).unwrap().vector_type(),
+        paro_common::vector::VectorType::Flat,
+        "physical-order sparse fetch should not add an identity dictionary"
     );
 }
 

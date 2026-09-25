@@ -101,13 +101,14 @@ fn direct_decimal_program_fuses_shared_group_and_input_updates() {
     let average_offset = std::mem::size_of::<DecimalNarrowState>();
     let count_offset = average_offset + std::mem::size_of::<DecimalAverageState>();
     let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(3);
-    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0), true));
+    assert!(program.try_add_filtered(0, sum.direct_update, sum_offset, Some(0), Some(1), true,));
     assert!(program.try_add(1, average.direct_update, average_offset, Some(0), true,));
-    assert!(program.try_add(
+    assert!(program.try_add_filtered(
         2,
         Some(AggregateDirectUpdate::CountStar),
         count_offset,
         None,
+        Some(1),
         true,
     ));
     assert!(program.has_updates());
@@ -121,24 +122,110 @@ fn direct_decimal_program_fuses_shared_group_and_input_updates() {
         *base.add(count_offset).cast::<i64>() = 0;
     }
     let mut addresses = paro_common::test_utils::test_vector(LogicalType::BigInt);
-    addresses.set_count(2);
+    addresses.set_count(3);
     unsafe {
         let values = addresses.flat_data_mut::<*mut u8>();
         *values = base;
         *values.add(1) = base;
+        *values.add(2) = base;
     }
     let mut values = paro_common::test_utils::test_vector(input_type);
-    values.set_count(2);
+    values.set_count(3);
     values.set_i64(0, 100);
     values.set_i64(1, 200);
-    let payload = paro_common::test_utils::test_chunk_from_vectors(vec![values]);
-    assert!(unsafe { program.execute(&payload, &addresses, 2) }.unwrap());
+    values.set_null(2, true);
+    let filters = paro_common::test_utils::test_bool_vector(&[true, false, true]);
+    let payload = paro_common::test_utils::test_chunk_from_vectors(vec![values, filters]);
+    assert!(unsafe { program.execute(&payload, &addresses, 3) }.unwrap());
     let sum = unsafe { &*base.add(sum_offset).cast::<DecimalNarrowState>() };
     let average = unsafe { &*base.add(average_offset).cast::<DecimalAverageState>() };
-    assert_eq!(sum.value(), 300);
+    assert_eq!(sum.value(), 100);
     assert_eq!(average.value(), i256::from(300));
     assert_eq!(average.count, 2);
     assert_eq!(unsafe { *base.add(count_offset).cast::<i64>() }, 2);
+}
+
+#[test]
+fn direct_decimal_program_observes_constant_zero_without_losing_sum_semantics() {
+    let input_type = LogicalType::Decimal {
+        precision: 15,
+        scale: 2,
+    };
+    let (sum, _) = bind_sum(std::slice::from_ref(&input_type)).unwrap();
+    let (average, _) = bind_avg(std::slice::from_ref(&input_type)).unwrap();
+    let sum_offset = 0;
+    let average_offset = std::mem::size_of::<DecimalNarrowState>();
+    let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(2);
+    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0), true));
+    assert!(program.try_add(1, average.direct_update, average_offset, Some(0), true));
+
+    let state_bytes = average_offset + std::mem::size_of::<DecimalAverageState>();
+    let mut storage = vec![0_u64; state_bytes.div_ceil(std::mem::size_of::<u64>())];
+    let base = storage.as_mut_ptr().cast::<u8>();
+    unsafe {
+        initialize_narrow(base.add(sum_offset));
+        initialize_average(base.add(average_offset));
+    }
+    let mut addresses = paro_common::test_utils::test_vector(LogicalType::BigInt);
+    addresses.set_count(3);
+    unsafe {
+        let address_data = addresses.flat_data_mut::<*mut u8>();
+        for row in 0..3 {
+            *address_data.add(row) = base;
+        }
+    }
+    let values = Vector::try_constant(input_type, 0_i64, 3, Arc::new(default_allocator())).unwrap();
+    let payload = paro_common::test_utils::test_chunk_from_vectors(vec![values]);
+
+    assert!(unsafe { program.execute(&payload, &addresses, 3) }.unwrap());
+    let sum = unsafe { &*base.add(sum_offset).cast::<DecimalNarrowState>() };
+    let average = unsafe { &*base.add(average_offset).cast::<DecimalAverageState>() };
+    assert!(sum.is_set());
+    assert_eq!(sum.value(), 0);
+    assert_eq!(average.value(), i256::ZERO);
+    assert_eq!(average.count, 3);
+}
+
+#[test]
+fn wide_direct_decimal_program_shares_constant_zero_lifecycle_semantics() {
+    let input_type = LogicalType::Decimal {
+        precision: 31,
+        scale: 4,
+    };
+    let (sum, _) = bind_sum(std::slice::from_ref(&input_type)).unwrap();
+    let (average, _) = bind_avg(std::slice::from_ref(&input_type)).unwrap();
+    let sum_offset = 0;
+    let average_offset = std::mem::size_of::<DecimalSumState>();
+    let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(2);
+    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0), true));
+    assert!(program.try_add(1, average.direct_update, average_offset, Some(0), true));
+
+    let state_bytes = average_offset + std::mem::size_of::<DecimalAverageState>();
+    let mut storage = vec![0_u64; state_bytes.div_ceil(std::mem::size_of::<u64>())];
+    let base = storage.as_mut_ptr().cast::<u8>();
+    unsafe {
+        initialize_sum(base.add(sum_offset));
+        initialize_average(base.add(average_offset));
+    }
+    let mut addresses = paro_common::test_utils::test_vector(LogicalType::BigInt);
+    addresses.set_count(3);
+    unsafe {
+        let address_data = addresses.flat_data_mut::<*mut u8>();
+        for row in 0..3 {
+            *address_data.add(row) = base;
+        }
+    }
+    let values =
+        Vector::try_constant(input_type, 0_i128, 3, Arc::new(default_allocator())).unwrap();
+    let payload = paro_common::test_utils::test_chunk_from_vectors(vec![values]);
+
+    assert!(unsafe { program.execute(&payload, &addresses, 3) }.unwrap());
+    let sum = unsafe { &*base.add(sum_offset).cast::<DecimalSumState>() };
+    let average = unsafe { &*base.add(average_offset).cast::<DecimalAverageState>() };
+    assert!(sum.is_set());
+    assert_eq!(sum.try_i128(), Some(0));
+    assert_eq!(average.value(), i256::ZERO);
+    assert_eq!(average.count, 3);
 }
 
 #[test]
@@ -331,14 +418,15 @@ fn reduced_direct_decimal_program_promotes_batch_totals_beyond_i128() {
     assert_eq!(average.count, 3);
 }
 
-unsafe fn finalize_single<T>(state: &mut T, data: &DecimalAggregateBindData) -> Result<Vector> {
+unsafe fn finalize_single<T>(
+    state: &mut T,
+    data: &DecimalAggregateBindData,
+    result_type: LogicalType,
+) -> Result<Vector> {
     let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
     states.set_count(1);
     *states.flat_data_mut::<*mut u8>() = state as *mut T as *mut u8;
-    let mut result = paro_common::test_utils::test_vector(LogicalType::Decimal {
-        precision: data.output_precision,
-        scale: data.output_scale,
-    });
+    let mut result = paro_common::test_utils::test_vector(result_type);
     result.set_count(1);
     let mut arena = ArenaAllocator::new(Arc::new(default_allocator()));
     let input_data = AggregateInputData::new(
@@ -394,13 +482,7 @@ fn decimal_aggregate_binding_preserves_exact_result_shapes() {
     );
 
     let (avg, _) = bind_avg(&[input]).unwrap();
-    assert_eq!(
-        avg.return_type,
-        LogicalType::Decimal {
-            precision: 38,
-            scale: 6
-        }
-    );
+    assert_eq!(avg.return_type, LogicalType::Double);
 
     let (wide_sum, _) = bind_sum(&[LogicalType::Decimal {
         precision: 38,
@@ -414,13 +496,7 @@ fn decimal_aggregate_binding_preserves_exact_result_shapes() {
         scale: 0,
     }])
     .unwrap();
-    assert_eq!(
-        wide_avg.return_type,
-        LogicalType::Decimal {
-            precision: 38,
-            scale: 0
-        }
-    );
+    assert_eq!(wide_avg.return_type, LogicalType::Double);
 }
 
 #[test]
@@ -456,7 +532,17 @@ fn decimal_sum_reports_declared_precision_overflow() {
     let mut state = initialized_sum_state();
     state.set_i128(10_i128.pow(38));
 
-    let error = unsafe { finalize_single(&mut state, &data) }.unwrap_err();
+    let error = unsafe {
+        finalize_single(
+            &mut state,
+            &data,
+            LogicalType::Decimal {
+                precision: data.output_precision,
+                scale: data.output_scale,
+            },
+        )
+    }
+    .unwrap_err();
     assert!(error
         .to_string()
         .contains("Decimal SUM result exceeds precision 38"));
@@ -835,6 +921,27 @@ fn decimal_avg_uses_wide_accumulator_before_division() {
     assert!(state.wide);
     assert!(state.value() > i256::from(i128::MAX));
 
-    let result = unsafe { finalize_single(&mut state, &data) }.unwrap();
-    assert_eq!(unsafe { result.get_fixed::<i128>(0) }, input);
+    let result = unsafe { finalize_single(&mut state, &data, LogicalType::Double) }.unwrap();
+    assert_eq!(unsafe { result.get_fixed::<f64>(0) }, input as f64);
+}
+
+#[test]
+fn decimal_avg_performs_one_final_scale_conversion_to_double() {
+    let data = DecimalAggregateBindData {
+        op: DecimalAggregateOp::Avg,
+        input_scale: 2,
+        output_precision: 38,
+        output_scale: 2,
+        output_limit: 10_i128.pow(38),
+        wide_sum: false,
+    };
+    let mut state = initialized_average_state();
+    for value in [3_507, 3_507, 3_506] {
+        update_average_state(&mut state, value);
+    }
+
+    let result = unsafe { finalize_single(&mut state, &data, LogicalType::Double) }.unwrap();
+    let average = unsafe { result.get_fixed::<f64>(0) };
+    assert_eq!(average.to_bits(), (10_520_f64 / 300_f64).to_bits());
+    assert_ne!(average.to_bits(), (10_520_f64 / 3_f64 / 100_f64).to_bits());
 }

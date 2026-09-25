@@ -74,3 +74,37 @@ ORDER BY o.id;
 o.id	o.label
 5	null_grp
 6	missing_grp
+
+SELECT o.id, o.label
+FROM subquery_exists_outer AS o
+WHERE EXISTS(
+  SELECT 1
+  FROM subquery_exists_lookup AS l
+  JOIN subquery_exists_lookup AS required
+    ON required.grp = l.grp
+   AND required.kind = 'open'
+  WHERE l.grp = o.grp
+)
+ORDER BY o.id;
+o.id	o.label
+1	alpha
+4	delta
+
+SELECT o.id, o.label
+FROM subquery_exists_outer AS o
+WHERE EXISTS(
+  SELECT 1
+  FROM subquery_exists_lookup AS l
+  WHERE l.grp = o.grp
+    AND l.kind = 'blocked'
+)
+OR EXISTS(
+  SELECT 1
+  FROM subquery_exists_lookup AS l
+  WHERE l.grp = o.grp
+    AND l.quota >= 6
+)
+ORDER BY o.id;
+o.id	o.label
+1	alpha
+4	delta

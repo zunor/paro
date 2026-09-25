@@ -21,7 +21,7 @@ use crate::rowset::encoding::{
 use crate::rowset::page::{
     EncodingType, NullEncoding, PageFooter, PageReadOptions, CURRENT_DATA_PAGE_FORMAT_VERSION,
 };
-use crate::rowset::page_reader::{DecodedPageAccess, PageReader};
+use crate::rowset::page_reader::{DecodedPageAccess, PageReader, BITSHUFFLE_DECODE_GROUP_ROWS};
 use crate::rowset::SegmentRowId;
 use bytes::Bytes;
 use paro_common::error::{self as paro_error, Result};
@@ -73,6 +73,18 @@ struct RowIdPageRun {
     span_start: u64,
     span_end: u64,
     span_len: usize,
+    decoded_groups: usize,
+    group_runs: usize,
+}
+
+impl RowIdPageRun {
+    fn decoded_page_access(self) -> DecodedPageAccess {
+        DecodedPageAccess::SparseGather {
+            selected_rows: self.run_end - self.run_start,
+            decoded_groups: self.decoded_groups,
+            group_runs: self.group_runs,
+        }
+    }
 }
 
 trait RowIdSequence {
@@ -547,6 +559,13 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         self.meta.is_nullable && self.meta.null_count != Some(0)
     }
 
+    fn padded_bitshuffle_rows(page_num_rows: u32) -> Result<usize> {
+        page_num_rows
+            .checked_add(7)
+            .map(|rows| (rows & !7) as usize)
+            .ok_or_else(|| paro_error::data_corrupted("BitShuffle page row count overflow"))
+    }
+
     /// Load a page by index.
     fn load_page(&mut self, page_idx: usize) -> Result<()> {
         let entry = self.ordinal_index.get_page(page_idx).ok_or_else(|| {
@@ -575,22 +594,57 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             prefetcher.record_consume(&page_key);
         }
 
-        if self.meta.encoding == EncodingType::BitShuffle
-            && (!self.meta.is_nullable || self.meta.null_count == Some(0))
-        {
+        if self.meta.encoding == EncodingType::BitShuffle {
             if let Some(decoded) = self.page_reader.lookup_decoded(page_pointer) {
                 let type_size = self.meta.type_size.ok_or_else(|| {
                     paro_error::internal("BitShuffle encoding requires type size")
                 })?;
-                let decoder = PageDecoderImpl::BitShuffle(
-                    BitShufflePageDecoder::from_decoded_data(page_num_rows, type_size, decoded)?,
-                );
+                let padded_rows = Self::padded_bitshuffle_rows(page_num_rows)?;
+                let data_size = padded_rows.checked_mul(type_size).ok_or_else(|| {
+                    paro_error::data_corrupted("decoded BitShuffle data size overflow")
+                })?;
+                let (decoded_data, null_decoder) = if self.column_may_have_nulls() {
+                    let expected_size = data_size.checked_add(padded_rows).ok_or_else(|| {
+                        paro_error::data_corrupted("decoded BitShuffle bundle size overflow")
+                    })?;
+                    if decoded.len() != expected_size {
+                        return Err(paro_error::data_corrupted(format!(
+                            "decoded nullable BitShuffle bundle has size {}, expected {expected_size}",
+                            decoded.len()
+                        )));
+                    }
+                    let decoded_nulls = decoded.slice(data_size..);
+                    (
+                        decoded.slice(..data_size),
+                        Some(PageDecoderImpl::BitShuffle(
+                            BitShufflePageDecoder::from_decoded_data(
+                                page_num_rows,
+                                1,
+                                decoded_nulls,
+                            )?,
+                        )),
+                    )
+                } else {
+                    if decoded.len() != data_size {
+                        return Err(paro_error::data_corrupted(format!(
+                            "decoded BitShuffle page has size {}, expected {data_size}",
+                            decoded.len()
+                        )));
+                    }
+                    (decoded, None)
+                };
+                let decoder =
+                    PageDecoderImpl::BitShuffle(BitShufflePageDecoder::from_decoded_data(
+                        page_num_rows,
+                        type_size,
+                        decoded_data,
+                    )?);
                 self.install_page(
                     page_idx,
                     first_ordinal,
                     page_pointer,
                     decoder,
-                    None,
+                    null_decoder,
                     false,
                     false,
                 );
@@ -694,6 +748,10 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         expected_num_elements: u32,
         page_pointer: crate::rowset::page::PagePointer,
     ) -> Result<PageDecoderImpl> {
+        let _cold_work = paro_common::cold_work::WorkScope::new(
+            paro_common::cold_work::Kind::Decoder,
+            data.len(),
+        );
         let mut decoder = match self.meta.encoding {
             EncodingType::Plain => {
                 if self.meta.field_type == crate::rowset::encoding::FieldType::Vector {
@@ -715,7 +773,12 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 let type_size = self.meta.type_size.ok_or_else(|| {
                     paro_error::internal("BitShuffle encoding requires type size")
                 })?;
-                let cached = self.page_reader.lookup_decoded(page_pointer);
+                // Nullable BitShuffle pages publish one atomic data+null
+                // bundle. `load_page` consumes that bundle before physical
+                // I/O; reaching this path means no complete bundle exists.
+                let cached = (!self.column_may_have_nulls())
+                    .then(|| self.page_reader.lookup_decoded(page_pointer))
+                    .flatten();
                 let decoder = if let Some(decoded) = cached {
                     BitShufflePageDecoder::with_decoded_data(
                         data,
@@ -860,10 +923,27 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         idx: &mut usize,
     ) -> Result<RowIdPageRun> {
         let page_idx = self.page_index_for_rowid(rowids.pair(*idx).1)?;
+        let page_start = self
+            .ordinal_index
+            .get_page(page_idx)
+            .ok_or_else(|| paro_error::data_corrupted("rowid page index disappeared"))?
+            .first_ordinal;
         let page_end = self.page_end_ordinal(page_idx);
         let run_start = *idx;
+        let mut previous_group =
+            (rowids.pair(*idx).1 - page_start) / BITSHUFFLE_DECODE_GROUP_ROWS as u64;
+        let mut decoded_groups = 1usize;
+        let mut group_runs = 1usize;
         *idx += 1;
         while *idx < rowids.len() && rowids.pair(*idx).1 < page_end {
+            let group = (rowids.pair(*idx).1 - page_start) / BITSHUFFLE_DECODE_GROUP_ROWS as u64;
+            if group != previous_group {
+                decoded_groups = decoded_groups.saturating_add(1);
+                if group != previous_group.saturating_add(1) {
+                    group_runs = group_runs.saturating_add(1);
+                }
+                previous_group = group;
+            }
             *idx += 1;
         }
 
@@ -878,6 +958,8 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             span_start,
             span_end,
             span_len,
+            decoded_groups,
+            group_runs,
         })
     }
 
@@ -992,6 +1074,57 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
     }
 
     fn prepare_page_access(&mut self, access: DecodedPageAccess) -> Result<()> {
+        let page_pointer = self.current_page_pointer.ok_or_else(|| {
+            paro_error::internal("loaded BitShuffle page is missing its physical pointer")
+        })?;
+        if self.column_may_have_nulls() {
+            let (current_decoder, current_null_decoder) =
+                (&mut self.current_decoder, &mut self.current_null_decoder);
+            let (
+                Some(PageDecoderImpl::BitShuffle(decoder)),
+                Some(PageDecoderImpl::BitShuffle(null_decoder)),
+            ) = (current_decoder.as_mut(), current_null_decoder.as_mut())
+            else {
+                // Old or alternate null encodings retain their physical-page
+                // fallback; a partial decoded entry would be ambiguous.
+                return Ok(());
+            };
+            if decoder.is_materialized() && null_decoder.is_materialized() {
+                return Ok(());
+            }
+            if !self.page_reader.should_materialize_decoded(
+                page_pointer,
+                access,
+                decoder.count() as usize,
+            ) {
+                if matches!(access, DecodedPageAccess::Sequential) {
+                    decoder.stream_sequential();
+                    null_decoder.stream_sequential();
+                }
+                return Ok(());
+            }
+            let data_size = decoder.decoded_size()?;
+            let null_size = null_decoder.decoded_size()?;
+            let decoded_size = data_size.checked_add(null_size).ok_or_else(|| {
+                paro_error::data_corrupted("decoded BitShuffle bundle size overflow")
+            })?;
+            if let Some(decoded) =
+                self.page_reader
+                    .cache_decoded_with(page_pointer, decoded_size, |destination| {
+                        let (data, nulls) = destination.split_at_mut(data_size);
+                        decoder.materialize_into(data)?;
+                        null_decoder.materialize_into(nulls)
+                    })?
+            {
+                decoder.install_decoded(decoded.slice(..data_size))?;
+                null_decoder.install_decoded(decoded.slice(data_size..))?;
+            } else if matches!(access, DecodedPageAccess::Sequential) {
+                decoder.materialize_all()?;
+                null_decoder.materialize_all()?;
+            }
+            return Ok(());
+        }
+
         let Some(decoder) = self
             .current_decoder
             .as_mut()
@@ -1003,13 +1136,14 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             return Ok(());
         }
 
-        let page_pointer = self.current_page_pointer.ok_or_else(|| {
-            paro_error::internal("loaded BitShuffle page is missing its physical pointer")
-        })?;
-        if !self
-            .page_reader
-            .should_materialize_decoded(page_pointer, access)
-        {
+        if !self.page_reader.should_materialize_decoded(
+            page_pointer,
+            access,
+            decoder.count() as usize,
+        ) {
+            if matches!(access, DecodedPageAccess::Sequential) {
+                decoder.stream_sequential();
+            }
             return Ok(());
         }
         let decoded_size = decoder.decoded_size()?;
@@ -1020,7 +1154,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 })?
         {
             decoder.install_decoded(decoded)?;
-        } else if access == DecodedPageAccess::Sequential {
+        } else if matches!(access, DecodedPageAccess::Sequential) {
             decoder.materialize_all()?;
         }
         Ok(())
@@ -1198,7 +1332,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
 
             self.seek_internal(row_run.span_start)?;
             page_run_seeks += 1;
-            if !self.ensure_page_loaded(DecodedPageAccess::SparseGather)? {
+            if !self.ensure_page_loaded(row_run.decoded_page_access())? {
                 return Err(paro_error::out_of_range(format!(
                     "rowid {} not found",
                     row_run.span_start
@@ -1407,7 +1541,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
 
             self.seek_internal(row_run.span_start)?;
             page_run_seeks += 1;
-            if !self.ensure_page_loaded(DecodedPageAccess::SparseGather)? {
+            if !self.ensure_page_loaded(row_run.decoded_page_access())? {
                 return Err(paro_error::out_of_range(format!(
                     "rowid {} not found",
                     row_run.span_start
@@ -1502,7 +1636,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
 
             self.seek_internal(row_run.span_start)?;
             page_run_seeks += 1;
-            if !self.ensure_page_loaded(DecodedPageAccess::SparseGather)? {
+            if !self.ensure_page_loaded(row_run.decoded_page_access())? {
                 return Err(paro_error::out_of_range(format!(
                     "rowid {} not found",
                     row_run.span_start
@@ -1510,18 +1644,50 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             }
 
             if matches!(self.current_decoder, Some(PageDecoderImpl::BitShuffle(_))) {
-                let span_nulls = if let Some(ref mut null_decoder) = self.current_null_decoder {
-                    let (null_count, null_bytes) = null_decoder.next_batch(row_run.span_len)?;
-                    if null_count != row_run.span_len {
-                        return Err(paro_error::data_corrupted(
-                            "Null map count mismatch with fixed-width row lookup",
-                        ));
-                    }
-                    Some(null_bytes)
-                } else {
-                    None
-                };
                 let page_start = self.current_page_first_ordinal;
+                let mut span_nulls = None;
+                if let Some(ref mut null_decoder) = self.current_null_decoder {
+                    match null_decoder {
+                        PageDecoderImpl::BitShuffle(null_decoder) => {
+                            let page_span_end = u32::try_from(row_run.span_end - page_start)
+                                .map_err(|_| {
+                                    paro_error::data_corrupted(
+                                        "BitShuffle null page row offset overflow",
+                                    )
+                                })?;
+                            if page_span_end >= null_decoder.count() {
+                                return Err(paro_error::data_corrupted(format!(
+                                    "BitShuffle null row span exceeds page: end={page_span_end}, count={}",
+                                    null_decoder.count()
+                                )));
+                            }
+                            if let Some(ref mut nulls_out) = result_nulls {
+                                // SAFETY: the row run was validated against
+                                // this page above, and every destination index
+                                // came from the request that sized nulls_out.
+                                unsafe {
+                                    null_decoder.gather_values_at_validated(
+                                        (row_run.run_start..row_run.run_end).map(|run_idx| {
+                                            let (orig_idx, rowid) = rowids.pair(run_idx);
+                                            ((rowid - page_start) as u32, orig_idx)
+                                        }),
+                                        nulls_out,
+                                    )?;
+                                }
+                            }
+                        }
+                        _ => {
+                            let (null_count, null_bytes) =
+                                null_decoder.next_batch(row_run.span_len)?;
+                            if null_count != row_run.span_len {
+                                return Err(paro_error::data_corrupted(
+                                    "Null map count mismatch with fixed-width row lookup",
+                                ));
+                            }
+                            span_nulls = Some(null_bytes);
+                        }
+                    }
+                }
                 let decoder = match self.current_decoder.as_mut() {
                     Some(PageDecoderImpl::BitShuffle(decoder)) => decoder,
                     _ => unreachable!("BitShuffle decoder checked above"),
@@ -1552,17 +1718,15 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 }
 
                 if let Some(ref mut nulls_out) = result_nulls {
-                    for run_idx in row_run.run_start..row_run.run_end {
-                        let (orig_idx, rowid) = rowids.pair(run_idx);
-                        let span_idx =
-                            usize::try_from(rowid - row_run.span_start).map_err(|_| {
-                                paro_error::data_corrupted("fixed-width null offset overflow")
-                            })?;
-                        nulls_out[orig_idx] = span_nulls
-                            .as_ref()
-                            .and_then(|nulls| nulls.get(span_idx))
-                            .copied()
-                            .unwrap_or(0);
+                    if let Some(span_nulls) = &span_nulls {
+                        for run_idx in row_run.run_start..row_run.run_end {
+                            let (orig_idx, rowid) = rowids.pair(run_idx);
+                            let span_idx =
+                                usize::try_from(rowid - row_run.span_start).map_err(|_| {
+                                    paro_error::data_corrupted("fixed-width null offset overflow")
+                                })?;
+                            nulls_out[orig_idx] = span_nulls.get(span_idx).copied().unwrap_or(0);
+                        }
                     }
                 }
 
@@ -1572,6 +1736,13 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 decoder.seek_to_position(u32::try_from(next_ordinal - page_start).map_err(
                     |_| paro_error::data_corrupted("BitShuffle page cursor overflow"),
                 )?)?;
+                if let Some(ref mut null_decoder) = self.current_null_decoder {
+                    null_decoder.seek_to_position(
+                        u32::try_from(next_ordinal - page_start).map_err(|_| {
+                            paro_error::data_corrupted("BitShuffle null page cursor overflow")
+                        })?,
+                    )?;
+                }
                 self.current_ordinal = next_ordinal;
                 continue;
             }
@@ -2198,6 +2369,97 @@ mod tests {
     }
 
     #[test]
+    fn sequential_streaming_does_not_materialize_even_without_cache_admission() {
+        for nullable in [false, true] {
+            for cache_enabled in [false, true] {
+                let opts = ColumnWriterOptions::new(FieldType::Int, 0)
+                    .with_nullable(nullable)
+                    .with_encoding(EncodingType::BitShuffle)
+                    .with_compression(CompressionType::None);
+                let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+                let values: Vec<i32> = (0..257).map(|i| i - 128).collect();
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let mut null_bits = vec![0u8; values.len().div_ceil(8)];
+                for i in (0..values.len()).step_by(7) {
+                    null_bits[i / 8] |= 1 << (i % 8);
+                }
+                writer
+                    .append(&bytes, nullable.then_some(null_bits.as_slice()), 257)
+                    .unwrap();
+                let meta = writer.finish().unwrap();
+                let physical = writer.into_inner().into_inner();
+                let index = Arc::new(OrdinalIndexReader::new(
+                    vec![OrdinalIndexEntry {
+                        first_ordinal: 0,
+                        page_pointer: meta.data_page_pointer,
+                    }],
+                    257,
+                ));
+                let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+                let mut options = PageReaderOptions {
+                    cache_decoded: cache_enabled,
+                    ..Default::default()
+                };
+                options.decoded_admission_policy.sequential_materialization = false;
+                let reader = PageReader::new(
+                    PageReaderContext::new(1, 2, 3, 4),
+                    cache_enabled.then_some(cache.clone()),
+                    options,
+                );
+                // Two independent iterators verify cold and repeated sequential reads.
+                for _ in 0..2 {
+                    let mut iterator = ScalarColumnIterator::new(
+                        ColumnReaderMeta::from_writer_meta(&meta, FieldType::Int),
+                        Cursor::new(physical.clone()),
+                        ColumnReaderOptions::default().with_compression(CompressionType::None),
+                        reader.clone(),
+                        None,
+                        None,
+                        index.clone(),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    let mut offset = 0;
+                    loop {
+                        let (count, batch) = iterator.next_batch(31).unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        for row in 0..count {
+                            let is_null = nullable && (offset + row) % 7 == 0;
+                            assert_eq!(batch.nulls.as_ref().is_some_and(|n| n[row] != 0), is_null);
+                            if !is_null {
+                                assert_eq!(
+                                    i32::from_le_bytes(
+                                        batch.data[row * 4..row * 4 + 4].try_into().unwrap()
+                                    ),
+                                    values[offset + row]
+                                );
+                            }
+                        }
+                        assert!(!iterator
+                            .current_decoder
+                            .as_mut()
+                            .unwrap()
+                            .decoded_cache_decoder_mut()
+                            .unwrap()
+                            .is_materialized());
+                        if let Some(PageDecoderImpl::BitShuffle(nulls)) =
+                            iterator.current_null_decoder.as_ref()
+                        {
+                            assert!(!nulls.is_materialized());
+                        }
+                        offset += count;
+                    }
+                    assert_eq!(offset, 257);
+                    assert_eq!(cache.stats().decoded_entries, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn decoded_cache_hit_bypasses_physical_page_for_all_valid_column() {
         let opts = ColumnWriterOptions::new(FieldType::Int, 0)
             .with_nullable(true)
@@ -2274,13 +2536,96 @@ mod tests {
     }
 
     #[test]
+    fn decoded_cache_bundle_bypasses_physical_page_for_nullable_column() {
+        let opts = ColumnWriterOptions::new(FieldType::Int, 0)
+            .with_nullable(true)
+            .with_encoding(EncodingType::BitShuffle)
+            .with_compression(CompressionType::None);
+        let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+        let values: Vec<i32> = (0..17).collect();
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let null_flags = [0b0010_0100, 0b0000_0001, 0];
+        writer
+            .append(&bytes, Some(&null_flags), values.len() as u32)
+            .unwrap();
+        let meta = writer.finish().unwrap();
+        assert_eq!(meta.null_count, 3);
+        let physical_page = writer.into_inner().into_inner();
+
+        let reader_meta = ColumnReaderMeta::from_writer_meta(&meta, FieldType::Int);
+        let ordinal_index = OrdinalIndexReader::new(
+            vec![OrdinalIndexEntry {
+                first_ordinal: 0,
+                page_pointer: meta.data_page_pointer,
+            }],
+            values.len() as u64,
+        );
+        let page_cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        let page_reader = PageReader::new(
+            PageReaderContext::new(1, 2, 3, 4),
+            Some(page_cache.clone()),
+            PageReaderOptions {
+                cache_decoded: true,
+                ..PageReaderOptions::default()
+            },
+        );
+        let reader_options = ColumnReaderOptions::default().with_compression(CompressionType::None);
+
+        let mut first = ScalarColumnIterator::new(
+            reader_meta.clone(),
+            Cursor::new(physical_page),
+            reader_options.clone(),
+            page_reader.clone(),
+            None,
+            None,
+            Arc::new(ordinal_index.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+        let (_, expected) = first.next_batch(values.len()).unwrap();
+        assert_eq!(page_cache.stats().decoded_entries, 1);
+
+        // The cached logical bundle owns both fixed-width values and decoded
+        // null flags, so no page footer or compressed body is needed here.
+        let mut cached = ScalarColumnIterator::new(
+            reader_meta,
+            Cursor::new(Vec::new()),
+            reader_options,
+            page_reader,
+            None,
+            None,
+            Arc::new(ordinal_index),
+            None,
+            None,
+        )
+        .unwrap();
+        let (count, actual) = cached.next_batch(values.len()).unwrap();
+        assert_eq!(count, values.len());
+        assert_eq!(actual.data, expected.data);
+        assert_eq!(actual.nulls, expected.nulls);
+        assert_eq!(
+            actual
+                .nulls
+                .unwrap()
+                .iter()
+                .filter(|&&flag| flag != 0)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
     fn sparse_gather_uses_probation_before_decoded_cache_promotion() {
         let opts = ColumnWriterOptions::new(FieldType::Int, 0)
             .with_nullable(false)
             .with_encoding(EncodingType::BitShuffle)
             .with_compression(CompressionType::None);
         let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
-        let values: Vec<i32> = (0..128).collect();
+        let values: Vec<i32> = (0..4096).collect();
         let bytes = values
             .iter()
             .flat_map(|value| value.to_le_bytes())
@@ -2319,14 +2664,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let gathered = gather.read_by_rowids(&[3, 97]).unwrap();
+        let gathered = gather.read_by_rowids(&[3, 4090]).unwrap();
         assert_eq!(
             gathered
                 .data
                 .chunks_exact(4)
                 .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect::<Vec<_>>(),
-            [3, 97]
+            [3, 4090]
         );
         assert_eq!(page_cache.stats().decoded_entries, 0);
 
@@ -2342,7 +2687,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let repeated = repeated_gather.read_by_rowids(&[3, 97]).unwrap();
+        let repeated = repeated_gather.read_by_rowids(&[3, 4090]).unwrap();
         assert_eq!(repeated.data, gathered.data);
         assert_eq!(page_cache.stats().decoded_entries, 1);
 

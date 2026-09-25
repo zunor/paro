@@ -1,0 +1,1043 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+//! Enumerate candidate join orders with DPccp and a greedy fallback.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use paro_common::logging::targets;
+use tracing::debug;
+
+use crate::cost::region::RegionCostModel;
+use crate::region::join::candidate::DPJoinNode;
+use crate::region::join::query_graph::{
+    CutPredicateResolution, JoinPredicateSet, NeighborInfo, QueryGraphEdges,
+};
+use crate::region::join::relation::{JoinRelationSet, JoinRelationSetManager};
+
+/// Terminal state of one enumeration strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnumerationOutcome {
+    Complete,
+    /// A plan was produced by a bounded/greedy strategy, but the declared
+    /// search domain was not exhausted.  This is usable as an anytime seed,
+    /// never as an exact join-order proof.
+    Approximate,
+    PairBudgetExhausted,
+    Ineligible,
+    MissingSubplan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PairEmission {
+    Emitted(Arc<JoinRelationSet>),
+    MissingInput,
+    Ineligible,
+}
+
+/// The PlanEnumerator performs join order optimization using dynamic programming.
+///
+pub(crate) struct PlanEnumerator<'a> {
+    /// The query graph containing edges between relations.
+    query_graph: &'a QueryGraphEdges,
+    /// The set manager for creating/looking up relation sets.
+    set_manager: &'a mut JoinRelationSetManager,
+    /// The cost model for evaluating join costs.
+    cost_model: &'a mut RegionCostModel,
+    /// Number of relations in the query.
+    num_relations: usize,
+    /// Bounded non-dominated work/memory frontier for each relation set.
+    plans: HashMap<Arc<JoinRelationSet>, Vec<DPJoinNode>>,
+    /// The total number of join pairs considered.
+    pairs: usize,
+    exact_relation_limit: usize,
+    max_pairs: usize,
+    max_frontier_size: usize,
+    frontier_truncated: bool,
+}
+
+impl super::connected::ConnectedRegion for PlanEnumerator<'_> {
+    fn relations(&self) -> usize {
+        self.num_relations
+    }
+    fn graph(&self) -> &QueryGraphEdges {
+        self.query_graph
+    }
+    fn sets(&mut self) -> &mut JoinRelationSetManager {
+        self.set_manager
+    }
+    fn contains(&self, set: &Arc<JoinRelationSet>) -> bool {
+        self.plans.contains_key(set)
+    }
+    fn emit(
+        &mut self,
+        left: &Arc<JoinRelationSet>,
+        right: &Arc<JoinRelationSet>,
+        connections: &[NeighborInfo],
+    ) -> EnumerationOutcome {
+        self.try_emit_pair(left, right, connections)
+    }
+}
+
+impl<'a> PlanEnumerator<'a> {
+    /// Create a new PlanEnumerator.
+    #[cfg(test)]
+    pub fn new(
+        query_graph: &'a QueryGraphEdges,
+        set_manager: &'a mut JoinRelationSetManager,
+        cost_model: &'a mut RegionCostModel,
+        num_relations: usize,
+    ) -> Self {
+        Self::with_budget(
+            query_graph,
+            set_manager,
+            cost_model,
+            num_relations,
+            12,
+            10_000,
+            4,
+        )
+    }
+
+    pub fn with_budget(
+        query_graph: &'a QueryGraphEdges,
+        set_manager: &'a mut JoinRelationSetManager,
+        cost_model: &'a mut RegionCostModel,
+        num_relations: usize,
+        exact_relation_limit: usize,
+        max_pairs: usize,
+        max_frontier_size: usize,
+    ) -> Self {
+        Self {
+            query_graph,
+            set_manager,
+            cost_model,
+            num_relations,
+            plans: HashMap::new(),
+            pairs: 0,
+            exact_relation_limit,
+            max_pairs,
+            max_frontier_size: max_frontier_size.max(1),
+            frontier_truncated: false,
+        }
+    }
+
+    /// Initialize leaf plans (single relations).
+    pub fn init_leaf_plans(&mut self) {
+        for i in 0..self.num_relations {
+            let set = self.set_manager.get_relation(i);
+            let cardinality = self.cost_model.get_cardinality(&set);
+            let risk_cardinality = self.cost_model.get_risk_cardinality(&set);
+            let materialization_cardinality = self.cost_model.get_materialization_cardinality(&set);
+            let mut node = DPJoinNode::leaf(
+                set.clone(),
+                self.cost_model.payload_width(set.as_ref()),
+                cardinality,
+                risk_cardinality,
+                materialization_cardinality,
+            );
+
+            node.cardinality_provenance = self.cost_model.relation_provenance(i);
+            self.plans.insert(set, vec![node]);
+        }
+    }
+
+    /// Solve the join order using dynamic programming.
+    ///
+    pub fn solve_join_order(&mut self) -> EnumerationOutcome {
+        // For small graphs, try exact algorithm first
+        if self.num_relations <= self.exact_relation_limit {
+            match self.solve_join_order_exactly() {
+                EnumerationOutcome::Complete => {
+                    // Exact DP must retain the whole non-dominated frontier.
+                    // A bounded resident frontier is an anytime policy, not
+                    // an admissible proof that no discarded plan can improve
+                    // a parent under another resource grant.
+                    if self.frontier_truncated {
+                        return EnumerationOutcome::Approximate;
+                    }
+                    // Check if we got a final plan
+                    let mut all_relations = HashSet::new();
+                    for i in 0..self.num_relations {
+                        all_relations.insert(i);
+                    }
+                    let total_set = self.set_manager.get_relation_from_set(&all_relations);
+
+                    if let Some(final_plan) =
+                        self.plans.get(&total_set).and_then(|plans| plans.first())
+                    {
+                        debug!(
+                            target: targets::OPTIMIZER,
+                            relations = self.num_relations,
+                            pairs = self.pairs,
+                            left = %final_plan.left_set,
+                            right = %final_plan.right_set,
+                            cardinality = final_plan.cardinality,
+                            cost = final_plan.cost,
+                            "Completed exact join-order enumeration"
+                        );
+                        return EnumerationOutcome::Complete;
+                    }
+                }
+                EnumerationOutcome::Ineligible => return EnumerationOutcome::Ineligible,
+                EnumerationOutcome::MissingSubplan => {
+                    return EnumerationOutcome::MissingSubplan;
+                }
+                EnumerationOutcome::Approximate => return EnumerationOutcome::Approximate,
+                EnumerationOutcome::PairBudgetExhausted => {}
+            }
+        }
+
+        // Exact DP state is all-or-nothing. Greedy enumeration starts from the
+        // authoritative leaves instead of accidentally depending on whichever
+        // composite sets happened to fit inside the pair budget.
+        self.plans.retain(|set, _| set.count() == 1);
+        // Fall back to approximate algorithm
+        debug!(
+            target: targets::OPTIMIZER,
+            relations = self.num_relations,
+            exact_pairs = self.pairs,
+            "Falling back to greedy join-order enumeration"
+        );
+        self.pairs = 0;
+        self.solve_join_order_approximately()
+    }
+
+    /// Get the optimal plans.
+    pub fn get_plans(&self) -> &HashMap<Arc<JoinRelationSet>, Vec<DPJoinNode>> {
+        &self.plans
+    }
+
+    /// Get the final plan for all relations.
+    #[cfg(test)]
+    pub fn get_final_plan(&mut self) -> Option<&DPJoinNode> {
+        let mut all_relations = HashSet::new();
+        for i in 0..self.num_relations {
+            all_relations.insert(i);
+        }
+        let total_set = self.set_manager.get_relation_from_set(&all_relations);
+        self.plans.get(&total_set).and_then(|plans| plans.first())
+    }
+
+    pub fn get_final_plans(&mut self) -> &[DPJoinNode] {
+        let mut all_relations = HashSet::new();
+        for i in 0..self.num_relations {
+            all_relations.insert(i);
+        }
+        let total_set = self.set_manager.get_relation_from_set(&all_relations);
+        self.plans.get(&total_set).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    // Private methods
+
+    /// Solve join order exactly using dynamic programming.
+    fn solve_join_order_exactly(&mut self) -> EnumerationOutcome {
+        let outcome = super::connected::enumerate(self);
+        if outcome != EnumerationOutcome::Complete {
+            return outcome;
+        }
+
+        // DPccp intentionally enumerates connected cuts.  A two-relation
+        // Cartesian region has no graph neighbor to emit, but its only legal
+        // binary tree is still an exact result. Keep this small completion
+        // case in the exact path instead of silently delegating it to the
+        // greedy seed path.
+        if self.num_relations == 2 {
+            let left = self.set_manager.get_relation(0);
+            let right = self.set_manager.get_relation(1);
+            let total = self.set_manager.union(&left, &right);
+            if !self.plans.contains_key(&total) {
+                let outcome = self.try_emit_pair(&left, &right, &[]);
+                if outcome != EnumerationOutcome::Complete {
+                    return outcome;
+                }
+            }
+        }
+        EnumerationOutcome::Complete
+    }
+
+    /// Try to emit a pair of relations.
+    ///
+    /// Returns an explicit terminal state rather than overloading a timeout
+    /// boolean with query-graph ineligibility.
+    fn try_emit_pair(
+        &mut self,
+        left: &Arc<JoinRelationSet>,
+        right: &Arc<JoinRelationSet>,
+        connections: &[NeighborInfo],
+    ) -> EnumerationOutcome {
+        self.pairs += 1;
+        if self.pairs > self.max_pairs {
+            return EnumerationOutcome::PairBudgetExhausted;
+        }
+
+        match self.emit_pair(left, right, connections) {
+            PairEmission::Emitted(_) => EnumerationOutcome::Complete,
+            // Exact DP can discover a connected cut before both component
+            // plans have been emitted. That pair is deferred, not rejected;
+            // later CSG/CMP traversal may revisit it once its inputs exist.
+            PairEmission::MissingInput => EnumerationOutcome::Complete,
+            PairEmission::Ineligible => EnumerationOutcome::Ineligible,
+        }
+    }
+
+    /// Emit a pair of relations and create a join node.
+    fn emit_pair(
+        &mut self,
+        left: &Arc<JoinRelationSet>,
+        right: &Arc<JoinRelationSet>,
+        connections: &[NeighborInfo],
+    ) -> PairEmission {
+        // Get the left and right plans
+        let left_plans = match self.plans.get(left) {
+            Some(plans) => plans.clone(),
+            None => return PairEmission::MissingInput,
+        };
+
+        let right_plans = match self.plans.get(right) {
+            Some(plans) => plans.clone(),
+            None => return PairEmission::MissingInput,
+        };
+
+        let mut new_set = None;
+        for left_plan in &left_plans {
+            for right_plan in &right_plans {
+                // Costing owns the canonical union and cardinality estimate
+                // for this pair; reuse its set instead of hashing the same
+                // bitset twice.
+                let Some(new_node) = self.create_join_tree(left_plan, right_plan, connections)
+                else {
+                    return PairEmission::Ineligible;
+                };
+                let set = Arc::clone(&new_node.set);
+                self.insert_frontier(set.clone(), new_node);
+                new_set = Some(set);
+            }
+        }
+        new_set
+            .map(PairEmission::Emitted)
+            .unwrap_or(PairEmission::MissingInput)
+    }
+
+    fn insert_frontier(&mut self, set: Arc<JoinRelationSet>, candidate: DPJoinNode) {
+        let frontier = self.plans.entry(set).or_default();
+        let candidate_shape = candidate.compact_shape();
+        if frontier.iter().any(|existing| {
+            existing.cost <= candidate.cost
+                && existing.peak_build_bytes <= candidate.peak_build_bytes
+                && (existing.cost < candidate.cost
+                    || existing.peak_build_bytes < candidate.peak_build_bytes
+                    || existing.compact_shape() <= candidate_shape)
+        }) {
+            return;
+        }
+        frontier.retain(|existing| {
+            !(candidate.cost <= existing.cost
+                && candidate.peak_build_bytes <= existing.peak_build_bytes)
+                || (candidate.cost == existing.cost
+                    && candidate.peak_build_bytes == existing.peak_build_bytes
+                    && candidate_shape > existing.compact_shape())
+        });
+        frontier.push(candidate);
+        frontier.sort_by(|left, right| {
+            left.cost
+                .total_cmp(&right.cost)
+                .then_with(|| left.peak_build_bytes.cmp(&right.peak_build_bytes))
+                .then_with(|| left.compact_shape().cmp(right.compact_shape()))
+        });
+        // The resident cap is an explicit anytime policy. It can produce a
+        // useful seed, but it is never evidence that the discarded frontier
+        // members cannot improve a parent under another resource grant.
+        if frontier.len() > self.max_frontier_size {
+            self.frontier_truncated = true;
+            let lowest_memory = frontier
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, plan)| plan.peak_build_bytes)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            if lowest_memory >= self.max_frontier_size {
+                let low_memory_plan = frontier.remove(lowest_memory);
+                frontier.truncate(self.max_frontier_size - 1);
+                frontier.push(low_memory_plan);
+            } else {
+                frontier.truncate(self.max_frontier_size);
+            }
+            frontier.sort_by(|left, right| {
+                left.cost
+                    .total_cmp(&right.cost)
+                    .then_with(|| left.peak_build_bytes.cmp(&right.peak_build_bytes))
+                    .then_with(|| left.compact_shape().cmp(right.compact_shape()))
+            });
+        }
+    }
+
+    fn create_join_tree(
+        &mut self,
+        left: &DPJoinNode,
+        right: &DPJoinNode,
+        connections: &[NeighborInfo],
+    ) -> Option<DPJoinNode> {
+        let predicates = match Self::collect_cut_predicates(connections, &left.set, &right.set) {
+            CutPredicateResolution::Resolved(predicates) => predicates,
+            CutPredicateResolution::Ineligible => return None,
+        };
+
+        Some(self.cost_model.compute_cost_and_create_node(
+            left,
+            right,
+            self.set_manager,
+            predicates,
+        ))
+    }
+
+    fn collect_cut_predicates(
+        connections: &[NeighborInfo],
+        left: &JoinRelationSet,
+        right: &JoinRelationSet,
+    ) -> CutPredicateResolution {
+        JoinPredicateSet::from_filters(
+            connections
+                .iter()
+                .flat_map(|connection| &connection.filters),
+            left,
+            right,
+        )
+    }
+
+    /// Solve join order approximately using a greedy algorithm.
+    fn solve_join_order_approximately(&mut self) -> EnumerationOutcome {
+        // Start with all base relations
+        let mut join_relations: Vec<Arc<JoinRelationSet>> = (0..self.num_relations)
+            .map(|i| self.set_manager.get_relation(i))
+            .collect();
+
+        while join_relations.len() > 1 {
+            let mut best_left = 0;
+            let mut best_right = 0;
+            let mut best_cost = f64::MAX;
+            let mut best_set = None;
+            let mut found_connection = false;
+
+            // Find the best pair to join
+            for i in 0..join_relations.len() {
+                for j in (i + 1)..join_relations.len() {
+                    self.pairs = self.pairs.saturating_add(1);
+                    if self.pairs > self.max_pairs {
+                        return EnumerationOutcome::PairBudgetExhausted;
+                    }
+                    let connections = self
+                        .query_graph
+                        .get_connections(&join_relations[i], &join_relations[j]);
+
+                    if !connections.is_empty() {
+                        let combined = match self.emit_pair(
+                            &join_relations[i],
+                            &join_relations[j],
+                            &connections,
+                        ) {
+                            PairEmission::Emitted(combined) => combined,
+                            PairEmission::MissingInput => {
+                                return EnumerationOutcome::MissingSubplan;
+                            }
+                            PairEmission::Ineligible => return EnumerationOutcome::Ineligible,
+                        };
+                        if let Some(node) =
+                            self.plans.get(&combined).and_then(|plans| plans.first())
+                        {
+                            if node.cost < best_cost {
+                                best_cost = node.cost;
+                                best_left = i;
+                                best_right = j;
+                                best_set = Some(Arc::clone(&combined));
+                                found_connection = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !found_connection {
+                // Fallback: just pick first two
+                best_left = 0;
+                best_right = 1;
+                let combined = match self.emit_pair(
+                    &join_relations[best_left],
+                    &join_relations[best_right],
+                    &[],
+                ) {
+                    PairEmission::Emitted(combined) => combined,
+                    PairEmission::MissingInput => return EnumerationOutcome::MissingSubplan,
+                    PairEmission::Ineligible => return EnumerationOutcome::Ineligible,
+                };
+                best_set = Some(combined);
+            }
+
+            // Ensure best_right > best_left for removal
+            if best_left > best_right {
+                std::mem::swap(&mut best_left, &mut best_right);
+            }
+
+            // Update join_relations
+            let Some(new_set) = best_set else {
+                return EnumerationOutcome::MissingSubplan;
+            };
+            join_relations.remove(best_right);
+            join_relations.remove(best_left);
+            join_relations.push(new_set);
+        }
+        // Greedy enumeration intentionally returns a seed only.  Callers may
+        // execute it as an anytime candidate, but must not advertise it as a
+        // complete proof of the declared join search space.
+        EnumerationOutcome::Approximate
+    }
+}
+
+/// Get all non-empty subsets of a set of neighbors.
+///
+/// This generates all 2^n - 1 subsets of the input set.
+pub(crate) fn get_all_neighbor_sets(mut neighbors: Vec<usize>) -> Vec<Vec<usize>> {
+    neighbors.sort();
+
+    // Keep the historical cardinality/lexicographic order, but represent a
+    // subset as a compact sorted Vec. The old HashSet implementation cloned
+    // every partial set at every level and then sorted it again in the set
+    // manager. Join-region enumeration invokes this helper for thousands of
+    // cuts, so the temporary hash tables became a measurable allocation
+    // stream without adding any search coverage.
+    let mut result = Vec::with_capacity(if neighbors.len() < usize::BITS as usize {
+        (1usize << neighbors.len()).saturating_sub(1)
+    } else {
+        0
+    });
+    for size in 1..=neighbors.len() {
+        append_neighbor_subsets(
+            &neighbors,
+            0,
+            size,
+            &mut Vec::with_capacity(size),
+            &mut result,
+        );
+    }
+    result
+}
+
+fn append_neighbor_subsets(
+    neighbors: &[usize],
+    start: usize,
+    remaining: usize,
+    current: &mut Vec<usize>,
+    output: &mut Vec<Vec<usize>>,
+) {
+    if remaining == 0 {
+        output.push(current.clone());
+        return;
+    }
+    let last_start = neighbors.len().saturating_sub(remaining);
+    for index in start..=last_start {
+        current.push(neighbors[index]);
+        append_neighbor_subsets(neighbors, index + 1, remaining - 1, current, output);
+        current.pop();
+    }
+}
+
+/// Add supersets by adding one more neighbor to each existing set.
+#[cfg(test)]
+fn add_super_sets(current: &[HashSet<usize>], all_neighbors: &[usize]) -> Vec<HashSet<usize>> {
+    let mut result = Vec::new();
+
+    for neighbor_set in current {
+        let max_val = neighbor_set.iter().max().copied().unwrap_or(0);
+
+        for &neighbor in all_neighbors {
+            if neighbor <= max_val {
+                continue;
+            }
+            if !neighbor_set.contains(&neighbor) {
+                let mut new_set = neighbor_set.clone();
+                new_set.insert(neighbor);
+                result.push(new_set);
+            }
+        }
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::region::join::query_graph::FilterInfo;
+    use crate::region::join::relation_manager::{DistinctCount, RelationStats};
+    use paro_common::types::LogicalType;
+    use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ComparisonType};
+    use paro_planner::logical::operator::{AntiJoinMode, ColumnBinding, JoinType};
+
+    fn column_distinct_counts(
+        table_index: usize,
+        counts: impl IntoIterator<Item = DistinctCount>,
+    ) -> HashMap<ColumnBinding, DistinctCount> {
+        counts
+            .into_iter()
+            .enumerate()
+            .map(|(column_index, count)| (ColumnBinding::new(table_index, column_index), count))
+            .collect()
+    }
+
+    fn create_column_ref(
+        table_index: usize,
+        column_index: usize,
+    ) -> paro_planner::expression::Expression {
+        paro_planner::expression::Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::logical::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
+    }
+
+    fn create_equality_filter(
+        set_manager: &mut JoinRelationSetManager,
+        left_table: usize,
+        left_col: usize,
+        right_table: usize,
+        right_col: usize,
+        filter_index: usize,
+    ) -> Arc<FilterInfo> {
+        let expr = paro_planner::expression::Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(left_table, left_col)),
+                right: Box::new(create_column_ref(right_table, right_col)),
+                comparison_type: ComparisonType::Equal,
+            }
+            .into(),
+        );
+
+        let set = set_manager.get_relation_from_vec(vec![left_table, right_table]);
+        let left_set = set_manager.get_relation(left_table);
+        let right_set = set_manager.get_relation(right_table);
+
+        let mut filter = FilterInfo::new_inner(expr, set, filter_index);
+        filter.set_left_set(left_set);
+        filter.set_right_set(right_set);
+        filter.set_left_binding(ColumnBinding::new(left_table, left_col), left_table);
+        filter.set_right_binding(ColumnBinding::new(right_table, right_col), right_table);
+
+        Arc::new(filter)
+    }
+
+    fn create_reduction_filter(
+        set_manager: &mut JoinRelationSetManager,
+        preserved: usize,
+        filtering: usize,
+        filter_index: usize,
+    ) -> Arc<FilterInfo> {
+        let expression = paro_planner::expression::Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(preserved, 0)),
+                right: Box::new(create_column_ref(filtering, 0)),
+                comparison_type: ComparisonType::Equal,
+            }
+            .into(),
+        );
+        let set = set_manager
+            .get_relation_from_vec(vec![preserved.min(filtering), preserved.max(filtering)]);
+        let mut filter = FilterInfo::new(
+            expression,
+            set,
+            filter_index,
+            JoinType::Semi,
+            AntiJoinMode::Regular,
+        );
+        filter.set_left_set(set_manager.get_relation(preserved));
+        filter.set_right_set(set_manager.get_relation(filtering));
+        Arc::new(filter)
+    }
+
+    #[test]
+    fn join_cut_collects_all_crossing_predicates_once() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let filter_ab = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
+        let filter_ac = create_equality_filter(&mut set_manager, 0, 1, 2, 0, 1);
+        let connections = vec![
+            NeighborInfo {
+                neighbor: set_manager.get_relation(1),
+                filters: vec![Arc::clone(&filter_ab)],
+            },
+            NeighborInfo {
+                neighbor: set_manager.get_relation(2),
+                filters: vec![filter_ab, filter_ac],
+            },
+        ];
+
+        let left = set_manager.get_relation(0);
+        let right = set_manager.get_relation_from_vec(vec![1, 2]);
+        let CutPredicateResolution::Resolved(Some(predicates)) =
+            PlanEnumerator::collect_cut_predicates(&connections, &left, &right)
+        else {
+            panic!("join cut should contain valid predicates")
+        };
+
+        assert_eq!(predicates.predicates().len(), 2);
+        assert_eq!(predicates.predicates()[0].filter().filter_index, 0);
+        assert_eq!(predicates.predicates()[1].filter().filter_index, 1);
+    }
+
+    #[test]
+    fn ineligible_exact_cut_does_not_fall_through_to_greedy_state() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let forward = create_reduction_filter(&mut set_manager, 0, 1, 0);
+        let inverted = create_reduction_filter(&mut set_manager, 1, 0, 1);
+        let left = set_manager.get_relation(0);
+        let right = set_manager.get_relation(1);
+        let mut query_graph = QueryGraphEdges::new();
+        for filter in [forward, inverted] {
+            query_graph.create_edge(&left, Arc::clone(&right), Some(Arc::clone(&filter)));
+            query_graph.create_edge(&right, Arc::clone(&left), Some(filter));
+        }
+        let mut cost_model =
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+        cost_model.init_cost_model(
+            &mut set_manager,
+            &[
+                RelationStats::with_cardinality(10),
+                RelationStats::with_cardinality(10),
+            ],
+        );
+        let mut enumerator =
+            PlanEnumerator::new(&query_graph, &mut set_manager, &mut cost_model, 2);
+        enumerator.init_leaf_plans();
+
+        assert_eq!(
+            enumerator.solve_join_order(),
+            EnumerationOutcome::Ineligible
+        );
+        assert_eq!(
+            enumerator.plans.len(),
+            2,
+            "an ineligible exact region must leave only authoritative leaf plans"
+        );
+    }
+
+    #[test]
+    fn test_get_all_neighbor_sets() {
+        let neighbors = vec![1, 2, 3];
+        let sets = get_all_neighbor_sets(neighbors);
+
+        // Should have 2^3 - 1 = 7 subsets
+        assert_eq!(sets.len(), 7);
+    }
+
+    #[test]
+    fn test_get_all_neighbor_sets_single() {
+        let neighbors = vec![1];
+        let sets = get_all_neighbor_sets(neighbors);
+
+        assert_eq!(sets.len(), 1);
+        assert!(sets[0].contains(&1));
+    }
+
+    #[test]
+    fn test_add_super_sets() {
+        let mut set1 = HashSet::new();
+        set1.insert(1);
+
+        let current = vec![set1];
+        let all_neighbors = vec![1, 2, 3];
+
+        let result = add_super_sets(&current, &all_neighbors);
+
+        // Should add {1,2} and {1,3}
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_plan_enumerator_init_leaf_plans() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model =
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+        let query_graph = QueryGraphEdges::new();
+
+        // Initialize cost model
+        let stats = vec![
+            RelationStats::with_cardinality(1000),
+            RelationStats::with_cardinality(500),
+        ];
+        cost_model.init_cost_model(&mut set_manager, &stats);
+
+        let mut enumerator =
+            PlanEnumerator::new(&query_graph, &mut set_manager, &mut cost_model, 2);
+        enumerator.init_leaf_plans();
+
+        assert_eq!(enumerator.plans.len(), 2);
+
+        // Get the key before borrowing enumerator
+        let set0_key = enumerator.set_manager.get_relation(0);
+
+        let plan0 = enumerator.plans.get(&set0_key).unwrap();
+        assert!(plan0[0].is_leaf);
+        assert_eq!(plan0[0].cardinality, 1000.0);
+    }
+
+    #[test]
+    fn greedy_missing_input_is_not_reported_as_semantic_ineligibility() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model =
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+        let query_graph = QueryGraphEdges::new();
+        cost_model.init_cost_model(
+            &mut set_manager,
+            &[
+                RelationStats::with_cardinality(10),
+                RelationStats::with_cardinality(10),
+            ],
+        );
+        let mut enumerator =
+            PlanEnumerator::new(&query_graph, &mut set_manager, &mut cost_model, 2);
+        enumerator.init_leaf_plans();
+        let missing = enumerator.set_manager.get_relation(1);
+        enumerator.plans.remove(&missing);
+
+        assert_eq!(
+            enumerator.solve_join_order_approximately(),
+            EnumerationOutcome::MissingSubplan
+        );
+    }
+
+    #[test]
+    fn calibrated_region_matches_independent_exhaustive_bipartitions() {
+        // Enumerate every labelled binary tree independently of DPccp's
+        // neighbor traversal and frontier admission. The cost kernel is the
+        // common contract, not a second implementation of physical costing.
+        fn exhaustive(
+            mask: u8,
+            leaves: &[DPJoinNode],
+            filters: &[Arc<FilterInfo>],
+            sets: &mut JoinRelationSetManager,
+            costs: &mut RegionCostModel,
+        ) -> Vec<DPJoinNode> {
+            if mask.count_ones() == 1 {
+                return vec![leaves[mask.trailing_zeros() as usize].clone()];
+            }
+            let mut result = Vec::new();
+            let mut left_mask = (mask - 1) & mask;
+            while left_mask != 0 {
+                let right_mask = mask ^ left_mask;
+                if left_mask < right_mask {
+                    let left = exhaustive(left_mask, leaves, filters, sets, costs);
+                    let right = exhaustive(right_mask, leaves, filters, sets, costs);
+                    for a in &left {
+                        for b in &right {
+                            if let CutPredicateResolution::Resolved(Some(predicates)) =
+                                JoinPredicateSet::from_filters(filters, &a.set, &b.set)
+                            {
+                                result.push(costs.compute_cost_and_create_node(
+                                    a,
+                                    b,
+                                    sets,
+                                    Some(predicates),
+                                ));
+                            }
+                        }
+                    }
+                }
+                left_mask = (left_mask - 1) & mask;
+            }
+            result
+        }
+        for rows in [[10, 200, 3, 800], [1000, 2, 400, 30]] {
+            let mut sets = JoinRelationSetManager::new();
+            let mut costs = RegionCostModel::new(Default::default());
+            costs.regional_pricing = Some(
+                crate::cost::join::JoinWorkPricing::new(
+                    &crate::cost::calibration::MachineCalibrationBundle::builtin_production(),
+                )
+                .unwrap(),
+            );
+            let mut graph = QueryGraphEdges::new();
+            let mut filters = Vec::new();
+            for a in 0..4 {
+                for b in a + 1..4 {
+                    let filter = create_equality_filter(&mut sets, a, 0, b, 0, filters.len());
+                    let left = sets.get_relation(a);
+                    let right = sets.get_relation(b);
+                    graph.create_edge(&left, right.clone(), Some(filter.clone()));
+                    graph.create_edge(&right, left, Some(filter.clone()));
+                    filters.push(filter);
+                }
+            }
+            costs.init_equivalent_relations(&filters);
+            costs.init_cost_model(&mut sets, &rows.map(RelationStats::with_cardinality));
+            let mut dp =
+                PlanEnumerator::with_budget(&graph, &mut sets, &mut costs, 4, 12, 10_000, 1024);
+            dp.init_leaf_plans();
+            let leaves = (0..4)
+                .map(|i| dp.plans[&dp.set_manager.get_relation(i)][0].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(dp.solve_join_order(), EnumerationOutcome::Complete);
+            let selected = dp.get_final_plan().unwrap().cost;
+            drop(dp);
+            let oracle = exhaustive(15, &leaves, &filters, &mut sets, &mut costs)
+                .into_iter()
+                .map(|node| node.cost)
+                .min_by(f64::total_cmp)
+                .unwrap();
+            assert!((selected - oracle).abs() <= oracle.abs() * 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_plan_enumerator_two_relations() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model =
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+        let mut query_graph = QueryGraphEdges::new();
+
+        // Create join filter
+        let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
+        cost_model.init_equivalent_relations(&[filter.clone()]);
+
+        // Add edge to query graph
+        let left = set_manager.get_relation(0);
+        let right = set_manager.get_relation(1);
+        query_graph.create_edge(&left, right.clone(), Some(filter.clone()));
+        query_graph.create_edge(&right, left, Some(filter));
+
+        // Initialize cost model
+        let mut stats0 = RelationStats::with_cardinality(1000);
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(100, true)]);
+
+        let mut stats1 = RelationStats::with_cardinality(500);
+        stats1.column_distinct_count = column_distinct_counts(1, [DistinctCount::new(50, true)]);
+
+        cost_model.init_cost_model(&mut set_manager, &[stats0, stats1]);
+
+        let mut enumerator =
+            PlanEnumerator::new(&query_graph, &mut set_manager, &mut cost_model, 2);
+        enumerator.init_leaf_plans();
+        assert_eq!(enumerator.solve_join_order(), EnumerationOutcome::Complete);
+
+        // Should have plans for both single relations and the join
+        assert!(enumerator.plans.len() >= 2);
+
+        // Check final plan exists
+        let final_plan = enumerator.get_final_plan();
+        assert!(final_plan.is_some());
+        assert!(final_plan.unwrap().predicates.is_some());
+    }
+
+    #[test]
+    fn test_plan_enumerator_three_relations_chain() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model =
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+        let mut query_graph = QueryGraphEdges::new();
+
+        // Create chain: A - B - C
+        let filter_ab = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
+        let filter_bc = create_equality_filter(&mut set_manager, 1, 1, 2, 0, 1);
+
+        cost_model.init_equivalent_relations(&[filter_ab.clone(), filter_bc.clone()]);
+
+        // Add edges
+        let r0 = set_manager.get_relation(0);
+        let r1 = set_manager.get_relation(1);
+        let r2 = set_manager.get_relation(2);
+
+        query_graph.create_edge(&r0, r1.clone(), Some(filter_ab.clone()));
+        query_graph.create_edge(&r1, r0, Some(filter_ab));
+        query_graph.create_edge(&r1, r2.clone(), Some(filter_bc.clone()));
+        query_graph.create_edge(&r2, r1, Some(filter_bc));
+
+        // Initialize cost model
+        let mut stats0 = RelationStats::with_cardinality(1000);
+        stats0.column_distinct_count = column_distinct_counts(0, [DistinctCount::new(100, true)]);
+
+        let mut stats1 = RelationStats::with_cardinality(500);
+        stats1.column_distinct_count = column_distinct_counts(
+            1,
+            [DistinctCount::new(50, true), DistinctCount::new(25, true)],
+        );
+
+        let mut stats2 = RelationStats::with_cardinality(200);
+        stats2.column_distinct_count = column_distinct_counts(2, [DistinctCount::new(20, true)]);
+
+        cost_model.init_cost_model(&mut set_manager, &[stats0, stats1, stats2]);
+
+        let mut enumerator =
+            PlanEnumerator::new(&query_graph, &mut set_manager, &mut cost_model, 3);
+        enumerator.init_leaf_plans();
+        assert_eq!(enumerator.solve_join_order(), EnumerationOutcome::Complete);
+
+        // Check final plan exists
+        let final_plan = enumerator.get_final_plan();
+        assert!(final_plan.is_some());
+
+        let plan = final_plan.unwrap();
+        assert_eq!(plan.set.count(), 3);
+        assert!(plan.cost > 0.0);
+        assert!(plan.predicates.is_some());
+    }
+
+    #[test]
+    fn test_plan_enumerator_cross_product() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model =
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+        let query_graph = QueryGraphEdges::new();
+
+        // No join conditions - will need cross product
+        let stats = vec![
+            RelationStats::with_cardinality(100),
+            RelationStats::with_cardinality(50),
+        ];
+        cost_model.init_cost_model(&mut set_manager, &stats);
+
+        let mut enumerator =
+            PlanEnumerator::new(&query_graph, &mut set_manager, &mut cost_model, 2);
+        enumerator.init_leaf_plans();
+        assert_eq!(enumerator.solve_join_order(), EnumerationOutcome::Complete);
+
+        // Should still produce a final plan (via cross product)
+        let final_plan = enumerator.get_final_plan();
+        assert!(
+            final_plan.is_some(),
+            "Final plan should exist for cross product"
+        );
+    }
+
+    #[test]
+    fn test_plan_enumerator_approximate() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model =
+            RegionCostModel::new(crate::estimate::selectivity::SelectivityDefaults::default());
+        let query_graph = QueryGraphEdges::new();
+
+        // Create many relations to trigger approximate algorithm
+        let num_relations = 13;
+        let stats: Vec<_> = (0..num_relations)
+            .map(|_| RelationStats::with_cardinality(1000))
+            .collect();
+
+        cost_model.init_cost_model(&mut set_manager, &stats);
+
+        let mut enumerator = PlanEnumerator::new(
+            &query_graph,
+            &mut set_manager,
+            &mut cost_model,
+            num_relations,
+        );
+        enumerator.init_leaf_plans();
+
+        let result = enumerator.solve_join_order();
+        assert_eq!(result, EnumerationOutcome::Approximate);
+    }
+}

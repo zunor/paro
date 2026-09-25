@@ -1,0 +1,864 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+"""Finite schema checks for normal benchmark receipt associations."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+try:
+    from .run_output import SUMMARY_LIMIT_BYTES
+    from .evidence_schema import EVIDENCE_SCHEMA_VERSION
+except ImportError:  # pragma: no cover - documented script invocation
+    from evidence_schema import EVIDENCE_SCHEMA_VERSION
+    from run_output import SUMMARY_LIMIT_BYTES  # type: ignore[no-redef]
+
+
+# One current producer/consumer contract. Historical v1/v2/v5 documents are
+# archival evidence and are intentionally rejected by this reader.
+RECEIPT_ASSOCIATION_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
+COMPILE_DOCUMENT_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
+BENCHMARK_CELL_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
+OWNERSHIP_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
+MAX_SEARCH_COUNTERS = 256
+
+
+class ReceiptContractError(ValueError):
+    """A result contains a malformed identity or admission association."""
+
+
+def uncovered_receipt(reason: str) -> dict[str, Any]:
+    """Create the only valid negative receipt for the current contract."""
+    if not isinstance(reason, str) or not reason:
+        raise ReceiptContractError("Uncovered receipt requires a reason")
+    return {
+        "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+        "status": "Uncovered",
+        "reason": reason,
+    }
+
+
+def _valid_observation(value: Any) -> bool:
+    """Recognise the Rust externally-tagged Observation enum.
+
+    The producer owns the payload semantics.  The benchmark boundary only
+    checks the tag and preserves its payload; it must not reinterpret an
+    execution failure as an uncovered or not-executed result.
+    """
+    if isinstance(value, str):
+        return value in {"NotExecuted", "NotApplicable"}
+    if not isinstance(value, dict) or len(value) != 1:
+        return False
+    marker, payload = next(iter(value.items()))
+    if marker == "Observed":
+        # CompileFields.execution and UnavailableDocument.target_execution
+        # are Observation<u64>, not arbitrary JSON observations.
+        return type(payload) is int and 0 <= payload < 1 << 64
+    return marker == "Uncovered" and isinstance(payload, str) and payload in {
+        "NotInstrumented", "FutureBoundary", "Capacity"
+    }
+
+
+def validate_compile_document(value: Any, *, require_analyze: bool = False) -> str:
+    """Validate the Rust-owned EXPLAIN (COMPILE) wire envelope.
+
+    This is intentionally a structural boundary, not a second compiler.  The
+    Rust renderer/reader remains authoritative for semantic validation; the
+    benchmark side only rejects missing, unknown, or contradictory lifecycle
+    fields before a sample can be marked as jointly verified.
+    """
+    if not isinstance(value, dict):
+        raise ReceiptContractError("compile document must be an object")
+    if value.get("schema_version") != COMPILE_DOCUMENT_SCHEMA_VERSION:
+        raise ReceiptContractError("unsupported compile document schema version")
+    if value.get("diagnostic") == "Unavailable":
+        if value.get("target_compile") not in {"Success", "Incomplete"}:
+            raise ReceiptContractError("unavailable compile document lacks compile outcome")
+        if value.get("reason") not in {"Capacity", "ProcessCapacity"}:
+            raise ReceiptContractError("unavailable compile document has unknown reason")
+        if not _valid_observation(value.get("target_execution")):
+            raise ReceiptContractError("unavailable compile document has invalid execution state")
+        if require_analyze:
+            raise ReceiptContractError("ANALYZE document is unavailable")
+        return "Unavailable"
+    required = ("outcome", "artifact", "cache", "admission", "execution")
+    missing = [field for field in required if field not in value]
+    if missing:
+        raise ReceiptContractError(
+            "compile document lacks required fields: " + ", ".join(missing)
+        )
+    if value["outcome"] not in {"Incomplete", "Success"}:
+        raise ReceiptContractError("compile document has unknown outcome")
+    if value["artifact"] not in {"NotReady", "CompiledArtifactReady"}:
+        raise ReceiptContractError("compile document has unknown artifact state")
+    if value["cache"] not in {"ForcedCompile", "CacheHit"}:
+        raise ReceiptContractError("compile document has unknown cache state")
+    if value["outcome"] == "Success" and value["artifact"] != "CompiledArtifactReady":
+        raise ReceiptContractError("successful compile lacks a ready artifact")
+    work = value.get("optimizer_work", {})
+    if isinstance(work, dict) and set(work) == {"Observed"}:
+        work = work["Observed"]
+        if not isinstance(work, dict) or set(work) != {
+            "total_ns", "buckets"
+        }:
+            raise ReceiptContractError("malformed optimizer work accounting")
+        buckets = work["buckets"]
+        if not isinstance(buckets, list) or [b.get("kind") for b in buckets if isinstance(b, dict)] != ["Normalization", "RegionPlanning", "PhysicalSelection", "PhysicalLowering", "Unclassified"]:
+            raise ReceiptContractError("invalid optimizer work bucket count")
+        names = set()
+        for bucket in buckets:
+            if not isinstance(bucket, dict) or set(bucket) != {"kind", "exclusive_ns", "entries"}:
+                raise ReceiptContractError("malformed optimizer work bucket")
+            if not isinstance(bucket["kind"], str) or bucket["kind"] in names:
+                raise ReceiptContractError("duplicate optimizer work bucket")
+            names.add(bucket["kind"])
+            if any(type(bucket[k]) is not int or bucket[k] < 0 for k in ("exclusive_ns", "entries")):
+                raise ReceiptContractError("invalid optimizer work measurement")
+        if (type(work["total_ns"]) is not int or work["total_ns"] < 0
+                or sum(b["exclusive_ns"] for b in buckets) != work["total_ns"]):
+            raise ReceiptContractError("optimizer work accounting does not close")
+        if value.get("optimizer_ns") != {"Observed": work["total_ns"]}:
+            raise ReceiptContractError("optimizer work interval mismatch")
+    counters = value.get("search_counters")
+    omitted_counters = value.get("omitted_search_counters")
+    if not isinstance(counters, list) or len(counters) > MAX_SEARCH_COUNTERS:
+        raise ReceiptContractError("compile document has invalid search counter snapshot")
+    if (
+        not isinstance(omitted_counters, int)
+        or isinstance(omitted_counters, bool)
+        or omitted_counters < 0
+    ):
+        raise ReceiptContractError("compile document has invalid omitted search counter count")
+    names = set()
+    for counter in counters:
+        if not isinstance(counter, dict) or set(counter) != {"name", "value"}:
+            raise ReceiptContractError("compile document has malformed search counter")
+        name = counter["name"]
+        value_number = counter["value"]
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in names
+            or not isinstance(value_number, int)
+            or isinstance(value_number, bool)
+            or value_number < 0
+        ):
+            raise ReceiptContractError("compile document has invalid search counter")
+        names.add(name)
+    identity = value.get("artifact_identity")
+    if isinstance(identity, dict) and set(identity) == {"Observed"}:
+        identity = identity["Observed"]
+    if value["outcome"] == "Success":
+        _validate_identity(identity)
+    execution = value["execution"]
+    if not _valid_observation(execution):
+        raise ReceiptContractError("compile document has invalid execution observation")
+    receipt = value.get("execution_receipt")
+    if receipt is not None:
+        if not isinstance(receipt, dict) or receipt.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+            raise ReceiptContractError("compile document has invalid execution receipt")
+        terminal = receipt.get("terminal")
+        if terminal not in {"NotExecuted", "Running", "Completed", "Failed", "Cancelled", "Dropped"}:
+            raise ReceiptContractError("compile document has invalid execution terminal")
+        if require_analyze and terminal == "NotExecuted":
+            raise ReceiptContractError("ANALYZE document claims no execution")
+    elif require_analyze:
+        raise ReceiptContractError("ANALYZE document lacks execution receipt")
+    return "Summary"
+
+
+def validate_receipt_association(value: Any) -> str:
+    if value is None:
+        return "Uncovered"
+    if not isinstance(value, dict):
+        raise ReceiptContractError("compile_receipt must be an object or null")
+    if value.get("schema_version") != RECEIPT_ASSOCIATION_SCHEMA_VERSION:
+        raise ReceiptContractError("unsupported compile receipt schema version")
+    status = value.get("status")
+    if status == "Uncovered":
+        if not isinstance(value.get("reason"), str) or not value["reason"]:
+            raise ReceiptContractError("Uncovered receipt must preserve a reason")
+        return status
+    if status != "Verified":
+        raise ReceiptContractError(f"unknown compile receipt status: {status!r}")
+    if value.get("association_basis") != "statement_decision_id":
+        raise ReceiptContractError("verified receipt has no exact statement association")
+    if (
+        not isinstance(value.get("statement_decision_id"), int)
+        or isinstance(value["statement_decision_id"], bool)
+        or value["statement_decision_id"] < 0
+    ):
+        raise ReceiptContractError("verified receipt has invalid statement decision id")
+    identity = value.get("artifact_identity")
+    _validate_identity(identity)
+    fingerprint = value.get("query_fingerprint")
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 16
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise ReceiptContractError("verified receipt lacks query fingerprint")
+    # Occurrence is retained as an optional diagnostic coordinate only.  It is
+    # derived from a bounded active view and is not an authentication key;
+    # statement_decision_id plus the nested identities are the exact contract.
+    occurrence = value.get("occurrence")
+    if occurrence is not None and (
+        not isinstance(occurrence, int)
+        or isinstance(occurrence, bool)
+        or occurrence < 0
+    ):
+        raise ReceiptContractError("verified receipt has invalid diagnostic occurrence")
+    if value.get("compilation") not in {"Executed", "CacheHit"}:
+        raise ReceiptContractError("verified receipt has invalid compilation state")
+    compile_state = value.get("compile_state")
+    if compile_state not in {"Executed", "NotExecuted"}:
+        raise ReceiptContractError("verified receipt lacks compile execution state")
+    if (value["compilation"] == "CacheHit") != (compile_state == "NotExecuted"):
+        raise ReceiptContractError("cache-hit compilation state is inconsistent")
+    if not isinstance(value.get("execution_id"), int) or value["execution_id"] < 0:
+        raise ReceiptContractError("verified receipt has invalid execution id")
+    compile_identity = _validate_receipt_fields(value.get("compile"), required_identity=True)
+    execution_identity = _validate_receipt_fields(value.get("execution"), required_identity=True)
+    if compile_identity != identity or execution_identity != identity:
+        raise ReceiptContractError("nested receipt identity does not match association identity")
+    compile_detail = value["compile"]
+    if compile_detail.get("decision_id") != value["statement_decision_id"]:
+        raise ReceiptContractError("compile receipt is bound to another statement decision")
+    compile_receipt = compile_detail.get("receipt")
+    _validate_compile_receipt(compile_receipt, identity)
+    if compile_detail.get("cache_hit") not in {True, False}:
+        raise ReceiptContractError("compile receipt lacks cache decision")
+    if (compile_detail["cache_hit"] is True) != (value["compilation"] == "CacheHit"):
+        raise ReceiptContractError("cache decision and compilation state differ")
+    execution_detail = value["execution"]
+    if execution_detail.get("execution_id") != value["execution_id"]:
+        raise ReceiptContractError("execution receipt id does not match association")
+    selection = value.get("selection")
+    if not isinstance(selection, dict):
+        raise ReceiptContractError("verified receipt lacks actual selection contract")
+    if selection.get("admission") != "Selected":
+        raise ReceiptContractError("verified receipt is not a selected execution")
+    expected_class = selection.get("expected_class")
+    if expected_class is not None and (
+        not isinstance(expected_class, int)
+        or isinstance(expected_class, bool)
+        or expected_class < 0
+    ):
+        raise ReceiptContractError("verified receipt has invalid expected grant class")
+    observed_expected = compile_receipt.get("expected_class")
+    if isinstance(observed_expected, dict) and set(observed_expected) == {"Observed"}:
+        if expected_class != observed_expected["Observed"]:
+            raise ReceiptContractError("compile and admission expected classes differ")
+    raw_execution = execution_detail.get("raw")
+    if not isinstance(raw_execution, dict):
+        raise ReceiptContractError("execution receipt lacks its producer record")
+    _validate_execution_producer_record(
+        raw_execution,
+        execution_id=value["execution_id"],
+        decision_id=value["statement_decision_id"],
+        identity=identity,
+        selection=selection,
+    )
+    if (
+        not isinstance(selection.get("actual_class"), int)
+        or isinstance(selection["actual_class"], bool)
+        or selection["actual_class"] < 0
+    ):
+        raise ReceiptContractError("verified receipt lacks actual grant class")
+    fingerprint = selection.get("actual_fingerprint")
+    if (
+        not isinstance(fingerprint, list)
+        or len(fingerprint) != 2
+        or any(not isinstance(word, int) or word < 0 or word >= 1 << 64 for word in fingerprint)
+    ):
+        raise ReceiptContractError("verified receipt lacks actual physical fingerprint")
+    resources = selection.get("resources")
+    if not isinstance(resources, dict):
+        raise ReceiptContractError("verified receipt lacks resource contract")
+    required_resources = {
+        "class", "minimum_memory_bytes", "working_set_memory_bytes",
+        "memory_ceiling_bytes", "memory_completion", "max_parallel_tasks",
+        "external_worker_slots",
+    }
+    if set(resources) != required_resources:
+        raise ReceiptContractError("verified receipt has incomplete resource contract")
+    if resources["class"] != selection["actual_class"]:
+        raise ReceiptContractError("resource and selected grant classes differ")
+    for field in (
+        "minimum_memory_bytes",
+        "working_set_memory_bytes",
+        "memory_ceiling_bytes",
+        "max_parallel_tasks",
+        "external_worker_slots",
+    ):
+        if (
+            not isinstance(resources[field], int)
+            or isinstance(resources[field], bool)
+            or resources[field] < 0
+        ):
+            raise ReceiptContractError(f"resource field {field} is invalid")
+    if resources["max_parallel_tasks"] == 0:
+        raise ReceiptContractError("resource contract has no execution capacity")
+    if (
+        resources["working_set_memory_bytes"] < resources["minimum_memory_bytes"]
+        or resources["memory_ceiling_bytes"] < resources["minimum_memory_bytes"]
+    ):
+        raise ReceiptContractError("resource memory bounds are inconsistent")
+    completion = resources["memory_completion"]
+    valid_simple_completion = isinstance(completion, str) and completion in {
+        "Guaranteed", "RuntimeCappedUnbounded"
+    }
+    valid_known_completion = (
+        isinstance(completion, dict)
+        and set(completion) == {"RuntimeCappedKnown"}
+        and isinstance(completion["RuntimeCappedKnown"], dict)
+        and set(completion["RuntimeCappedKnown"]) == {"uncapped_memory_bytes"}
+        and isinstance(completion["RuntimeCappedKnown"]["uncapped_memory_bytes"], int)
+        and not isinstance(completion["RuntimeCappedKnown"]["uncapped_memory_bytes"], bool)
+        and completion["RuntimeCappedKnown"]["uncapped_memory_bytes"] >= 0
+    )
+    if not valid_simple_completion and not valid_known_completion:
+        raise ReceiptContractError("unknown memory completion contract")
+    if isinstance(completion, dict) and completion["RuntimeCappedKnown"]["uncapped_memory_bytes"] < resources["working_set_memory_bytes"]:
+        raise ReceiptContractError("known uncapped memory is below the working set")
+    if selection.get("image") not in {"Ready", "NotReady"}:
+        raise ReceiptContractError("verified receipt lacks executable-image status")
+    if selection.get("terminal") not in {
+        "Running", "Completed", "Failed", "Cancelled", "Dropped", "NotExecuted"
+    }:
+        raise ReceiptContractError("verified receipt lacks execution terminal")
+    if selection["terminal"] == "NotExecuted":
+        raise ReceiptContractError("verified selected execution cannot be NotExecuted")
+    if selection.get("reservation") not in {"Committed", "Failed"}:
+        raise ReceiptContractError("selected execution lacks a reservation phase")
+    if selection.get("lowering") not in {"NotStarted", "Ready", "Failed"}:
+        raise ReceiptContractError("selected execution lacks a lowering phase")
+    if selection["lowering"] == "Failed" and not isinstance(selection.get("lowering_error"), str):
+        raise ReceiptContractError("failed lowering lacks its original error")
+    if selection["reservation"] == "Failed" and selection["terminal"] == "Completed":
+        raise ReceiptContractError("completed execution has a failed reservation")
+    if selection["reservation"] == "Failed" and (
+        selection["terminal"] != "Failed"
+        or selection["lowering"] != "NotStarted"
+        or selection["image"] != "NotReady"
+        or not isinstance(selection.get("terminal_error"), str)
+    ):
+        raise ReceiptContractError("failed reservation has an inconsistent execution lifecycle")
+    if selection["lowering"] == "Failed" and (
+        selection["terminal"] != "Failed"
+        or selection["image"] != "NotReady"
+        or not isinstance(selection.get("terminal_error"), str)
+    ):
+        raise ReceiptContractError("failed lowering has an inconsistent execution lifecycle")
+    if selection["lowering"] == "NotStarted" and selection["image"] != "NotReady":
+        raise ReceiptContractError("image is ready before lowering")
+    if selection["terminal"] in {"Failed", "Cancelled"} and not isinstance(
+        selection.get("terminal_error"), str
+    ):
+        raise ReceiptContractError("terminal failure lacks its original error")
+    if selection["terminal"] == "Completed" and (
+        selection["reservation"] != "Committed"
+        or selection["lowering"] != "Ready"
+    ):
+        raise ReceiptContractError("completed execution has incomplete lifecycle phases")
+    if selection["terminal"] == "Completed" and selection["image"] != "Ready":
+        raise ReceiptContractError("completed execution must have a ready image")
+    return status
+
+
+def associate_typed_receipts(
+    decisions: dict[int, dict[str, Any]],
+    executions: dict[int, dict[str, Any]],
+    *,
+    before_execution_ids: set[int] | None,
+    query_fingerprint: int | str | None,
+) -> dict[str, Any]:
+    """Bind one target execution to its immutable compile decision.
+
+    This is the single benchmark-side projection of the Rust receipt channel.
+    Callers supply already decoded, record-id-checked maps; no caller may pick
+    the newest occurrence or an artifact-only match.  A structurally complete
+    association is validated before it can be labelled ``Verified``.
+    """
+    if before_execution_ids is None:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "target execution boundary was not captured",
+        }
+    if not decisions or not executions:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "compile or execution receipt was not published",
+        }
+
+    matches = [
+        (execution_id, execution)
+        for execution_id, execution in executions.items()
+        if execution_id not in before_execution_ids
+        and execution.get("statement_decision_id") in decisions
+        and (
+            query_fingerprint is None
+            or decisions[execution["statement_decision_id"]].get("query_fingerprint")
+            == query_fingerprint
+        )
+    ]
+    if not matches:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "no execution receipt matches this statement decision",
+        }
+    if len(matches) != 1:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "statement execution boundary is ambiguous",
+            "matching_execution_ids": sorted(execution_id for execution_id, _ in matches),
+        }
+
+    execution_id, execution = matches[0]
+    decision_id = execution.get("statement_decision_id")
+    decision = decisions[decision_id]
+    identity = execution.get("artifact_identity")
+    if not isinstance(identity, dict):
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "execution receipt lacks artifact identity",
+            "execution_id": execution_id,
+        }
+    if decision.get("artifact_identity") != identity:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": "statement decision and execution artifact differ",
+            "execution_id": execution_id,
+        }
+
+    compile_detail = {
+        "artifact_identity": identity,
+        "decision_id": decision_id,
+        "query_fingerprint": decision.get("query_fingerprint"),
+        "occurrence": decision.get("occurrence"),
+        "cache_hit": decision.get("cache_hit"),
+        "receipt": decision.get("compile_receipt"),
+        "raw": decision.get("compile_work"),
+    }
+    execution_detail = {
+        "execution_id": execution_id,
+        "artifact_identity": identity,
+        "raw": execution,
+    }
+    selection = {
+        "expected_class": execution.get("expected_class"),
+        "actual_class": execution.get("actual_class"),
+        "actual_fingerprint": execution.get("actual_fingerprint"),
+        "admission": execution.get("admission"),
+        "fallback": execution.get("fallback"),
+        "image": execution.get("image"),
+        "terminal": execution.get("terminal"),
+        "reservation": execution.get("reservation"),
+        "lowering": execution.get("lowering"),
+        "lowering_error": execution.get("lowering_error"),
+        "terminal_error": execution.get("terminal_error"),
+        "resources": execution.get("resources"),
+    }
+    raw_fingerprint = decision.get("query_fingerprint", 0)
+    if isinstance(raw_fingerprint, int) and not isinstance(raw_fingerprint, bool):
+        fingerprint = f"{raw_fingerprint:016x}"
+    else:
+        fingerprint = str(raw_fingerprint)
+    association = {
+        "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+        "status": "Verified",
+        "association_basis": "statement_decision_id",
+        "statement_decision_id": decision_id,
+        "query_fingerprint": fingerprint,
+        "occurrence": decision.get("occurrence"),
+        "compilation": "CacheHit" if decision.get("cache_hit") else "Executed",
+        "compile_state": "NotExecuted" if decision.get("cache_hit") else "Executed",
+        "artifact_identity": identity,
+        "compile": compile_detail,
+        "execution_id": execution_id,
+        "execution": execution_detail,
+        "selection": selection,
+    }
+    try:
+        validate_receipt_association(association)
+    except ReceiptContractError as error:
+        return {
+            "schema_version": RECEIPT_ASSOCIATION_SCHEMA_VERSION,
+            "status": "Uncovered",
+            "reason": f"receipt association failed validation: {error}",
+            "execution_id": execution_id,
+        }
+    return association
+
+
+def _validate_execution_producer_record(
+    raw: dict[str, Any],
+    *,
+    execution_id: int,
+    decision_id: int,
+    identity: dict[str, Any],
+    selection: dict[str, Any],
+) -> None:
+    if raw.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+        raise ReceiptContractError("unsupported execution receipt schema version")
+    if raw.get("execution_id") != execution_id:
+        raise ReceiptContractError("producer execution id differs from association")
+    if raw.get("statement_decision_id") != decision_id:
+        raise ReceiptContractError("producer statement decision differs from association")
+    _validate_identity(raw.get("artifact_identity"))
+    if raw["artifact_identity"] != identity:
+        raise ReceiptContractError("producer execution identity differs from association")
+    for field in (
+        "admission", "fallback", "reservation", "lowering", "lowering_error",
+        "image", "terminal", "terminal_error", "expected_class", "actual_class",
+        "actual_fingerprint", "resources",
+    ):
+        if raw.get(field) != selection.get(field):
+            raise ReceiptContractError(
+                f"projected execution field differs from producer: {field}"
+            )
+
+
+def validate_benchmark_payload(payload: dict[str, Any], *, require_receipts: bool = False) -> None:
+    if not isinstance(payload, dict):
+        raise ReceiptContractError("benchmark payload must be an object")
+    if payload.get("version") != BENCHMARK_CELL_SCHEMA_VERSION:
+        raise ReceiptContractError("benchmark payload must use current schema version")
+    ownership = payload.get("ownership")
+    if not isinstance(ownership, dict) or ownership.get("schema_version") != OWNERSHIP_SCHEMA_VERSION:
+        raise ReceiptContractError("benchmark payload lacks ownership schema")
+    if payload.get("schema_version") != BENCHMARK_CELL_SCHEMA_VERSION:
+        raise ReceiptContractError("benchmark payload lacks the current cell schema")
+    for field in ("campaign_id", "run_id"):
+        if not isinstance(ownership.get(field), str) or not ownership[field]:
+            raise ReceiptContractError(f"benchmark payload lacks ownership {field}")
+    for field in ("query_case", "arm_id"):
+        if not isinstance(ownership.get(field), str) or not ownership[field]:
+            raise ReceiptContractError(f"benchmark payload lacks cell ownership {field}")
+    sample_ids = ownership.get("sample_ids")
+    if (
+        not isinstance(sample_ids, list)
+        or not sample_ids
+        or len(set(sample_ids)) != len(sample_ids)
+        or any(not isinstance(sample_id, str) or not sample_id for sample_id in sample_ids)
+    ):
+        raise ReceiptContractError("benchmark payload lacks unique sample_ids")
+    queries = 0
+    receipt_sample_ids: list[str] = []
+    for workload in payload.get("workloads", []):
+        if not isinstance(workload, dict):
+            raise ReceiptContractError("workload entry must be an object")
+        for query in workload.get("queries", []):
+            if not isinstance(query, dict):
+                raise ReceiptContractError("query entry must be an object")
+            queries += 1
+            receipts = query.get("compile_receipts")
+            if receipts is not None:
+                if not isinstance(receipts, list) or not receipts:
+                    if require_receipts:
+                        raise ReceiptContractError(
+                            f"query {query.get('id', '<unknown>')} lacks per-sample receipts"
+                        )
+                    continue
+                statuses = [validate_receipt_association(receipt) for receipt in receipts]
+            else:
+                statuses = [validate_receipt_association(query.get("compile_receipt"))]
+            for receipt in (
+                query.get("compile_receipts")
+                if isinstance(query.get("compile_receipts"), list)
+                else [query.get("compile_receipt")]
+            ):
+                if not isinstance(receipt, dict):
+                    raise ReceiptContractError("cell receipt must be an object")
+                sample_id = receipt.get("sample_id")
+                if (
+                    not isinstance(sample_id, str)
+                    or not sample_id
+                    or receipt.get("query_case") != ownership["query_case"]
+                    or receipt.get("arm_id") != ownership["arm_id"]
+                ):
+                    raise ReceiptContractError(
+                        "cell receipt lacks its query_case/arm_id/sample_id binding"
+                    )
+                receipt_sample_ids.append(sample_id)
+            if require_receipts and any(status != "Verified" for status in statuses):
+                raise ReceiptContractError(
+                    f"query {query.get('id', '<unknown>')} lacks verified per-sample receipts"
+                )
+    if queries == 0:
+        raise ReceiptContractError("benchmark payload contains no query cells")
+    if (
+        len(receipt_sample_ids) != len(ownership["sample_ids"])
+        or len(set(receipt_sample_ids)) != len(receipt_sample_ids)
+        or set(receipt_sample_ids) != set(ownership["sample_ids"])
+    ):
+        raise ReceiptContractError(
+            "cell receipts must bind exactly once to every registered sample_id"
+        )
+
+
+def validate_campaign_summary(summary: Any, manifest: dict[str, Any] | None = None) -> None:
+    """Validate the bounded campaign index emitted by :class:`CampaignSummary`."""
+    if not isinstance(summary, dict) or summary.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+        raise ReceiptContractError("unsupported campaign summary schema")
+    if summary.get("kind") != "CampaignSummary":
+        raise ReceiptContractError("campaign summary has the wrong producer kind")
+    for field in ("campaign_id", "run_id", "status", "registration_status"):
+        if field not in summary:
+            raise ReceiptContractError(f"campaign summary lacks {field}")
+    cells = summary.get("cells")
+    if not isinstance(cells, list):
+        raise ReceiptContractError("campaign summary cells must be a list")
+    seen: set[str] = set()
+
+    def valid_owned_path(value: Any, *, required: bool = False) -> bool:
+        if value is None:
+            return not required
+        if not isinstance(value, str) or not value or value.startswith("/"):
+            return False
+        parts = value.replace("\\", "/").split("/")
+        return ".." not in parts and all(part not in {"", "."} for part in parts)
+
+    for cell in cells:
+        if not isinstance(cell, dict):
+            raise ReceiptContractError("campaign summary cell must be an object")
+        cell_id = cell.get("cell_id")
+        if not isinstance(cell_id, str) or not cell_id or cell_id in seen:
+            raise ReceiptContractError("campaign summary has duplicate or invalid cell id")
+        seen.add(cell_id)
+        if not isinstance(cell.get("sample_ids"), list):
+            raise ReceiptContractError("campaign summary cell lacks sample ids")
+        accepted_attempt_id = cell.get("accepted_attempt_id")
+        if accepted_attempt_id is not None and (
+            not isinstance(accepted_attempt_id, str) or not accepted_attempt_id
+        ):
+            raise ReceiptContractError("campaign summary has invalid accepted attempt")
+        for field in ("declared_samples", "declared_receipts", "declared_captures"):
+            if not isinstance(cell.get(field), int) or isinstance(cell[field], bool) or cell[field] < 0:
+                raise ReceiptContractError(f"campaign summary has invalid {field}")
+        attempts = cell.get("attempts")
+        if not isinstance(attempts, list):
+            raise ReceiptContractError("campaign summary cell lacks attempt index")
+        attempt_ids: set[str] = set()
+        completed_attempt_ids: set[str] = set()
+        for attempt in attempts:
+            if not isinstance(attempt, dict) or not isinstance(attempt.get("status"), str):
+                raise ReceiptContractError("campaign summary has malformed attempt")
+            attempt_id = attempt.get("attempt_id")
+            attempt_index = attempt.get("attempt_index")
+            if (
+                not isinstance(attempt_id, str)
+                or not attempt_id
+                or attempt_id in attempt_ids
+                or not isinstance(attempt_index, int)
+                or isinstance(attempt_index, bool)
+                or attempt_index < 0
+            ):
+                raise ReceiptContractError("campaign summary has invalid attempt identity")
+            attempt_ids.add(attempt_id)
+            if attempt.get("status") == "Completed":
+                completed_attempt_ids.add(attempt_id)
+            for path_field in ("result", "summary", "failure", "metadata"):
+                if not valid_owned_path(attempt.get(path_field), required=path_field == "metadata"):
+                    raise ReceiptContractError(
+                        f"campaign summary has invalid owned attempt path: {path_field}"
+                    )
+        if accepted_attempt_id is not None and accepted_attempt_id not in completed_attempt_ids:
+            raise ReceiptContractError("accepted attempt is not a completed attempt in the cell")
+    if manifest is not None:
+        if summary.get("campaign_id") != manifest.get("campaign_id") \
+                or summary.get("run_id") != manifest.get("run_id"):
+            raise ReceiptContractError("campaign summary identity differs from manifest")
+        if summary.get("status") != manifest.get("status"):
+            raise ReceiptContractError("campaign summary status differs from manifest")
+        registration = manifest.get("registration")
+        if not isinstance(registration, dict) or summary.get("registration_status") != registration.get("status"):
+            raise ReceiptContractError("campaign summary registration status differs from manifest")
+        manifest_cells = {cell.get("cell_id") for cell in registration.get("cells", [])}
+        if seen != manifest_cells:
+            raise ReceiptContractError("campaign summary cell index differs from registration")
+        for manifest_cell in registration.get("cells", []):
+            summary_cell = next(
+                item for item in cells if item.get("cell_id") == manifest_cell.get("cell_id")
+            )
+            if summary_cell.get("accepted_attempt_id") != manifest_cell.get("accepted_attempt_id"):
+                raise ReceiptContractError("campaign summary accepted attempt differs from registration")
+            manifest_attempts = [
+                item for item in (manifest or {}).get("attempts", [])
+                if item.get("query_case") == manifest_cell.get("query_case")
+                and item.get("arm_id") == manifest_cell.get("arm_id")
+            ]
+            summary_attempts = summary_cell.get("attempts", [])
+            if {
+                (item.get("attempt_id"), item.get("attempt_index"), item.get("status"),
+                 item.get("result"), item.get("summary"), item.get("failure"))
+                for item in summary_attempts
+            } != {
+                (item.get("attempt_id"), item.get("attempt_index"), item.get("status"),
+                 item.get("result"), item.get("summary"), item.get("failure"))
+                for item in manifest_attempts
+            }:
+                raise ReceiptContractError("campaign summary attempt index differs from manifest")
+
+
+def build_benchmark_cell_payload(
+    *,
+    campaign_id: str,
+    run_id: str,
+    query_case: str,
+    arm_id: str,
+    workload_name: str,
+    query_payload: dict[str, Any],
+    compile_receipts: list[dict[str, Any]],
+    source_id: str | None = None,
+    attempt_id: str | None = None,
+    sample_ids: list[str] | None = None,
+    require_receipts: bool = False,
+) -> dict[str, Any]:
+    """Build the one cell envelope consumed by all benchmark readers.
+
+    Collectors may put their domain-specific report under ``query``; the
+    ownership and receipt association are deliberately not inferred from that
+    report.  In particular, a diagnostic cell must carry an explicit
+    ``Uncovered`` receipt instead of pretending that a compile-only document
+    is an execution receipt.
+    """
+    if not isinstance(compile_receipts, list) or not compile_receipts:
+        raise ReceiptContractError("cell payload requires an explicit receipt list")
+    if sample_ids is None:
+        sample_ids = [
+            f"{query_case}-sample-{index:04d}"
+            for index in range(len(compile_receipts))
+        ]
+    if len(sample_ids) != len(compile_receipts) or len(set(sample_ids)) != len(sample_ids):
+        raise ReceiptContractError("sample_ids must have one unique id per receipt")
+    bound_receipts: list[dict[str, Any]] = []
+    for sample_id, receipt in zip(sample_ids, compile_receipts, strict=True):
+        if not isinstance(receipt, dict):
+            raise ReceiptContractError("cell receipt must be an object")
+        bound = dict(receipt)
+        for key, value in (
+            ("sample_id", sample_id),
+            ("query_case", query_case),
+            ("arm_id", arm_id),
+        ):
+            if key in bound and bound[key] != value:
+                raise ReceiptContractError(f"receipt {key} disagrees with cell identity")
+            bound[key] = value
+        bound_receipts.append(bound)
+    payload = {
+        "version": BENCHMARK_CELL_SCHEMA_VERSION,
+        "ownership": {
+            "schema_version": OWNERSHIP_SCHEMA_VERSION,
+            "campaign_id": campaign_id,
+            "run_id": run_id,
+            "source_id": source_id,
+            "attempt_id": attempt_id,
+            "query_case": query_case,
+            "arm_id": arm_id,
+            "sample_ids": list(sample_ids),
+        },
+        "workloads": [{
+            "name": workload_name,
+            "queries": [{
+                "id": query_case,
+                    "compile_receipts": bound_receipts,
+            }],
+        }],
+        "schema_version": BENCHMARK_CELL_SCHEMA_VERSION,
+        "query": query_payload,
+    }
+    validate_benchmark_payload(payload, require_receipts=require_receipts)
+    return payload
+
+
+def validate_summary_bytes(summary: str) -> None:
+    size = len(summary.encode("utf-8"))
+    if size > SUMMARY_LIMIT_BYTES:
+        raise ReceiptContractError(
+            f"Summary exceeds {SUMMARY_LIMIT_BYTES} bytes: {size}"
+        )
+
+
+def _validate_identity(identity: Any) -> None:
+    if not isinstance(identity, dict) or set(identity) != {
+        "schema_version", "artifact", "structure", "dependencies"
+    }:
+        raise ReceiptContractError(
+            "artifact identity must contain schema_version/artifact/structure/dependencies"
+        )
+    if (
+        not isinstance(identity["schema_version"], int)
+        or isinstance(identity["schema_version"], bool)
+        or identity["schema_version"] != EVIDENCE_SCHEMA_VERSION
+    ):
+        raise ReceiptContractError("artifact identity has an invalid schema version")
+    for key in ("artifact", "structure", "dependencies"):
+        words = identity[key]
+        if not isinstance(words, list) or len(words) != 2 or any(
+            not isinstance(word, int) or word < 0 or word >= 1 << 64 for word in words
+        ):
+            raise ReceiptContractError(f"artifact identity {key} is not two u64 words")
+
+
+def _validate_receipt_fields(value: Any, *, required_identity: bool) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        raise ReceiptContractError("receipt detail must be an object")
+    if required_identity:
+        identity = value.get("artifact_identity")
+        _validate_identity(identity)
+        return identity
+    return None
+
+
+def _validate_compile_receipt(value: Any, identity: dict[str, Any]) -> None:
+    if not isinstance(value, dict):
+        raise ReceiptContractError("verified association lacks the immutable compile receipt")
+    if value.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+        raise ReceiptContractError("unsupported compile receipt schema version")
+    if value.get("artifact_identity") != identity:
+        raise ReceiptContractError("compile receipt identity differs from the artifact")
+    retired = {"search_stop", "search_complete", "quality_policy_satisfied", "obligations",
+               "groups", "logical_expressions", "physical_expressions"}
+    if retired.intersection(value):
+        raise ReceiptContractError("compile receipt contains retired search facts")
+    status = value.get("planning_status")
+    if not isinstance(status, dict) or set(status) != {"Observed"} or status["Observed"] not in {"Planned", "PlannedWithFallback"}:
+        raise ReceiptContractError("compile receipt lacks a valid planning status")
+    limited = value.get("budget_limited")
+    if not isinstance(limited, dict) or set(limited) != {"Observed"} or type(limited["Observed"]) is not bool:
+        raise ReceiptContractError("compile receipt has invalid budget_limited")
+    if limited["Observed"] != (status["Observed"] == "PlannedWithFallback"):
+        raise ReceiptContractError("planning status contradicts regional fallback")
+    for field in ("expected_class", "variant_count"):
+        observed = value.get(field)
+        if not isinstance(observed, dict) or set(observed) != {"Observed"}:
+            raise ReceiptContractError(f"compile receipt has invalid {field}")
+        if type(observed["Observed"]) is not int or observed["Observed"] < 0:
+            raise ReceiptContractError(f"compile receipt has invalid {field} value")
+    if value["variant_count"]["Observed"] != 1 or value.get("omitted_variants") != 0:
+        raise ReceiptContractError("compiled statement must carry exactly one physical plan")
+    compile_work = value.get("compile_work")
+    if compile_work is not None:
+        if not isinstance(compile_work, dict) or any(
+            not isinstance(compile_work.get(field), int) or compile_work[field] < 0
+            for field in (
+                "compiler_elapsed_us",
+                "optimizer_elapsed_us",
+                "normalization_elapsed_us",
+                "physical_alternatives",
+            )
+        ):
+            raise ReceiptContractError("compile receipt has invalid work summary")
+
+
+def payload_size_bytes(payload: dict[str, Any]) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))

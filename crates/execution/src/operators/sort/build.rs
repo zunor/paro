@@ -11,6 +11,7 @@ use paro_common::types::LogicalType;
 
 use crate::explain::types::ExplainRuntimeStats;
 use crate::physical::properties::MemoryClass;
+use crate::physical::specs::SpillExecutionPolicy;
 use crate::runtime::breaker::{HandleRef, SortHandle, SortPendingRunsReclaimer};
 use crate::runtime::context::{
     OperatorCallContext, OperatorFinishContext, PipelineInitContext, QueryRuntimeContext,
@@ -39,13 +40,13 @@ pub struct SortBuildSinkExec {
     pub input_types: Box<[LogicalType]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
-    pub force_external: bool,
+    pub spill_policy: crate::physical::specs::SpillExecutionPolicy,
 }
 
 impl SortBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
-        let force_external = self.force_external || ctx.query.session.limits.force_external;
+        let force_external = self.spill_policy == SpillExecutionPolicy::ForcedExternal;
         if force_external && !query_has_temporary_directory(ctx.query) {
             return Err(paro_error::out_of_memory(
                 "force_external sort requires a temporary directory",
@@ -58,7 +59,9 @@ impl SortBuildSinkExec {
             false,
         )?);
         handle.initialize(sort, self.output_types.clone(), force_external)?;
-        if query_has_temporary_directory(ctx.query) {
+        if self.spill_policy != SpillExecutionPolicy::InMemory
+            && query_has_temporary_directory(ctx.query)
+        {
             ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
                 SortPendingRunsReclaimer::for_query(
                     handle.clone(),
@@ -193,7 +196,7 @@ impl SortBuildSinkExec {
             ));
         };
         let handle = global.handle.clone();
-        let num_threads = ctx.query.session.number_of_threads();
+        let num_threads = ctx.query.max_parallel_tasks();
         if let Some(work) = prepare_parallel_sort_finalize(
             Arc::clone(&handle),
             num_threads,
@@ -315,7 +318,7 @@ pub(crate) fn sort_run_target_bytes(query: &QueryRuntimeContext, force_external:
     let target = if query_cap >= usize::MAX / 8 {
         DEFAULT_SORT_RUN_TARGET_BYTES
     } else {
-        query_cap / query.session.number_of_threads().max(1)
+        query_cap / query.max_parallel_tasks()
     };
     target.max(paro_storage::buffer::DEFAULT_BLOCK_SIZE)
 }

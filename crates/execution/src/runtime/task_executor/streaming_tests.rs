@@ -24,6 +24,7 @@ fn topn_and_window_stream_through_typed_transforms() {
                 nulls_first: true,
             }]
             .into_boxed_slice(),
+            projection_map: Box::new([0]),
             limit: 2,
             offset: 0,
             hnsw_options: Default::default(),

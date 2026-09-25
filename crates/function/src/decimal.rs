@@ -222,22 +222,6 @@ pub(crate) fn pow10_i128(exp: u8) -> Option<i128> {
     pow10_checked(exp)
 }
 
-pub(crate) fn rescale(value: i256, from_scale: u8, to_scale: u8) -> Result<i256> {
-    let scale_delta = from_scale.abs_diff(to_scale);
-    if scale_delta > MAX_DECIMAL_PRECISION * 2 {
-        return Err(paro_error::out_of_range(format!(
-            "Decimal scale {scale_delta} exceeds the exact intermediate range"
-        )));
-    }
-    rescale_checked(value, from_scale, to_scale)
-        .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))
-}
-
-pub(crate) fn round_divide(value: i256, divisor: i256) -> Result<i256> {
-    round_divide_checked(value, divisor)
-        .ok_or_else(|| paro_error::out_of_range("Decimal division overflow"))
-}
-
 pub(crate) fn check_precision(value: i256, precision: u8) -> Result<()> {
     if precision == 0 || precision > MAX_DECIMAL_PRECISION {
         return Err(paro_error::invalid_input(format!(
@@ -344,7 +328,7 @@ mod tests {
         let product = value.checked_mul(value).unwrap();
         assert!(product > i256::from(i128::MAX));
         assert_eq!(
-            rescale(product, 76, 38).unwrap(),
+            rescale_checked(product, 76, 38).unwrap(),
             pow10(38).unwrap() - i256::from(2)
         );
     }
@@ -361,8 +345,10 @@ mod tests {
             assert_eq!(
                 rescale_checked(value, from_scale, to_scale),
                 Some(
-                    i128::try_from(rescale(i256::from(value), from_scale, to_scale).unwrap())
-                        .unwrap()
+                    i128::try_from(
+                        rescale_checked(i256::from(value), from_scale, to_scale).unwrap(),
+                    )
+                    .unwrap()
                 )
             );
         }

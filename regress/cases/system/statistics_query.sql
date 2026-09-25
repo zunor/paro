@@ -29,6 +29,9 @@ FROM paro_tables()
 WHERE table_name IN ('stats_big', 'stats_small')
 ORDER BY table_name;
 
+-- A commutative join may expose either equivalent internal column order;
+-- validate the complete typed schema without assigning meaning to that order.
+-- @normalize explain_schema_order
 EXPLAIN (VERBOSE)
 SELECT s.id, b.payload
 FROM stats_small AS s

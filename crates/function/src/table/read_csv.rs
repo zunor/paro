@@ -24,7 +24,9 @@ use paro_common::vector::VECTOR_SIZE;
 
 use crate::copy::{CopyFormat, CopyFromSource, CopyOptions};
 use crate::scalar::cast::array_casts::parse_vector_literal;
-use crate::scalar::cast::date_casts::parse_date_text;
+use crate::scalar::cast::date_casts::{
+    parse_date_text, parse_timestamp_text, parse_timestamptz_text,
+};
 use crate::scalar::cast::decimal_casts::parse_decimal_text;
 
 use super::{
@@ -234,6 +236,26 @@ struct ReadCsvBindData {
 }
 
 impl TableFunctionBindData for ReadCsvBindData {
+    fn canonical_plan_payload(&self) -> Option<Vec<u8>> {
+        Some(
+            serde_json::json!([
+                "paro.read-csv.v1",
+                self.source.identity_value(),
+                self.types,
+                self.skip_header,
+                self.options.delimiter,
+                self.options.null_string,
+                self.options.header,
+                self.options.quote,
+                self.options.escape,
+                self.options.parallel,
+                self.options.parallel_workers
+            ])
+            .to_string()
+            .into_bytes(),
+        )
+    }
+
     fn clone_box(&self) -> Box<dyn TableFunctionBindData> {
         Box::new(self.clone())
     }
@@ -1317,6 +1339,12 @@ fn parse_field(field: &ParsedField, target_type: &LogicalType) -> Result<Value> 
         LogicalType::Date => parse_date_text(&field.value)
             .map(Value::Date)
             .ok_or_else(|| paro_error::invalid_value(target_type.to_string(), field.value.clone())),
+        LogicalType::Timestamp => parse_timestamp_text(&field.value)
+            .map(Value::Timestamp)
+            .ok_or_else(|| paro_error::invalid_value(target_type.to_string(), field.value.clone())),
+        LogicalType::TimestampTz => parse_timestamptz_text(&field.value)
+            .map(Value::TimestampTz)
+            .ok_or_else(|| paro_error::invalid_value(target_type.to_string(), field.value.clone())),
         _ => Err(paro_error::not_implemented(format!(
             "read_csv does not support type {}",
             target_type
@@ -1451,6 +1479,18 @@ mod tests {
         let value = parse_field(&field, &LogicalType::Date).unwrap();
 
         assert_eq!(value, Value::Date(10_561));
+    }
+
+    #[test]
+    fn parse_field_supports_timestamp_with_ignored_offset() {
+        let field = ParsedField {
+            value: "1970-01-01T00:00:00.123+09:30".to_string(),
+            is_null: false,
+        };
+
+        let value = parse_field(&field, &LogicalType::Timestamp).unwrap();
+
+        assert_eq!(value, Value::Timestamp(123_000));
     }
 
     #[test]

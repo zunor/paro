@@ -119,3 +119,5 @@ COPY part FROM '${data_dir}/part.tbl' WITH (FORMAT csv, DELIMITER '|');
 COPY partsupp FROM '${data_dir}/partsupp.tbl' WITH (FORMAT csv, DELIMITER '|');
 COPY orders FROM '${data_dir}/orders.tbl' WITH (FORMAT csv, DELIMITER '|');
 COPY lineitem FROM '${data_dir}/lineitem.tbl' WITH (FORMAT csv, DELIMITER '|');
+
+SET optimizer_verify = ${optimizer_verify};

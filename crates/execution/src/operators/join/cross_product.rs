@@ -7,6 +7,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector, VectorSelection, VECTOR_SIZE};
+use paro_storage::row::RowStore;
 
 use crate::runtime::breaker::{HandleRef, MaterializedHandle, MaterializedReader};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
@@ -56,26 +57,45 @@ impl CrossProductProbeTransformExec {
                 "cross product probe transform local state mismatch",
             ));
         };
-        let build_chunks = global.sealed_chunks()?;
         if input.is_empty() {
             output.try_set_cardinality(0)?;
             return Ok(TransformPoll::NeedMoreInput);
-        }
-        if build_chunks.iter().all(Chunk::is_empty) {
-            output.try_set_cardinality(0)?;
-            return Ok(TransformPoll::NeedMoreInput);
-        }
-        if self.output_types.len()
-            != input.column_count() + right_build_column_count(build_chunks.as_ref())
-        {
-            return Err(paro_error::internal(
-                "cross product probe output type count does not match input and build columns",
-            ));
         }
         if self.left_column_count != input.column_count() {
             return Err(paro_error::internal(
                 "cross product probe left column count does not match input",
             ));
+        }
+        let Some(right_types) = self.output_types.get(self.left_column_count..) else {
+            return Err(paro_error::internal(
+                "cross product output has fewer columns than its left input",
+            ));
+        };
+
+        if let Some(stores) = global.external_row_stores()? {
+            return transform_external_cross_product(
+                input,
+                output,
+                local,
+                stores,
+                self.left_column_count,
+                right_types,
+            );
+        }
+
+        let build_chunks = global.sealed_chunks()?;
+        if build_chunks.iter().all(Chunk::is_empty) {
+            output.try_set_cardinality(0)?;
+            return Ok(TransformPoll::NeedMoreInput);
+        }
+        if right_types.len() != right_build_column_count(build_chunks.as_ref()) {
+            return Err(paro_error::internal(
+                "cross product probe output type count does not match input and build columns",
+            ));
+        }
+        if let Some(build) = singleton_build_chunk(build_chunks.as_ref()) {
+            emit_scalar_build_batch(input, build, self.left_column_count, output)?;
+            return Ok(TransformPoll::Output);
         }
 
         if !local.probe_in_progress {
@@ -157,6 +177,129 @@ impl CrossProductProbeTransformExec {
     }
 }
 
+fn transform_external_cross_product(
+    input: &Chunk,
+    output: &mut Chunk,
+    local: &mut CrossProductProbeTransformLocal,
+    stores: &[Arc<RowStore>],
+    left_column_count: usize,
+    right_types: &[LogicalType],
+) -> Result<TransformPoll> {
+    if stores.iter().all(|store| store.count() == 0) {
+        output.try_set_cardinality(0)?;
+        return Ok(TransformPoll::NeedMoreInput);
+    }
+    if stores
+        .iter()
+        .any(|store| store.layout().types() != right_types)
+    {
+        return Err(paro_error::internal(
+            "external cross product build schema does not match its physical contract",
+        ));
+    }
+
+    if !local.probe_in_progress {
+        local.probe_row = 0;
+        local.external_store = 0;
+        local.external_scan.reset();
+        local.external_chunk_ready = false;
+        local.probe_in_progress = true;
+    }
+    if local.external_chunk.is_none() {
+        local.external_chunk = Some(Chunk::try_initialize(
+            right_types,
+            VECTOR_SIZE,
+            input.allocator().clone(),
+        )?);
+    }
+
+    let build = local
+        .external_chunk
+        .as_mut()
+        .expect("external cross product scratch initialized above");
+    if !local.external_chunk_ready {
+        loop {
+            let Some(store) = stores.get(local.external_store) else {
+                local.probe_in_progress = false;
+                output.try_set_cardinality(0)?;
+                return Ok(TransformPoll::NeedMoreInput);
+            };
+            let count = store.scan_with_state(&mut local.external_scan, build)?;
+            if count > 0 {
+                local.external_chunk_ready = true;
+                local.probe_row = 0;
+                break;
+            }
+            local.external_store += 1;
+            local.external_scan.reset();
+        }
+    }
+
+    let count = build.size();
+    if count == 1 {
+        emit_scalar_build_batch(input, build, left_column_count, output)?;
+        local.external_chunk_ready = false;
+        local.probe_row = 0;
+        return Ok(TransformPoll::OutputMore);
+    }
+    emit_cross_product_batch(
+        input,
+        build,
+        left_column_count,
+        local.probe_row,
+        0,
+        count,
+        output,
+    )?;
+    local.probe_row += 1;
+    if local.probe_row >= input.size() {
+        // Reuse each external build block for the whole probe vector
+        // before advancing the disk cursor. This changes external cross
+        // product I/O from one full build scan per probe row to one scan
+        // per probe chunk while retaining vector-bounded output.
+        local.external_chunk_ready = false;
+        local.probe_row = 0;
+    }
+    Ok(TransformPoll::OutputMore)
+}
+
+fn singleton_build_chunk(build_chunks: &[Chunk]) -> Option<&Chunk> {
+    let mut singleton = None;
+    for chunk in build_chunks.iter().filter(|chunk| !chunk.is_empty()) {
+        if chunk.size() != 1 || singleton.is_some() {
+            return None;
+        }
+        singleton = Some(chunk);
+    }
+    singleton
+}
+
+fn emit_scalar_build_batch(
+    input: &Chunk,
+    build: &Chunk,
+    left_column_count: usize,
+    output: &mut Chunk,
+) -> Result<()> {
+    if build.size() != 1 {
+        return Err(paro_error::internal(
+            "scalar cross product build must contain exactly one row",
+        ));
+    }
+    let allocator = input.allocator().clone();
+    let scalar_selection = SelectionVector::try_repeated(0, input.size(), allocator.clone())?;
+    let mut vectors = Vec::with_capacity(left_column_count + build.column_count());
+    vectors.extend(input.data.iter().take(left_column_count).cloned());
+    for column in 0..build.column_count() {
+        vectors.push(Arc::new(Vector::try_dictionary(
+            Arc::clone(&build.data[column]),
+            scalar_selection.clone(),
+        )?));
+    }
+    *output = Chunk::from_arc_vectors(vectors, allocator);
+    output.try_set_cardinality(input.size())?;
+    Ok(())
+}
+
 fn right_build_column_count(build_chunks: &[Chunk]) -> usize {
     build_chunks
         .iter()
@@ -195,4 +338,37 @@ fn emit_cross_product_batch(
     *output = Chunk::from_arc_vectors(vectors, allocator);
     output.try_set_cardinality(count)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_common::test_utils::{test_allocator, test_chunk_from_vectors};
+
+    fn integers(values: &[i32]) -> Chunk {
+        test_chunk_from_vectors(vec![
+            Vector::try_from_i32(values, test_allocator()).expect("integer vector")
+        ])
+    }
+
+    #[test]
+    fn singleton_build_is_broadcast_over_the_probe_vector() {
+        let input = integers(&[10, 20, 30]);
+        let build = integers(&[7]);
+        let mut output = Chunk::try_new(test_allocator()).expect("output chunk");
+
+        emit_scalar_build_batch(&input, &build, 1, &mut output).expect("scalar broadcast");
+
+        assert_eq!(output.size(), 3);
+        assert_eq!(output.column(0).unwrap().get_i32(0), Some(10));
+        assert_eq!(output.column(0).unwrap().get_i32(2), Some(30));
+        assert_eq!(output.column(1).unwrap().get_i32(0), Some(7));
+        assert_eq!(output.column(1).unwrap().get_i32(2), Some(7));
+    }
+
+    #[test]
+    fn singleton_detection_rejects_multiple_nonempty_chunks() {
+        let chunks = vec![integers(&[1]), integers(&[2])];
+        assert!(singleton_build_chunk(&chunks).is_none());
+    }
 }

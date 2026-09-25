@@ -10,10 +10,11 @@ use paro_common::identity::GraphId;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, VectorSelection};
 use paro_parser::ast::PathMode;
-use paro_planner::operator::graph_expand::{graph_path_element_list_type, ExpandDirection};
+use paro_planner::logical::operator::graph_expand::{
+    graph_path_element_list_type, ExpandDirection,
+};
 
 use crate::operators::graph::state::{graph_path_list_value, GraphPathPayload};
-use crate::operators::sort::build::query_has_temporary_directory;
 use crate::physical::specs::GraphShortestPathSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::state::{
@@ -38,11 +39,6 @@ struct ShortestPathRow {
 
 impl GraphShortestPathTransformExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<TransformGlobal> {
-        if ctx.query.session.limits.force_external && !query_has_temporary_directory(ctx.query) {
-            return Err(paro_error::out_of_memory(
-                "force_external graph shortest path requires a temporary directory",
-            ));
-        }
         if self.spec.target_filter.is_some() {
             return Err(paro_error::not_implemented(
                 "typed GraphShortestPath target filters require graph target materialization",
@@ -51,9 +47,7 @@ impl GraphShortestPathTransformExec {
         let snapshot = ctx
             .query
             .session
-            .services
-            .graph_index
-            .snapshot(&GraphId::new(
+            .graph_snapshot(&GraphId::new(
                 ctx.query.session.current_database(),
                 &self.spec.schema_name,
                 &self.spec.graph_name,

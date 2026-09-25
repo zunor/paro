@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import sys
@@ -22,6 +22,7 @@ from harness import (
     load_workloads,
     select_queries_exact,
 )
+from harness.run_output import RunOutput, RunOutputError
 
 
 TRUE_SET = {"1", "true", "yes", "on"}
@@ -42,7 +43,8 @@ class RunnerConfig:
     timeout_seconds: int
     collect_memory: bool
     collect_explain_profile: bool
-    output_path: Path
+    collect_compile_receipts: bool
+    output_path: Path | None = None
 
     @property
     def workloads_dir(self) -> Path:
@@ -72,13 +74,21 @@ class BenchmarkInvocation:
     timeout_seconds: int | None = None
     collect_memory: bool | None = None
     collect_explain_profile: bool | None = None
+    collect_compile_receipts: bool | None = None
     workload: str | None = None
     filter: str | None = None
     suite: str | None = None
     param: list[str] | None = None
-    output: Path | None = None
     pid: int = 0
     query_ids_by_workload: dict[str, tuple[str, ...]] | None = None
+    report_root: Path | None = None
+    run_id: str | None = None
+    run_output: RunOutput | None = None
+    source_id: str | None = None
+    attempt_id: str | None = None
+    query_case: str | None = None
+    arm_id: str | None = None
+    output_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +151,20 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Disable EXPLAIN ANALYZE sidecar collection",
     )
+    parser.add_argument(
+        "--collect-receipts",
+        dest="collect_compile_receipts",
+        action="store_true",
+        default=None,
+        help="Collect bounded compile/admission receipts after each timed query",
+    )
+    parser.add_argument(
+        "--no-collect-receipts",
+        dest="collect_compile_receipts",
+        action="store_false",
+        default=None,
+        help="Disable bounded compile/admission receipt collection",
+    )
 
     parser.add_argument("--workload", help="Run only one workload by name")
     parser.add_argument("--filter", help="Filter queries by substring")
@@ -153,7 +177,19 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="Override workload parameter",
     )
 
-    parser.add_argument("--output", type=Path, help="JSON report path (default: benchmark/report/result.json)")
+    parser.add_argument(
+        "--report-root",
+        type=Path,
+        help="owned benchmark run parent (default: benchmark/report)",
+    )
+    parser.add_argument(
+        "--run-id",
+        help="exclusive run identity; an opaque identity is generated when omitted",
+    )
+    parser.add_argument(
+        "--arm-id",
+        help="stable campaign arm identity; it is part of the QueryCase×ArmId cell",
+    )
     parser.add_argument("--pid", type=int, default=0, help="Sample peak RSS for the given parod pid")
 
 
@@ -211,6 +247,10 @@ def resolve_config(args: BenchmarkInvocation, *, env: Mapping[str, str] | None =
         defaults_table.get("collect_explain_profile", False),
         field="defaults.collect_explain_profile",
     )
+    collect_compile_receipts = _as_bool(
+        defaults_table.get("collect_compile_receipts", True),
+        field="defaults.collect_compile_receipts",
+    )
 
     if "PARO_HOST" in environment:
         connection["host"] = environment["PARO_HOST"]
@@ -236,6 +276,11 @@ def resolve_config(args: BenchmarkInvocation, *, env: Mapping[str, str] | None =
             environment["BENCH_COLLECT_EXPLAIN_PROFILE"],
             "BENCH_COLLECT_EXPLAIN_PROFILE",
         )
+    if "BENCH_COLLECT_RECEIPTS" in environment:
+        collect_compile_receipts = _parse_bool(
+            environment["BENCH_COLLECT_RECEIPTS"],
+            "BENCH_COLLECT_RECEIPTS",
+        )
     if args.host is not None:
         connection["host"] = args.host
     if args.port is not None:
@@ -256,10 +301,8 @@ def resolve_config(args: BenchmarkInvocation, *, env: Mapping[str, str] | None =
         collect_memory = args.collect_memory
     if args.collect_explain_profile is not None:
         collect_explain_profile = args.collect_explain_profile
-
-    output_path = args.output if args.output is not None else root_dir / "report" / "result.json"
-    if not output_path.is_absolute():
-        output_path = (Path.cwd() / output_path).resolve()
+    if args.collect_compile_receipts is not None:
+        collect_compile_receipts = args.collect_compile_receipts
 
     if iterations <= 0:
         raise RunnerError("--iterations must be > 0")
@@ -277,7 +320,7 @@ def resolve_config(args: BenchmarkInvocation, *, env: Mapping[str, str] | None =
         timeout_seconds=timeout_seconds,
         collect_memory=collect_memory,
         collect_explain_profile=collect_explain_profile,
-        output_path=output_path,
+        collect_compile_receipts=collect_compile_receipts,
     )
 
 
@@ -441,16 +484,28 @@ def run(argv: list[str] | None = None) -> int:
         )
 
     args = _invocation_from_namespace(parsed)
+    run_output: RunOutput | None = None
     try:
         config = resolve_config(args)
         param_overrides = parse_param_overrides(args.param)
+        run_output = RunOutput.create(
+            _resolve_report_root(config.root_dir, args.report_root),
+            run_id=args.run_id,
+        )
+        args = replace(args, run_output=run_output)
     except RunnerError as exc:
+        print(f"runner error: {exc}", file=sys.stderr)
+        return 2
+    except RunOutputError as exc:
         print(f"runner error: {exc}", file=sys.stderr)
         return 2
 
     try:
         result = execute_workloads(config, args, param_overrides)
+        run_output.finalize(status="Failed" if result.failed else "Completed")
     except Exception as exc:
+        if run_output is not None:
+            run_output.finalize(status="Failed")
         print(f"failed to run benchmark: {exc}", file=sys.stderr)
         return 2
 
@@ -461,43 +516,149 @@ def execute_workloads(
     config: RunnerConfig,
     args: BenchmarkInvocation,
     param_overrides: Mapping[str, Any],
+    *,
+    run_output: RunOutput | None = None,
 ) -> BenchmarkRunResult:
-    workloads = load_selected_workloads(config, args, param_overrides)
-    if not workloads:
-        raise RunnerError("no workloads selected")
+    owned_run = run_output is None and args.run_output is None
+    active_run = run_output or args.run_output
+    if active_run is None:
+        active_run = RunOutput.create(
+            _resolve_report_root(config.root_dir, args.report_root),
+            run_id=args.run_id,
+        )
 
-    executor = BenchmarkExecutor(
-        connection=config.connection,
-        iterations=config.iterations,
-        warmup=config.warmup,
-        timeout_seconds=config.timeout_seconds,
-        collect_memory=config.collect_memory,
-        profile_pid=args.pid,
-    )
-    validator = BenchmarkValidator(
-        executor.connection_factory,
-        timeout_seconds=config.timeout_seconds,
-    )
-    reporter = BenchmarkReporter(config.root_dir)
+    # Direct `runner.py run` is itself a source invocation.  Give it the same
+    # AttemptId-owned directory as gate/source adapters; otherwise it would
+    # write a root-level result with no recoverable attempt state.  Adapters
+    # that already own an attempt pass its identity through and do not enter
+    # this branch.
+    owned_attempt = None
+    if args.attempt_id is None:
+        source_id = args.source_id or args.query_case or args.suite or args.workload or "adhoc"
+        query_case = args.query_case or args.suite or args.workload or source_id
+        arm_id = args.arm_id or "default"
+        owned_attempt = active_run.begin_attempt(
+            source_id,
+            query_case=query_case,
+            arm_id=arm_id,
+        )
+        args = replace(
+            args,
+            source_id=owned_attempt.source_id,
+            attempt_id=owned_attempt.attempt_id,
+            query_case=owned_attempt.query_case,
+            arm_id=owned_attempt.arm_id,
+            output_root=owned_attempt.root,
+        )
 
-    workload_results = [executor.run_workload(workload, validator) for workload in workloads]
-    payload = reporter.build_payload(
-        workloads=workload_results,
-        iterations=config.iterations,
-        warmup=config.warmup,
-        timeout_seconds=config.timeout_seconds,
-        collect_memory=config.collect_memory,
-        collect_explain_profile=config.collect_explain_profile,
-    )
-    result_path, summary_path = reporter.write_reports(payload, config.output_path)
-    reporter.print_terminal_summary(workload_results, result_path)
+    try:
+        workloads = load_selected_workloads(config, args, param_overrides)
+        if not workloads:
+            raise RunnerError("no workloads selected")
+        query_count = sum(len(workload.queries) for workload in workloads)
+        active_run.registration.cell(
+            query_cases=query_count,
+            # Warmups never produce benchmark receipts.  Registration counts
+            # only the target executions that the shared payload can bind.
+            sample_rows=query_count * max(config.iterations, 1),
+            product_receipts=query_count * max(config.iterations, 1),
+            query_case=args.query_case or args.suite or args.workload or args.source_id or "adhoc",
+            arm_id=args.arm_id or "default",
+        )
 
-    return BenchmarkRunResult(
-        payload=payload,
-        result_path=result_path,
-        summary_path=summary_path,
-        failed=reporter.has_failures(workload_results),
-    )
+        executor = BenchmarkExecutor(
+            connection=config.connection,
+            iterations=config.iterations,
+            warmup=config.warmup,
+            timeout_seconds=config.timeout_seconds,
+            collect_memory=config.collect_memory,
+            profile_pid=args.pid,
+            collect_compile_receipts=config.collect_compile_receipts,
+        )
+        validator = BenchmarkValidator(
+            executor.connection_factory,
+            timeout_seconds=config.timeout_seconds,
+        )
+        reporter = BenchmarkReporter(config.root_dir)
+
+        workload_results = [executor.run_workload(workload, validator) for workload in workloads]
+        payload = reporter.build_payload(
+            workloads=workload_results,
+            iterations=config.iterations,
+            warmup=config.warmup,
+            timeout_seconds=config.timeout_seconds,
+            collect_memory=config.collect_memory,
+            collect_explain_profile=config.collect_explain_profile,
+            collect_compile_receipts=config.collect_compile_receipts,
+            run_output=active_run,
+            source_id=args.source_id,
+            attempt_id=args.attempt_id,
+            query_case=args.query_case or args.suite or args.workload or args.source_id or "adhoc",
+            arm_id=args.arm_id or "default",
+        )
+        output_root = active_run.owned_path(args.output_root or active_run.root)
+        evidence_writer = (
+            owned_attempt.cell_writer()
+            if owned_attempt is not None
+            else active_run.cell_writer(
+                query_case=args.query_case or args.suite or args.workload or args.source_id or "adhoc",
+                arm_id=args.arm_id or "default",
+                root=output_root,
+            )
+        )
+        result_path, summary_path = reporter.write_reports(
+            payload, evidence_writer
+        )
+        reporter.print_terminal_summary(workload_results, result_path)
+
+        result = BenchmarkRunResult(
+            payload=payload,
+            result_path=result_path,
+            summary_path=summary_path,
+            failed=reporter.has_failures(workload_results),
+        )
+        if owned_attempt is not None:
+            owned_attempt.seal(
+                status="Failed" if result.failed else "Completed",
+                result_path=result.result_path,
+                summary_path=result.summary_path,
+            )
+            if not result.failed:
+                owned_attempt.accept()
+    except BaseException:
+        if owned_attempt is not None:
+            try:
+                owned_attempt.write_failure(status="Incomplete", error="benchmark run did not reach a terminal result")
+                owned_attempt.seal(status="Incomplete", failure_path=owned_attempt.failure_path)
+            except (RunOutputError, OSError):
+                # The original run exception is authoritative.  A bounded
+                # terminal writer failure is visible in the run manifest or
+                # capacity state and must not replace it.
+                pass
+        if owned_run:
+            active_run.finalize(status="Incomplete")
+        raise
+    if owned_run:
+        active_run.finalize(status="Failed" if result.failed else "Completed")
+    return result
+
+
+def _resolve_report_root(root_dir: Path, value: Path | None) -> Path:
+    if value is None:
+        return root_dir / "report"
+    return value if value.is_absolute() else (Path.cwd() / value).resolve()
+
+
+def _as_bool_env(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    lowered = value.strip().lower()
+    if lowered in TRUE_SET:
+        return True
+    if lowered in FALSE_SET:
+        return False
+    raise RunnerError(f"{name} must be one of: {sorted(TRUE_SET | FALSE_SET)}")
 
 
 def _load_toml(path: Path) -> dict[str, Any]:

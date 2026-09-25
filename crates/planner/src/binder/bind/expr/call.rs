@@ -127,11 +127,9 @@ fn bind_scalar_or_routine(
             let return_type = bound_function.return_type.clone();
             validate_non_literal_return_type(name, &return_type, false)?;
 
-            Ok(Expression::Function(FunctionExpression::new(
-                bound_function,
-                bound_args,
-                return_type,
-            )))
+            Ok(Expression::Function(
+                FunctionExpression::new(bound_function, bound_args, return_type).into(),
+            ))
         }
         ResolvedScalarCallable::Routine(overload) => {
             bind_external_scalar_routine(name, overload, &arg_types, &mut bound_args, binder)
@@ -148,9 +146,10 @@ fn bind_aggregate_function(
     filter: Option<Expr>,
     order_bys: Vec<OrderByExpr>,
 ) -> Result<Expression> {
-    Ok(Expression::Aggregate(bind_aggregate_invocation(
-        binder, schema, name, args, distinct, filter, order_bys,
-    )?))
+    Ok(Expression::Aggregate(
+        (bind_aggregate_invocation(binder, schema, name, args, distinct, filter, order_bys)?)
+            .into(),
+    ))
 }
 
 /// Bind one native aggregate call into its complete execution-bearing IR.
@@ -676,7 +675,8 @@ fn bind_external_scalar_routine(
     };
     Ok(Expression::Function(
         FunctionExpression::new(bound_function, std::mem::take(bound_args), return_type)
-            .with_routine_meta(routine_meta),
+            .with_routine_meta(routine_meta)
+            .into(),
     ))
 }
 
@@ -788,7 +788,7 @@ mod tests {
         let Expression::Aggregate(aggregate) = expr else {
             panic!("expected bound aggregate expression");
         };
-        aggregate
+        aggregate.into_inner()
     }
 
     fn install_test_aggregate(

@@ -7,7 +7,7 @@
 //! provides cache-aware page loading with optional decompressed caching.
 
 use std::io::{Read, Seek};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -20,12 +20,108 @@ use crate::rowset::page::{PageFooter, PageIO, PagePointer, PageReadOptions};
 
 const SLOW_PAGE_IO_THRESHOLD: Duration = Duration::from_millis(8);
 const SLOW_PAGE_DECOMPRESS_THRESHOLD: Duration = Duration::from_millis(8);
-const SLOW_PAGE_FALLBACK_THRESHOLD: Duration = Duration::from_millis(12);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodedPageAccess {
     Sequential,
-    SparseGather,
+    SparseGather {
+        selected_rows: usize,
+        decoded_groups: usize,
+        group_runs: usize,
+    },
+}
+
+pub(crate) const BITSHUFFLE_DECODE_GROUP_ROWS: usize = 8;
+const DEFAULT_FULL_DECODE_ROWS_PER_WORK_UNIT: usize = 8;
+const DEFAULT_DECODER_SEEK_WORK_UNITS: usize = 1024;
+
+/// Relative work units for decoded-page first-touch admission.
+///
+/// One full materialization is a contiguous SIMD pass. Sparse decoding pays
+/// for each touched codec group and for every discontinuous decoder seek. The
+/// policy compares those two physical shapes and separately excludes point
+/// lookups; it does not infer reuse from a page-size ratio. Probation promotion
+/// uses the same work ratio as its reuse threshold, so an expensive full-page
+/// decode requires proportionally stronger observed-frequency evidence. The
+/// weights are calibration parameters, not codec geometry: their defaults are
+/// tracked by the `search_row_fetch` small-batch benchmark independently from
+/// `BITSHUFFLE_DECODE_GROUP_ROWS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedPageAdmissionPolicy {
+    /// Diagnostic intervention only. Sparse-gather admission and cache hits
+    /// remain unchanged; sequential reads use the codec's streaming path.
+    pub sequential_materialization: bool,
+    min_analytical_selected_rows: usize,
+    full_decode_rows_per_work_unit: usize,
+    decoder_seek_work_units: usize,
+}
+
+impl DecodedPageAdmissionPolicy {
+    pub fn new(
+        min_analytical_selected_rows: usize,
+        full_decode_rows_per_work_unit: usize,
+        decoder_seek_work_units: usize,
+    ) -> Result<Self> {
+        if min_analytical_selected_rows == 0
+            || full_decode_rows_per_work_unit == 0
+            || decoder_seek_work_units == 0
+        {
+            return Err(paro_error::invalid_input(
+                "decoded-page admission weights must be positive",
+            ));
+        }
+        Ok(Self {
+            sequential_materialization: true,
+            min_analytical_selected_rows,
+            full_decode_rows_per_work_unit,
+            decoder_seek_work_units,
+        })
+    }
+}
+
+impl Default for DecodedPageAdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            sequential_materialization: true,
+            min_analytical_selected_rows: 16,
+            full_decode_rows_per_work_unit: DEFAULT_FULL_DECODE_ROWS_PER_WORK_UNIT,
+            decoder_seek_work_units: DEFAULT_DECODER_SEEK_WORK_UNITS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodedPageWork {
+    sequential: usize,
+    sparse: usize,
+}
+
+impl DecodedPageWork {
+    fn promotion_accesses(self) -> u32 {
+        u32::try_from(self.sequential.div_ceil(self.sparse.max(1)).max(2)).unwrap_or(u32::MAX)
+    }
+}
+
+fn decoded_page_work(
+    decoded_groups: usize,
+    group_runs: usize,
+    decoded_rows: usize,
+    policy: DecodedPageAdmissionPolicy,
+) -> DecodedPageWork {
+    DecodedPageWork {
+        sequential: decoded_rows.div_ceil(policy.full_decode_rows_per_work_unit),
+        sparse: decoded_groups
+            .saturating_mul(BITSHUFFLE_DECODE_GROUP_ROWS)
+            .saturating_add(group_runs.saturating_mul(policy.decoder_seek_work_units)),
+    }
+}
+
+fn analytical_gather_should_materialize(
+    selected_rows: usize,
+    work: DecodedPageWork,
+    policy: DecodedPageAdmissionPolicy,
+) -> bool {
+    selected_rows >= policy.min_analytical_selected_rows && work.sequential <= work.sparse
 }
 
 /// Page reader context used for PageKey construction and version isolation.
@@ -53,6 +149,7 @@ impl PageReaderContext {
 pub struct PageReaderOptions {
     pub cache_decompressed: bool,
     pub cache_decoded: bool,
+    pub decoded_admission_policy: DecodedPageAdmissionPolicy,
     pub parallel_decompressor: Option<ParallelDecompressor>,
 }
 
@@ -61,6 +158,7 @@ impl Default for PageReaderOptions {
         Self {
             cache_decompressed: false,
             cache_decoded: false,
+            decoded_admission_policy: DecodedPageAdmissionPolicy::default(),
             parallel_decompressor: None,
         }
     }
@@ -78,8 +176,14 @@ impl PageReader {
     pub fn new(
         context: PageReaderContext,
         cache: Option<Arc<PageCache>>,
-        options: PageReaderOptions,
+        mut options: PageReaderOptions,
     ) -> Self {
+        static STREAM_SEQUENTIAL: OnceLock<bool> = OnceLock::new();
+        if *STREAM_SEQUENTIAL.get_or_init(|| {
+            std::env::var("PARO_DIAGNOSTIC_STREAM_SEQUENTIAL").as_deref() == Ok("1")
+        }) {
+            options.decoded_admission_policy.sequential_materialization = false;
+        }
         Self {
             cache,
             context,
@@ -95,50 +199,30 @@ impl PageReader {
     ) -> Result<(Bytes, PageFooter, u32)> {
         let key = self.make_key(opts.page_pointer);
 
-        // If no cache, fall back to direct PageIO path (or allocator-aware decompressor).
+        // The same exact-page ownership path is used with and without the
+        // cache. Without a cache the Vec returned by PageIO is moved into
+        // Bytes; with a cache the reader fills the cache allocation directly.
         if self.cache.is_none() {
-            if let Some(decompressor) = &self.options.parallel_decompressor {
-                let io_start = Instant::now();
-                let raw = PageIO::read_page_bytes(reader, opts)?;
-                let io_elapsed = io_start.elapsed();
-                if io_elapsed >= SLOW_PAGE_IO_THRESHOLD {
-                    self.trace_slow_io(&key, io_elapsed, "direct");
-                }
-                let (footer, uncompressed_size, body_size) =
-                    PageIO::parse_page_footer(&raw, opts.verify_checksum)?;
-                let decompress_start = Instant::now();
-                let body = decompressor.decompress_one(
+            let raw = self.read_raw_page(reader, opts, &key)?;
+            let (footer, uncompressed_size, body_size) =
+                PageIO::parse_page_footer(&raw, opts.verify_checksum)?;
+            let decompress_start = Instant::now();
+            let body = if let Some(decompressor) = &self.options.parallel_decompressor {
+                decompressor.decompress_one(
                     &raw[..body_size],
                     uncompressed_size as usize,
                     opts.codec,
-                )?;
-                let decompress_elapsed = decompress_start.elapsed();
-                if decompress_elapsed >= SLOW_PAGE_DECOMPRESS_THRESHOLD {
-                    self.trace_slow_decompress(
-                        &key,
-                        decompress_elapsed,
-                        body_size,
-                        uncompressed_size,
-                    );
-                }
-                return Ok((body, footer, uncompressed_size));
+                )?
+            } else if body_size == uncompressed_size as usize {
+                raw.slice(..body_size)
+            } else {
+                PageIO::decompress_page_body(&raw[..body_size], uncompressed_size, opts.codec)?
+            };
+            let decompress_elapsed = decompress_start.elapsed();
+            if decompress_elapsed >= SLOW_PAGE_DECOMPRESS_THRESHOLD {
+                self.trace_slow_decompress(&key, decompress_elapsed, body_size, uncompressed_size);
             }
-            let fallback_start = Instant::now();
-            let result = PageIO::read_and_decompress_page(reader, opts);
-            let fallback_elapsed = fallback_start.elapsed();
-            if fallback_elapsed >= SLOW_PAGE_FALLBACK_THRESHOLD {
-                trace!(
-                    tablet_id = self.context.tablet_id,
-                    rowset_id = self.context.rowset_id,
-                    rowset_gen = self.context.rowset_gen,
-                    segment_id = self.context.segment_id,
-                    page_offset = key.page_offset,
-                    page_size = key.page_size,
-                    elapsed_ms = fallback_elapsed.as_secs_f64() * 1000.0,
-                    "slow page read+decompress fallback path",
-                );
-            }
-            return result;
+            return Ok((body, footer, uncompressed_size));
         }
 
         // If decompressed cache is enabled, try it first.
@@ -155,24 +239,59 @@ impl PageReader {
         let (footer, uncompressed_size, body_size) =
             PageIO::parse_page_footer(&raw, opts.verify_checksum)?;
         let decompress_start = Instant::now();
-        let body = if let Some(decompressor) = &self.options.parallel_decompressor {
+        let body = if self.options.cache_decompressed {
+            let cache = self
+                .cache
+                .as_ref()
+                .expect("cache-decompressed path requires a page cache");
+            let handle = cache.get_or_load_into(
+                key,
+                PageContentKind::Decompressed,
+                uncompressed_size as usize,
+                |destination| {
+                    if body_size == uncompressed_size as usize {
+                        destination.copy_from_slice(&raw[..body_size]);
+                        Ok(())
+                    } else if let Some(decompressor) = &self.options.parallel_decompressor {
+                        let decoded = decompressor.decompress_one(
+                            &raw[..body_size],
+                            uncompressed_size as usize,
+                            opts.codec,
+                        )?;
+                        if decoded.len() != destination.len() {
+                            return Err(paro_error::data_corrupted(format!(
+                                "Bad page: uncompressed size mismatch ({} vs {})",
+                                decoded.len(),
+                                uncompressed_size
+                            )));
+                        }
+                        destination.copy_from_slice(&decoded);
+                        Ok(())
+                    } else {
+                        PageIO::decompress_page_body_into(
+                            &raw[..body_size],
+                            uncompressed_size,
+                            opts.codec,
+                            destination,
+                        )
+                    }
+                },
+            )?;
+            handle.try_into_bytes()?
+        } else if let Some(decompressor) = &self.options.parallel_decompressor {
             decompressor.decompress_one(
                 &raw[..body_size],
                 uncompressed_size as usize,
                 opts.codec,
             )?
+        } else if body_size == uncompressed_size as usize {
+            raw.slice(..body_size)
         } else {
             PageIO::decompress_page_body(&raw[..body_size], uncompressed_size, opts.codec)?
         };
         let decompress_elapsed = decompress_start.elapsed();
         if decompress_elapsed >= SLOW_PAGE_DECOMPRESS_THRESHOLD {
             self.trace_slow_decompress(&key, decompress_elapsed, body_size, uncompressed_size);
-        }
-
-        if self.options.cache_decompressed {
-            if let Some(cache) = &self.cache {
-                let _ = cache.insert(key, PageContentKind::Decompressed, body.to_vec());
-            }
         }
 
         Ok((body, footer, uncompressed_size))
@@ -231,22 +350,54 @@ impl PageReader {
             .transpose()
     }
 
-    /// Sequential consumers necessarily materialize a logical page. Sparse
-    /// gathers do so only after the page has survived one probationary access,
-    /// avoiding cache pollution from one-off point lookups while recognizing
-    /// repeated analytical reuse.
+    /// Sequential consumers normally materialize a logical page. A sparse
+    /// gather is admitted immediately only when its page-local access shape is
+    /// analytical and the full decode has bounded work amplification. Smaller
+    /// point lookups must demonstrate reuse through the page-local probation
+    /// counter before they can populate the decoded cache.
     pub(crate) fn should_materialize_decoded(
         &self,
         pointer: PagePointer,
         access: DecodedPageAccess,
+        decoded_rows: usize,
     ) -> bool {
         match access {
-            DecodedPageAccess::Sequential => true,
-            DecodedPageAccess::SparseGather => {
-                self.options.cache_decoded
-                    && self.cache.as_ref().is_some_and(|cache| {
-                        cache.should_promote_sparse_decoded(&self.make_key(pointer))
-                    })
+            DecodedPageAccess::Sequential => {
+                self.options
+                    .decoded_admission_policy
+                    .sequential_materialization
+            }
+            DecodedPageAccess::SparseGather {
+                selected_rows,
+                decoded_groups,
+                group_runs,
+            } => {
+                let Some(cache) = self.cache.as_ref().filter(|_| self.options.cache_decoded) else {
+                    return false;
+                };
+                let work = decoded_page_work(
+                    decoded_groups,
+                    group_runs,
+                    decoded_rows,
+                    self.options.decoded_admission_policy,
+                );
+                if analytical_gather_should_materialize(
+                    selected_rows,
+                    work,
+                    self.options.decoded_admission_policy,
+                ) {
+                    cache.record_decoded_first_touch_admission();
+                    true
+                } else if cache
+                    .observe_sparse_decoded_access(&self.make_key(pointer))
+                    .is_some_and(|accesses| accesses >= work.promotion_accesses())
+                {
+                    cache.record_decoded_probation_promotion();
+                    true
+                } else {
+                    cache.record_decoded_policy_rejection();
+                    false
+                }
             }
         }
     }
@@ -262,20 +413,20 @@ impl PageReader {
         reader: &mut R,
         opts: &PageReadOptions,
         key: &PageKey,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         let io_start = Instant::now();
         if let Some(cache) = &self.cache {
-            let handle = cache.get_or_load(*key, PageContentKind::Compressed, || {
-                PageIO::read_page_bytes(reader, opts)
-            })?;
-            let data = handle
-                .data()
-                .ok_or_else(|| paro_error::internal("page cache data missing"))?;
+            let handle = cache.get_or_load_into(
+                *key,
+                PageContentKind::Compressed,
+                key.page_size as usize,
+                |destination| PageIO::read_page_bytes_into(reader, opts, destination),
+            )?;
             let io_elapsed = io_start.elapsed();
             if io_elapsed >= SLOW_PAGE_IO_THRESHOLD {
                 self.trace_slow_io(key, io_elapsed, "cache");
             }
-            return Ok(data.to_vec());
+            return handle.try_into_bytes();
         }
 
         let raw = PageIO::read_page_bytes(reader, opts)?;
@@ -283,7 +434,7 @@ impl PageReader {
         if io_elapsed >= SLOW_PAGE_IO_THRESHOLD {
             self.trace_slow_io(key, io_elapsed, "direct");
         }
-        Ok(raw)
+        Ok(Bytes::from(raw))
     }
 
     fn trace_slow_io(&self, key: &PageKey, elapsed: Duration, source: &'static str) {
@@ -408,7 +559,7 @@ impl PageReader {
 struct PendingPage {
     idx: usize,
     key: PageKey,
-    raw: Vec<u8>,
+    raw: Bytes,
     footer: PageFooter,
     uncompressed_size: u32,
     body_size: usize,
@@ -440,6 +591,118 @@ mod tests {
     }
 
     #[test]
+    fn analytical_gather_admission_compares_decode_and_seek_work() {
+        let policy = DecodedPageAdmissionPolicy::default();
+        let point = decoded_page_work(2, 2, 65_536, policy);
+        let dense = decoded_page_work(8, 1, 65_536, policy);
+        let clustered = decoded_page_work(8, 8, 65_536, policy);
+        let scattered_i64 = decoded_page_work(16, 16, 32_768, policy);
+        let scattered_i32 = decoded_page_work(64, 64, 65_536, policy);
+        let broad = decoded_page_work(512, 500, 65_536, policy);
+
+        assert!(!analytical_gather_should_materialize(2, point, policy));
+        assert!(!analytical_gather_should_materialize(64, dense, policy));
+        assert!(analytical_gather_should_materialize(64, clustered, policy));
+        assert!(!analytical_gather_should_materialize(
+            15,
+            scattered_i64,
+            policy
+        ));
+        assert!(analytical_gather_should_materialize(
+            16,
+            scattered_i64,
+            policy
+        ));
+        assert!(analytical_gather_should_materialize(
+            64,
+            scattered_i32,
+            policy
+        ));
+        assert!(analytical_gather_should_materialize(512, broad, policy));
+        assert!(dense.promotion_accesses() > broad.promotion_accesses());
+    }
+
+    #[test]
+    fn admission_policy_rejects_zero_calibration_weights() {
+        assert!(DecodedPageAdmissionPolicy::new(0, 8, 1024).is_err());
+        assert!(DecodedPageAdmissionPolicy::new(16, 0, 1024).is_err());
+        assert!(DecodedPageAdmissionPolicy::new(16, 8, 0).is_err());
+    }
+
+    #[test]
+    fn promotion_threshold_is_representable_by_the_probation_counter() {
+        let work = decoded_page_work(
+            1,
+            1,
+            usize::MAX,
+            DecodedPageAdmissionPolicy::new(16, 1, 1).unwrap(),
+        );
+        assert_eq!(work.promotion_accesses(), u32::MAX);
+    }
+
+    #[test]
+    fn sparse_admission_paths_are_observable() {
+        let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        let pointer = PagePointer::new(128, 64);
+        let reader = PageReader::new(
+            PageReaderContext::new(1, 2, 3, 4),
+            Some(cache.clone()),
+            PageReaderOptions {
+                cache_decoded: true,
+                ..PageReaderOptions::default()
+            },
+        );
+        cache
+            .insert(
+                reader.make_key(pointer),
+                PageContentKind::Compressed,
+                vec![1],
+            )
+            .unwrap();
+
+        assert!(reader.should_materialize_decoded(
+            pointer,
+            DecodedPageAccess::SparseGather {
+                selected_rows: 64,
+                decoded_groups: 64,
+                group_runs: 64,
+            },
+            65_536,
+        ));
+        let point_promotion_accesses =
+            decoded_page_work(1, 1, 65_536, DecodedPageAdmissionPolicy::default())
+                .promotion_accesses();
+        for _ in 1..point_promotion_accesses {
+            assert!(!reader.should_materialize_decoded(
+                pointer,
+                DecodedPageAccess::SparseGather {
+                    selected_rows: 1,
+                    decoded_groups: 1,
+                    group_runs: 1,
+                },
+                65_536,
+            ));
+        }
+        assert!(reader.should_materialize_decoded(
+            pointer,
+            DecodedPageAccess::SparseGather {
+                selected_rows: 1,
+                decoded_groups: 1,
+                group_runs: 1,
+            },
+            65_536,
+        ));
+
+        let stats = cache.stats();
+        assert_eq!(stats.decoded_first_touch_admissions, 1);
+        assert_eq!(
+            stats.decoded_policy_rejections,
+            u64::from(point_promotion_accesses - 1)
+        );
+        assert_eq!(stats.decoded_probation_promotions, 1);
+    }
+
+    #[test]
     fn page_reader_falls_back_without_cache() {
         let mut buffer = Cursor::new(Vec::new());
         let footer = make_data_footer(0, 4);
@@ -453,6 +716,32 @@ mod tests {
         buffer.set_position(0);
         let (read_body, _, _) = reader.read_page(&mut buffer, &opts).unwrap();
         assert_eq!(read_body.as_ref(), body.as_slice());
+    }
+
+    #[test]
+    fn cached_raw_page_is_borrowed_by_uncompressed_body() {
+        let mut buffer = Cursor::new(Vec::new());
+        let footer = make_data_footer(0, 4);
+        let body = vec![1_u8, 2, 3, 4];
+        let pointer = PageIO::write_page(&mut buffer, &body, &footer, body.len() as u32).unwrap();
+
+        let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        let reader = PageReader::new(
+            PageReaderContext::new(1, 1, 1, 0),
+            Some(cache.clone()),
+            PageReaderOptions::default(),
+        );
+        let opts = PageReadOptions::new(pointer);
+
+        let (read_body, _, _) = reader.read_page(&mut buffer, &opts).unwrap();
+        assert_eq!(read_body.as_ref(), body.as_slice());
+
+        let cached = cache
+            .lookup(&reader.page_key(pointer), PageContentKind::Compressed)
+            .unwrap();
+        assert_eq!(read_body.as_ptr(), cached.data().unwrap().as_ptr());
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 1);
     }
 
     #[test]
@@ -525,6 +814,7 @@ mod tests {
             PageReaderOptions {
                 cache_decompressed: false,
                 cache_decoded: false,
+                decoded_admission_policy: Default::default(),
                 parallel_decompressor: Some(
                     ParallelDecompressor::new(Arc::new(default_allocator())).with_max_threads(4),
                 ),
@@ -593,6 +883,7 @@ mod tests {
             PageReaderOptions {
                 cache_decompressed: false,
                 cache_decoded: false,
+                decoded_admission_policy: Default::default(),
                 parallel_decompressor: Some(
                     ParallelDecompressor::new(Arc::new(default_allocator())).with_max_threads(4),
                 ),

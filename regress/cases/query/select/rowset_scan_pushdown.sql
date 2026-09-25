@@ -37,6 +37,8 @@ SELECT COUNT(*) FROM rowset_pushdown_case WHERE k = 3;
 EXPLAIN (VERBOSE)
 SELECT payload FROM rowset_pushdown_case WHERE k = 3;
 
+-- The frozen input domain schedules k < 5 before k >= 2: 34 vs 51 of
+-- these 64 rows survive the respective predicates; the conjunction returns 21.
 EXPLAIN (VERBOSE)
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k >= 2 AND k < 5;
 

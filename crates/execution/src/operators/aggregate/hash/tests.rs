@@ -75,7 +75,7 @@ fn insert_distinct_values(
 }
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, ty))
+    Expression::Reference(ReferenceExpression::new(index, ty).into())
 }
 
 fn distinct_count_object() -> AggregateObject {
@@ -104,13 +104,15 @@ fn distinct_count_expression(input_idx: usize) -> Expression {
             vec![reference(input_idx, LogicalType::Integer)],
             LogicalType::BigInt,
         )
-        .with_aggr_type(AggregateType::Distinct),
+        .with_aggr_type(AggregateType::Distinct)
+        .into(),
     )
 }
 
 fn distinct_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 0,
+        initial_lookup_hash_key_count: 0,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -125,6 +127,7 @@ fn distinct_spec() -> AggregateSpec {
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
         perfect_hash: None,
         output_names: Box::new([]),
         output_types: Box::new([]),
@@ -134,6 +137,7 @@ fn distinct_spec() -> AggregateSpec {
 fn grouped_distinct_grouping_set_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 2,
+        initial_lookup_hash_key_count: 2,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -155,6 +159,7 @@ fn grouped_distinct_grouping_set_spec() -> AggregateSpec {
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
         perfect_hash: None,
         output_names: Box::new(["g0".to_string(), "g1".to_string(), "count".to_string()]),
         output_types: Box::new([
@@ -168,6 +173,7 @@ fn grouped_distinct_grouping_set_spec() -> AggregateSpec {
 fn grouped_distinct_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -182,6 +188,7 @@ fn grouped_distinct_spec() -> AggregateSpec {
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
         perfect_hash: None,
         output_names: Box::new(["group".to_string(), "count".to_string()]),
         output_types: Box::new([LogicalType::Varchar, LogicalType::BigInt]),
@@ -261,7 +268,7 @@ fn grouped_distinct_finalization_deduplicates_after_grouping_set_projection() {
         memory.clone(),
     );
 
-    finalize_distinct_into_tables(
+    let _hash_runtime_stats = finalize_distinct_into_tables(
         &spec,
         &objects,
         &group_refs,

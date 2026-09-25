@@ -29,7 +29,7 @@ use crate::binder::ir::{
 };
 use crate::binder::{Binder, GroupingBindingContext};
 use crate::expression::*;
-use crate::operator::ColumnBinding;
+use crate::logical::operator::ColumnBinding;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_parser::ast::{
@@ -60,7 +60,7 @@ impl Binder {
         offset: &Option<paro_parser::ast::Expr>,
     ) -> Result<BoundQuery> {
         let mut aggregates = Vec::new();
-        let hnsw_options = Self::extract_hnsw_query_options(select.hints.as_ref())?;
+        let hnsw_options = self.extract_hnsw_query_options(select.hints.as_ref())?;
         let projection_index = self.bind_context.generate_table_index();
         let group_index = self.bind_context.generate_table_index();
         let aggregate_index = self.bind_context.generate_table_index();
@@ -103,6 +103,25 @@ impl Binder {
                 let mut qualified_expr = *expr.clone();
                 ExpressionBinder::qualify_column_names(self, &mut qualified_expr);
                 bind_state.add_projection(qualified_expr.to_string(), i);
+                let column_identity = matches!(qualified_expr, AstExpr::ColumnRef { .. })
+                    .then(|| qualified_expr.to_string());
+                if let Some(name) = alias {
+                    bind_state.add_order_output_name(
+                        &name.name,
+                        name.quote.is_some(),
+                        i,
+                        column_identity,
+                    );
+                } else if let AstExpr::ColumnRef { column, .. } = expr.as_ref() {
+                    if let paro_parser::ast::ColumnID::Name(name) = &column.column {
+                        bind_state.add_order_output_name(
+                            &name.name,
+                            name.quote.is_some(),
+                            i,
+                            column_identity,
+                        );
+                    }
+                }
             }
         }
 
@@ -192,10 +211,13 @@ impl Binder {
         for expr in &mut select_list {
             let mut e = std::mem::replace(
                 expr,
-                Expression::Constant(ConstantExpression {
-                    value: paro_common::runtime_value::Value::Null(LogicalType::Unknown),
-                    return_type: LogicalType::Unknown,
-                }),
+                Expression::Constant(
+                    ConstantExpression {
+                        value: paro_common::runtime_value::Value::Null(LogicalType::Unknown),
+                        return_type: LogicalType::Unknown,
+                    }
+                    .into(),
+                ),
             );
             e = e.extract_aggregates(&mut aggregates, group_count);
             let replaced = e.replace_groups(&groups.group_expressions);
@@ -247,10 +269,13 @@ impl Binder {
             for order in orders.iter_mut() {
                 let e = std::mem::replace(
                     &mut order.expression,
-                    Expression::Constant(ConstantExpression {
-                        value: paro_common::runtime_value::Value::Null(LogicalType::Unknown),
-                        return_type: LogicalType::Unknown,
-                    }),
+                    Expression::Constant(
+                        ConstantExpression {
+                            value: paro_common::runtime_value::Value::Null(LogicalType::Unknown),
+                            return_type: LogicalType::Unknown,
+                        }
+                        .into(),
+                    ),
                 );
                 let e = e.extract_aggregates(&mut aggregates, groups.group_expressions.len());
                 let replaced = e.replace_groups(&groups.group_expressions);
@@ -314,12 +339,18 @@ impl Binder {
         ))
     }
 
-    fn extract_hnsw_query_options(hints: Option<&Hint>) -> Result<HnswQueryOptions> {
-        let Some(hints) = hints else {
-            return Ok(HnswQueryOptions::default());
+    fn extract_hnsw_query_options(&self, hints: Option<&Hint>) -> Result<HnswQueryOptions> {
+        let objective = match self.session_context().settings.vector_search_objective() {
+            "cost_optimized" => HnswSearchObjective::CostOptimized,
+            _ => HnswSearchObjective::Exact,
         };
-
-        let mut options = HnswQueryOptions::default();
+        let mut options = HnswQueryOptions {
+            objective,
+            ..HnswQueryOptions::default()
+        };
+        let Some(hints) = hints else {
+            return Ok(options);
+        };
         let mut saw_ef = false;
         let mut saw_rerank_window = false;
         let mut saw_objective = false;
@@ -401,7 +432,7 @@ impl Binder {
         })
     }
 
-    /// Replace aggregate/group `BoundReference` nodes with `BoundColumnRef` nodes
+    /// Replace aggregate/group `SubplanRef` nodes with `BoundColumnRef` nodes
     /// bound to the aggregate operator output.
     ///
     /// in this logical phase.
@@ -432,10 +463,13 @@ impl Binder {
             } else {
                 (aggregate_index, reference.index - group_count)
             };
-            *expr = Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table_index, column_index),
-                reference.return_type.clone(),
-            ));
+            *expr = Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(table_index, column_index),
+                    reference.return_type.clone(),
+                )
+                .into(),
+            );
             return;
         }
 
@@ -1014,24 +1048,30 @@ mod tests {
     use crate::expression::{
         ColumnRefExpression, Expression, FunctionExpression, WindowExpression, WindowFrame,
     };
-    use crate::operator::ColumnBinding;
+    use crate::logical::operator::ColumnBinding;
     use paro_common::types::LogicalType;
     use paro_function::window::WindowFunction;
     use paro_parser::ast::{Expr as AstExpr, Literal as AstLiteral};
     use paro_storage::index::hnsw::HnswSearchObjective;
 
     fn row_number(partition_column: usize) -> Expression {
-        Expression::Window(WindowExpression::native(
-            WindowFunction::row_number(),
-            vec![],
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(10, partition_column),
-                LogicalType::Integer,
-            ))],
-            vec![],
-            WindowFrame::default(),
-            false,
-        ))
+        Expression::Window(
+            WindowExpression::native(
+                WindowFunction::row_number(),
+                vec![],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(10, partition_column),
+                        LogicalType::Integer,
+                    )
+                    .into(),
+                )],
+                vec![],
+                WindowFrame::default(),
+                false,
+            )
+            .into(),
+        )
     }
 
     fn random_call() -> Expression {
@@ -1040,11 +1080,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(FunctionExpression::new(
-            function,
-            vec![],
-            LogicalType::Double,
-        ))
+        Expression::Function(FunctionExpression::new(function, vec![], LogicalType::Double).into())
     }
 
     #[test]
@@ -1108,7 +1144,7 @@ mod tests {
         };
         expression.frame.start_bound =
             crate::expression::WindowFrameBound::Offset(Box::new(Expression::Reference(
-                crate::expression::ReferenceExpression::new(1, LogicalType::Integer),
+                crate::expression::ReferenceExpression::new(1, LogicalType::Integer).into(),
             )));
 
         let replaced = Binder::replace_aggregate_references_with_column_refs(window, 20, 1, 30);
@@ -1116,7 +1152,8 @@ mod tests {
         let Expression::Window(expression) = replaced else {
             panic!("expected window expression");
         };
-        let crate::expression::WindowFrameBound::Offset(offset) = expression.frame.start_bound
+        let crate::expression::WindowFrameBound::Offset(offset) =
+            expression.into_inner().frame.start_bound
         else {
             panic!("expected window frame offset");
         };

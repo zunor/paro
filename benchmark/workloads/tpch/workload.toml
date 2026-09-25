@@ -6,9 +6,10 @@ name = "tpch"
 description = "TPC-H analytical query performance"
 run_order = 90
 
-# The ordered_digest_v1 oracles were audited row-for-row against DuckDB 1.4.4
-# at SF1. In particular q02/q10/q13/q15/q20 contain 100/20/42/1/186 rows and
-# match DuckDB exactly; their earlier hashes were stale workload metadata.
+# The result oracles were audited row-for-row against DuckDB at SF1. DECIMAL
+# division and AVG intentionally use the fractional DOUBLE domain, so their
+# expected values retain full binary64 precision rather than a legacy fixed
+# six-place truncation.
 minimum_server_buffer_pool = "2GiB"
 
 [params]
@@ -16,6 +17,7 @@ data_dir = "/tmp/paro-tpch-data"
 thread_count = 4
 memory_limit = "2GB"
 rowset_scan_pushdown = true
+optimizer_verify = false
 
 [setup]
 file = "sql/setup.sql"
@@ -26,12 +28,11 @@ id = "q01_pricing_summary"
 file = "sql/q01.sql"
 validate = "ordered_rows"
 expected = [
-  ["A", "F", "37734107.00", "56586554400.73", "53758257134.8700", "55909065222.827692", "25.522006", "38273.129735", "0.049985", 1478493],
-  ["N", "F", "991417.00", "1487504710.38", "1413082168.0541", "1469649223.194375", "25.516472", "38284.467761", "0.050093", 38854],
-  ["N", "O", "74476040.00", "111701729697.74", "106118230307.6056", "110367043872.497010", "25.502227", "38249.117989", "0.049997", 2920374],
-  ["R", "F", "37719753.00", "56568041380.90", "53741292684.6040", "55889619119.831932", "25.505794", "38250.854626", "0.050009", 1478870],
+  ["A", "F", "37734107.00", "56586554400.73", "53758257134.8700", "55909065222.827692", 25.522005853257337, 38273.129734621674, 0.04998529583839761, 1478493],
+  ["N", "F", "991417.00", "1487504710.38", "1413082168.0541", "1469649223.194375", 25.51647192052298, 38284.4677608483, 0.05009342667421629, 38854],
+  ["N", "O", "74476040.00", "111701729697.74", "106118230307.6056", "110367043872.497010", 25.50222676958499, 38249.11798890827, 0.04999658605370408, 2920374],
+  ["R", "F", "37719753.00", "56568041380.90", "53741292684.6040", "55889619119.831932", 25.505793612690773, 38250.85462609966, 0.05000940583012706, 1478870],
 ]
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -39,7 +40,6 @@ id = "q02_minimum_cost_supplier"
 file = "sql/q02.sql"
 validate = "ordered_digest_v1"
 expected = "a26cfc41cb114bc05f881b09ae94df2bdf10bf2464e5855b63047d1f0e1b6a4c"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -58,7 +58,6 @@ expected = [
   [993600, "371407.4595", "1995-03-05", 0],
   [2300070, "367371.1452", "1995-03-13", 0],
 ]
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -66,7 +65,6 @@ id = "q04_order_priority_checking"
 file = "sql/q04.sql"
 validate = "ordered_digest_v1"
 expected = "6da450ab83e8441df000d7fec26a9b7d52dcc588a1b117b8f3fd37a872042c10"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -74,7 +72,6 @@ id = "q05_local_supplier_volume"
 file = "sql/q05.sql"
 validate = "ordered_digest_v1"
 expected = "d9d7d99794d81d505e06e899e17a662b4083c2ec2a4cdce7a502d6d611b757eb"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -82,7 +79,6 @@ id = "q06_forecast_revenue"
 file = "sql/q06.sql"
 validate = "scalar_equals"
 expected = "123141078.2283"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -90,15 +86,13 @@ id = "q07_volume_shipping"
 file = "sql/q07.sql"
 validate = "ordered_digest_v1"
 expected = "e772d1c35ddc57d10fd78d653d90fe0e71f75a05487df8a1c8df2687d0204bec"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
 id = "q08_national_market_share"
 file = "sql/q08.sql"
 validate = "ordered_digest_v1"
-expected = "f379aacbcdf483c3860b9ff15771cd31b669ef25b8090152c72579a7da1ec7d7"
-collect_explain_profile = true
+expected = "c055f0923b34d6d59a6a01ab2c3b84a4ba3561c9859d4c3fb8a99f2063b15fad"
 allow_reexecute = true
 
 [[query]]
@@ -106,7 +100,6 @@ id = "q09_product_type_profit"
 file = "sql/q09.sql"
 validate = "ordered_digest_v1"
 expected = "3830ae730f6e6643acfe0d48e9e95e3436f92659051d4ce9ecb858bcf9a88f7d"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -114,7 +107,6 @@ id = "q10_returned_item_reporting"
 file = "sql/q10.sql"
 validate = "ordered_digest_v1"
 expected = "6e095ef5daa8990aa8fcd0fe91e06aa2a432d5a1ea820bad4ae25436811f4297"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -122,7 +114,6 @@ id = "q11_important_stock_identification"
 file = "sql/q11.sql"
 validate = "ordered_digest_v1"
 expected = "cdb6bc75091c39558ec846b6ac9022c0c87b62c995b6d122aa6dc7dc7f7574ac"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -130,7 +121,6 @@ id = "q12_shipping_modes_priority"
 file = "sql/q12.sql"
 validate = "ordered_digest_v1"
 expected = "432ff7e9c93c646e2a08336d28e956e118f93df27de8e6cee9cff9e1de3ba89a"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -138,15 +128,13 @@ id = "q13_customer_distribution"
 file = "sql/q13.sql"
 validate = "ordered_digest_v1"
 expected = "11d383302dc6fd0cca6bec9c5d2e39c742f2c0f54a51380498e65bafa5292b01"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
 id = "q14_promotion_effect"
 file = "sql/q14.sql"
 validate = "scalar_equals"
-expected = "16.3807786264"
-collect_explain_profile = true
+expected = 16.380778626395543
 allow_reexecute = true
 
 [[query]]
@@ -154,7 +142,6 @@ id = "q15_top_supplier"
 file = "sql/q15.sql"
 validate = "ordered_digest_v1"
 expected = "701414c4b3d7362ababe7ee9266d19d9b34687b25cb533183a14449e66219e46"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -162,15 +149,13 @@ id = "q16_parts_supplier_relationship"
 file = "sql/q16.sql"
 validate = "ordered_digest_v1"
 expected = "103f9f9d2eb32f1c8ed299ddc8b9806169e67e402b36d5fc7200fe43c9f229ea"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
 id = "q17_small_quantity_order_revenue"
 file = "sql/q17.sql"
 validate = "ordered_digest_v1"
-expected = "5d858826518d799ffad6cb4d797b2a275261f131a147c794a037433ac2839f0f"
-collect_explain_profile = true
+expected = "7d203d88e9b31633729bcb7ea89b30c301792ff76f65c3e01346176f35f12bea"
 allow_reexecute = true
 
 [[query]]
@@ -178,7 +163,6 @@ id = "q18_large_volume_customer"
 file = "sql/q18.sql"
 validate = "ordered_digest_v1"
 expected = "69daf11b18de7e7f9170205df6ed271f389bb5b84ac9c1a45e654055a1425bbb"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -186,7 +170,6 @@ id = "q19_discounted_revenue"
 file = "sql/q19.sql"
 validate = "ordered_digest_v1"
 expected = "c4473f907341a009d95cd91e0cbb6381687d37693531e31b83c1b47f07d6a48b"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -194,7 +177,6 @@ id = "q20_potential_part_promotion"
 file = "sql/q20.sql"
 validate = "ordered_digest_v1"
 expected = "35a45b1b8e5b7fc1b8bdf77d9fbdd0da02a8f9ea826702ce6b5e3906c8c5b6c1"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -202,7 +184,6 @@ id = "q21_suppliers_who_kept_orders_waiting"
 file = "sql/q21.sql"
 validate = "ordered_digest_v1"
 expected = "131cee2d582b19145994421335368caee41b892d5cc864c1328f193fb6b05b6c"
-collect_explain_profile = true
 allow_reexecute = true
 
 [[query]]
@@ -210,5 +191,4 @@ id = "q22_global_sales_opportunity"
 file = "sql/q22.sql"
 validate = "ordered_digest_v1"
 expected = "364c2660f0bc2890de1fa3ce6d8bd04ca29e17d9a8313b25d94ba8e861f637fd"
-collect_explain_profile = true
 allow_reexecute = true

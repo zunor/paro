@@ -8,12 +8,15 @@ use paro_common::identity::GraphId;
 use paro_common::runtime_value::Value;
 use paro_context::StatementContext;
 use paro_planner::binder::context::BindContext;
-use paro_planner::operator::ColumnBinding;
+use paro_planner::logical::operator::ColumnBinding;
 use paro_storage::index::graph::GraphStatistics;
 use paro_storage::statistics::ColumnStatistics;
 
-use crate::cost_model::CostModel;
-use crate::profiler::PipelineProfiler;
+use crate::diagnostics::profile::OptimizerProfiler;
+use crate::estimate::selectivity::SelectivityModel;
+
+/// Immutable column statistics shared by candidate-local optimizer contexts.
+pub type SharedColumnStatistics = Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>;
 
 pub trait GraphStatsLoader: Send + Sync {
     fn load(&self, graph_name: &str) -> Option<Arc<GraphStatistics>>;
@@ -38,11 +41,13 @@ impl GraphStatsLoader for EmptyGraphStatsLoader {
 
 impl GraphStatsLoader for ContextGraphStatsLoader {
     fn load(&self, graph_name: &str) -> Option<Arc<GraphStatistics>> {
-        self.context.services.graph_index.statistics(&GraphId::new(
-            self.context.current_database(),
-            self.context.current_schema(),
-            graph_name,
-        ))
+        self.context
+            .graph_snapshot(&GraphId::new(
+                self.context.current_database(),
+                self.context.current_schema(),
+                graph_name,
+            ))
+            .map(|snapshot| snapshot.statistics().clone())
     }
 }
 
@@ -74,64 +79,11 @@ impl Default for GraphStatsCache {
 pub struct OptimizationContext {
     pub session: Arc<StatementContext>,
     pub bind_context: BindContext,
-    pub column_stats: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    pub column_stats: SharedColumnStatistics,
     pub graph_stats: GraphStatsCache,
-    pub cost_model: CostModel,
+    pub cost_model: SelectivityModel,
     pub verify_enabled: bool,
-    pub profiler: PipelineProfiler,
-    pub invalidations: OptimizerInvalidations,
-}
-
-/// Structural invalidations consumed by explicit pipeline segments.
-///
-/// Producers only mark bits; they never clear another producer's work. The
-/// pipeline driver consumes an invalidation before its complete segment runs;
-/// a producer inside that segment can therefore mark the bit again and request
-/// another observable fixed-point round. This avoids a linear-list sentinel
-/// whose scope changes when passes move.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct OptimizerInvalidations {
-    aggregate_schema: bool,
-    late_materialization: bool,
-    scan_projection: bool,
-}
-
-impl OptimizerInvalidations {
-    pub fn mark_aggregate_schema(&mut self) {
-        self.aggregate_schema = true;
-    }
-
-    pub fn aggregate_schema_pending(self) -> bool {
-        self.aggregate_schema
-    }
-
-    pub fn consume_aggregate_schema(&mut self) {
-        self.aggregate_schema = false;
-    }
-
-    pub fn mark_late_materialization(&mut self) {
-        self.late_materialization = true;
-    }
-
-    pub fn late_materialization_pending(self) -> bool {
-        self.late_materialization
-    }
-
-    pub fn consume_late_materialization(&mut self) {
-        self.late_materialization = false;
-    }
-
-    pub fn mark_scan_projection(&mut self) {
-        self.scan_projection = true;
-    }
-
-    pub fn scan_projection_pending(self) -> bool {
-        self.scan_projection
-    }
-
-    pub fn consume_scan_projection(&mut self) {
-        self.scan_projection = false;
-    }
+    pub profiler: OptimizerProfiler,
 }
 
 impl OptimizationContext {
@@ -143,12 +95,36 @@ impl OptimizationContext {
             })),
             session,
             bind_context,
-            column_stats: HashMap::new(),
-            cost_model: CostModel::default(),
+            column_stats: Arc::new(HashMap::new()),
+            cost_model: SelectivityModel::default(),
             verify_enabled,
-            profiler: PipelineProfiler::default(),
-            invalidations: OptimizerInvalidations::default(),
+            profiler: OptimizerProfiler::default(),
         }
+    }
+
+    /// Create an isolated estimation/search view for one logical candidate.
+    ///
+    /// Candidate generation must not communicate through `column_stats`: the
+    /// set is keyed by plan-local bindings and adding an unrelated alternative
+    /// must never change another alternative's join order or access path.
+    pub(crate) fn fork_for_candidate(
+        &self,
+        column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
+    ) -> Self {
+        let mut candidate = Self::new(self.session.clone(), self.bind_context.clone());
+        candidate.column_stats = column_stats;
+        candidate.cost_model = self.cost_model.clone();
+        candidate.verify_enabled = self.verify_enabled;
+        candidate
+    }
+
+    /// Mutate a candidate's statistics through copy-on-write. Read-only
+    /// physical alternatives share the immutable map; gathering detaches only
+    /// when it actually publishes a new fact.
+    pub(crate) fn column_stats_mut(
+        &mut self,
+    ) -> &mut HashMap<ColumnBinding, Arc<ColumnStatistics>> {
+        Arc::make_mut(&mut self.column_stats)
     }
 }
 

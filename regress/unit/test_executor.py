@@ -128,6 +128,20 @@ class _FakeConnection:
         self.close_calls += 1
 
 
+def test_fixture_source_identity_does_not_rewrite_returned_values() -> None:
+    path = "/private/tmp/owned-fixtures/helper.py"
+    executed_sql = f"SELECT '{path}';"
+    source_sql = "SELECT '{{fixture:helper.py}}';"
+    conn = _FakeConnection([_Step(executed_sql, columns=["path"], rows=[(path,)])])
+    result = execute_blocks(conn, [Block(
+        kind="query", line_no=1, sql=executed_sql, source_sql=source_sql,
+        query_mode="nosort",
+    )])
+    assert result.query_outputs[0].sql == source_sql
+    assert result.query_outputs[0].rows == [[path]]
+    assert conn.steps == []
+
+
 def test_setup_failure_skips_main_but_runs_teardown() -> None:
     conn = _FakeConnection(
         [

@@ -24,6 +24,7 @@ from ..performance_gate import (
     evaluate_gate,
 )
 from ..reporter import BenchmarkReporter
+from ..run_output import RunOutput
 from ..sources import SourceMeasurement
 from .common import (
     GateCommandError,
@@ -40,7 +41,16 @@ from .common import (
 )
 
 
-def run_check(args: argparse.Namespace, *, root_dir: Path, runner_module: object) -> int:
+def run_check(
+    args: argparse.Namespace,
+    *,
+    root_dir: Path,
+    runner_module: object,
+    run_output: RunOutput | None = None,
+) -> int:
+    from .common import ensure_run_output
+
+    run_output = ensure_run_output(run_output, root_dir=root_dir, args=args)
     policy = load_policy_for_gate(root_dir, args.gate, args.policy)
     baseline_path = resolve_baseline(
         root_dir,
@@ -54,6 +64,7 @@ def run_check(args: argparse.Namespace, *, root_dir: Path, runner_module: object
             root_dir=root_dir,
             policy=policy,
             baseline_path=baseline_path,
+            run_output=run_output,
         )
     baseline = load_baseline_checked(baseline_path)
     pid = resolve_pid(args, root_dir=root_dir, policy=policy)
@@ -72,7 +83,14 @@ def run_check(args: argparse.Namespace, *, root_dir: Path, runner_module: object
     )
     effective_policy = replace(policy, enforcement=archive_health.effective_enforcement)
     staging_queries = load_staging_queries_checked(root_dir, policy)
-    measurements = run_sources(args, policy=policy, root_dir=root_dir, runner_module=runner_module, pid=pid)
+    measurements = run_sources(
+        args,
+        policy=policy,
+        root_dir=root_dir,
+        runner_module=runner_module,
+        pid=pid,
+        run_output=run_output,
+    )
     if not measurements:
         raise GateCommandError("gate selected no measurement sources")
     if args.quorum_retries < 1:
@@ -112,6 +130,7 @@ def run_check(args: argparse.Namespace, *, root_dir: Path, runner_module: object
                 runner_module=runner_module,
                 pid=pid,
                 retry_query_keys_by_source=retry_keys_by_source,
+                run_output=run_output,
             )
             for _ in range(args.quorum_retries)
         ]
@@ -153,11 +172,20 @@ def run_check(args: argparse.Namespace, *, root_dir: Path, runner_module: object
 
     for measurement, outcome in results:
         reporter.print_gate_outcome(outcome)
-        reporter.append_gate_outcome_to_summary(measurement.summary_path, outcome)
+        reporter.append_gate_outcome_to_summary(
+            measurement.summary_path,
+            outcome,
+            writer=run_output.cell_writer(
+                query_case=getattr(measurement, "query_case", None) or measurement.source.name,
+                arm_id=getattr(measurement, "arm_id", None) or measurement.source.name,
+                root=measurement.summary_path.parent,
+            ),
+        )
     reporter.write_gate_report(
         gate=args.gate,
         outcomes=[outcome for _, outcome in results],
         archive_health=archive_health,
+        writer=run_output.control_writer(),
     )
 
     return 1 if any(
@@ -174,6 +202,7 @@ def report_missing_auto_baseline(
     root_dir: Path,
     policy: GatePolicy,
     baseline_path: Path,
+    run_output: RunOutput | None = None,
 ) -> int:
     status = (
         GateStatus.REGRESS
@@ -195,7 +224,15 @@ def report_missing_auto_baseline(
     )
     reporter = BenchmarkReporter(root_dir)
     reporter.print_gate_outcome(outcome)
-    reporter.write_gate_report(gate=args.gate, outcomes=[outcome])
+    if run_output is None:
+        from ..run_output import RunOutput
+
+        run_output = RunOutput.create(root_dir / "report", run_id=None)
+    reporter.write_gate_report(
+        gate=args.gate,
+        outcomes=[outcome],
+        writer=run_output.control_writer(),
+    )
     return 1 if outcome.blocking_failed else 0
 
 

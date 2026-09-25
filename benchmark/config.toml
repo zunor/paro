@@ -11,3 +11,4 @@ warmup = 1
 timeout_seconds = 120
 collect_memory = true
 collect_explain_profile = false
+collect_compile_receipts = true

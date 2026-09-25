@@ -163,30 +163,18 @@ line
 {"ID":2,"name":"pipe|bar","note":"quote \\"here\\""}
 {"ID":3,"name":"comma,space","note":"simple"}
 
-SET threads = 4;
+SET threads = 1;
 SET
 
 COPY (
   SELECT i AS id, 'name_' || i::VARCHAR AS name
   FROM generate_series(1, 20000) AS t(i)
-) TO '/tmp/paro_copy_t4_3_parallel.csv'
+) TO '/tmp/paro_copy_t1_3_parallel.csv'
   WITH (FORMAT csv, PER_THREAD_OUTPUT true);
 COPY 20000
 
 -- @normalize copy_rowcount
-COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_0.csv' WITH (FORMAT csv);
-COPY <rows>
-
--- @normalize copy_rowcount
-COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_1.csv' WITH (FORMAT csv);
-COPY <rows>
-
--- @normalize copy_rowcount
-COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_2.csv' WITH (FORMAT csv);
-COPY <rows>
-
--- @normalize copy_rowcount
-COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_3.csv' WITH (FORMAT csv);
+COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t1_3_parallel_0.csv' WITH (FORMAT csv);
 COPY <rows>
 
 SELECT COUNT(*) AS copied_rows,

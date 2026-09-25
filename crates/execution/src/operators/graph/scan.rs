@@ -12,14 +12,13 @@ use paro_common::identity::GraphId;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::operator::ColumnBinding;
+use paro_planner::logical::operator::ColumnBinding;
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::tablet::{TabletReader, TabletReaderParams};
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 use paro_transaction::TableId;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
-use crate::operators::sort::build::query_has_temporary_directory;
 use crate::physical::specs::GraphScanSpec;
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
@@ -43,17 +42,10 @@ pub struct GraphScanSourceExec {
 
 impl GraphScanSourceExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
-        if ctx.query.session.limits.force_external && !query_has_temporary_directory(ctx.query) {
-            return Err(paro_error::out_of_memory(
-                "force_external graph scan requires a temporary directory",
-            ));
-        }
         let snapshot = ctx
             .query
             .session
-            .services
-            .graph_index
-            .snapshot(&GraphId::new(
+            .graph_snapshot(&GraphId::new(
                 ctx.query.session.current_database(),
                 &self.spec.schema_name,
                 &self.spec.graph_name,
@@ -423,10 +415,13 @@ fn remap_graph_columns(expr: &Expression, column_ids: &[usize]) -> Result<Expres
             .iter()
             .position(|&column_id| column_id == original)
             .expect("graph filter column projection validated");
-        Some(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(col_ref.binding.table_index, column_index),
-            col_ref.return_type.clone(),
-        )))
+        Some(Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(col_ref.binding.table_index, column_index),
+                col_ref.return_type.clone(),
+            )
+            .into(),
+        ))
     }))
 }
 

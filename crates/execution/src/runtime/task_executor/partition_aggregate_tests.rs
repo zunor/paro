@@ -8,6 +8,18 @@ fn partition_aggregate_window_graph(
     key_type: LogicalType,
     input_rows: Vec<Vec<Expression>>,
 ) -> PipelineGraph {
+    partition_aggregate_window_graph_with_policy(
+        key_type,
+        input_rows,
+        crate::physical::specs::SpillExecutionPolicy::Adaptive,
+    )
+}
+
+fn partition_aggregate_window_graph_with_policy(
+    key_type: LogicalType,
+    input_rows: Vec<Vec<Expression>>,
+    spill_policy: crate::physical::specs::SpillExecutionPolicy,
+) -> PipelineGraph {
     let input_types = Box::new([key_type.clone(), LogicalType::Integer]);
     let mut aggregate = grouped_count_spec(None);
     aggregate.projection_exprs = Box::new([
@@ -17,6 +29,7 @@ fn partition_aggregate_window_graph(
     aggregate.payload_types = input_types.clone();
     aggregate.groups = Box::new([reference(0, key_type.clone())]);
     aggregate.output_types = Box::new([key_type.clone(), LogicalType::BigInt]);
+    aggregate.spill_policy = spill_policy;
     let spec = PartitionAggregateWindowSpec {
         domain: PartitionAggregateDomain::Keyed,
         input_types: input_types.clone(),
@@ -146,10 +159,9 @@ fn partition_aggregate_window_executes_bigint_key_domain() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
     let bigint = |value| {
-        Expression::Constant(ConstantExpression::new(
-            Value::BigInt(value),
-            LogicalType::BigInt,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into(),
+        )
     };
     let graph = partition_aggregate_window_graph(
         LogicalType::BigInt,
@@ -187,7 +199,8 @@ fn global_filtered_count_window_spec() -> PartitionAggregateWindowSpec {
             vec![reference(0, LogicalType::Integer)],
             LogicalType::BigInt,
         )
-        .with_filter(Some(reference(1, LogicalType::Boolean))),
+        .with_filter(Some(reference(1, LogicalType::Boolean)))
+        .into(),
     );
     let input_types = Box::new([LogicalType::Integer, LogicalType::Boolean]);
     PartitionAggregateWindowSpec {
@@ -196,6 +209,7 @@ fn global_filtered_count_window_spec() -> PartitionAggregateWindowSpec {
         detail_columns: Box::new([0]),
         aggregate: AggregateSpec {
             grouping_key_count: 0,
+            initial_lookup_hash_key_count: 0,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([
@@ -213,6 +227,7 @@ fn global_filtered_count_window_spec() -> PartitionAggregateWindowSpec {
             aggregate_orders: Box::new([Box::new([])]),
             post_reduction: None,
             having_filter: Box::new([]),
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
             perfect_hash: None,
             output_names: Box::new(["count".to_string()]),
             output_types: Box::new([LogicalType::BigInt]),
@@ -268,8 +283,10 @@ fn global_aggregate_window_forced_external_spills_only_detail_payload() {
             parallel_scheduler: false,
         },
     );
+    let mut spec = global_filtered_count_window_spec();
+    spec.aggregate.spill_policy = crate::physical::specs::SpillExecutionPolicy::ForcedExternal;
     let graph = partition_aggregate_window_graph_from_spec(
-        global_filtered_count_window_spec(),
+        spec,
         vec![
             vec![int_constant(10), bool_constant(true)],
             vec![int_constant(20), bool_constant(false)],
@@ -315,7 +332,7 @@ fn partition_aggregate_window_forced_external_replays_raw_payload() {
             parallel_scheduler: false,
         },
     );
-    let graph = partition_aggregate_window_graph(
+    let graph = partition_aggregate_window_graph_with_policy(
         LogicalType::Integer,
         vec![
             vec![int_constant(1), int_constant(10)],
@@ -324,6 +341,7 @@ fn partition_aggregate_window_forced_external_replays_raw_payload() {
             vec![null_constant(LogicalType::Integer), int_constant(40)],
             vec![int_constant(2), int_constant(50)],
         ],
+        crate::physical::specs::SpillExecutionPolicy::ForcedExternal,
     );
     let thread = ThreadContext::single_threaded();
     let wake = OperatorWakeScope {
@@ -384,7 +402,8 @@ fn partition_aggregate_window_forced_external_preserves_filter_payload() {
             vec![reference(1, LogicalType::Integer)],
             LogicalType::BigInt,
         )
-        .with_filter(Some(reference(2, LogicalType::Boolean))),
+        .with_filter(Some(reference(2, LogicalType::Boolean)))
+        .into(),
     );
     let input_types = Box::new([
         LogicalType::Integer,
@@ -397,6 +416,7 @@ fn partition_aggregate_window_forced_external_preserves_filter_payload() {
         detail_columns: Box::new([0, 1]),
         aggregate: AggregateSpec {
             grouping_key_count: 1,
+            initial_lookup_hash_key_count: 1,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([
@@ -415,6 +435,7 @@ fn partition_aggregate_window_forced_external_preserves_filter_payload() {
             aggregate_orders: Box::new([Box::new([])]),
             post_reduction: None,
             having_filter: Box::new([]),
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
             perfect_hash: None,
             output_names: Box::new(["k".to_string(), "count".to_string()]),
             output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),

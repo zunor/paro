@@ -49,25 +49,35 @@ WHERE p.order_key IN (
 GROUP BY p.order_key, p.label
 ORDER BY p.order_key;
 QUERY PLAN
-ORDER_BY  (rows=4)
+ORDER_BY  (rows=3)
   Sort Key: p.order_key ASC NULLS LAST
-  ->  PROJECTION  (rows=4)
-    Output: p.order_key, p.label, total_quantity
-    ->  AGGREGATE  (rows=4)
-      Group Key: p.order_key, p.label
-      Aggregates: sum(partial_aggregate)
-      ->  HASH_JOIN  (rows=4)
-        Join Type: INNER
-        Join Condition: p.order_key = order_key
-        ->  ROWSET_SCAN on public.agg_sub_preserved p  (rows=6)
-          Columns: order_key, label
-        ->  PROJECTION  (rows=3)
-          Output: order_key, partial_aggregate
-          ->  AGGREGATE  (rows=3)
-            Group Key: public.agg_sub_detail.order_key
-            Aggregates: sum(public.agg_sub_detail.quantity)
-            ->  ROWSET_SCAN on public.agg_sub_detail  (rows=8)
-              Columns: order_key, quantity
+  ->  PROJECTION  (rows=3)
+        Output: p.order_key, p.label, total_quantity
+        ->  AGGREGATE  (rows=3)
+              Group Key: p.order_key, p.label
+              Aggregates: sum(d.quantity)
+              ->  HASH_JOIN  (rows=3)
+                    Join Type: SEMI
+                    Join Condition: p.order_key = order_key
+                    ->  HASH_JOIN  (rows=12)
+                          Join Type: INNER
+                          Build Index: integer_build_time
+                          Join Condition: d.order_key = p.order_key
+                          ->  ROWSET_SCAN on public.agg_sub_detail d  (rows=8)
+                                Column IDs: 0, 1
+                                Columns: order_key, quantity
+                          ->  ROWSET_SCAN on public.agg_sub_preserved p  (rows=6)
+                                Column IDs: 0, 1
+                                Columns: order_key, label
+                    ->  PROJECTION  (rows=3)
+                          Output: order_key
+                          ->  AGGREGATE  (rows=4)
+                                Group Key: public.agg_sub_detail.order_key
+                                Aggregates: sum(public.agg_sub_detail.quantity)
+                                Having: sum(public.agg_sub_detail.quantity) > 100.00
+                                ->  ROWSET_SCAN on public.agg_sub_detail  (rows=8)
+                                      Column IDs: 0, 1
+                                      Columns: order_key, quantity
 
 SELECT
     p.order_key,

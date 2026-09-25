@@ -40,7 +40,10 @@ impl<'a> SerializedGroupLookup<'a> {
             )));
         }
         let source_row = self.source.row_ptr(source_row_idx);
-        let hash = self.source.layout.load_hash(source_row);
+        let hash = self.source.serialized_hash_for_lookup_contract(
+            source_row_idx,
+            self.target.lookup_hash_contract(),
+        )?;
         let inline_key = self
             .target
             .inline_key_layout
@@ -88,8 +91,11 @@ impl<'a> SerializedGroupLookup<'a> {
 }
 
 impl GroupedAggregateHashTable {
-    /// Read the full-key hash stored alongside a serialized group row.
-    pub(crate) fn serialized_group_hash(&self, row_idx: usize) -> Result<u64> {
+    /// Read the active lookup hash stored alongside a serialized group row.
+    ///
+    /// This is a full-key hash for DISTINCT tables, whose contract requires
+    /// exact full-key lookup, but callers must not infer that from this API.
+    pub(crate) fn serialized_lookup_hash(&self, row_idx: usize) -> Result<u64> {
         if row_idx >= self.count {
             return Err(paro_error::internal(format!(
                 "Serialized group hash row out of bounds: row={row_idx}, count={}",

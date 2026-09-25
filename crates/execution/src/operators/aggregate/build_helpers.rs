@@ -26,12 +26,16 @@ use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
 use crate::operators::aggregate::distinct_state::DistinctAggregateState;
 use crate::operators::aggregate::group_key_codec::{logical_group_types, physical_group_types};
 use crate::operators::aggregate::grouped_aggregate_data::reference_index;
+use crate::operators::aggregate::grouped_aggregate_hashtable::HashTableCapacityHint;
 use paro_storage::buffer::BufferPool;
 
-use crate::operators::aggregate::group_hash::GroupHashScratch;
+use crate::operators::aggregate::group_hash::{AggregateHashContract, GroupHashScratch};
 use crate::operators::aggregate::ordered_helpers::empty_ordered_collectors_with_memory;
 use crate::operators::aggregate::perfect_aggregate_hashtable::PerfectAggregateHashTable;
-use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
+use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::{
+    AggregateHashTable, AggregateHashTableConfig, AggregateHashTableGrowthPlan,
+    AggregateHashTableLayout,
+};
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{single_state_addresses, UngroupedAggregateRuntimeState};
 use crate::runtime::state::UngroupedAggregateSinkLocal;
@@ -296,7 +300,7 @@ pub(crate) fn build_groups_chunk_for_set(
     group_count: usize,
 ) -> Result<Chunk> {
     if grouping_set.len() == group_count {
-        return Ok(all_groups.clone());
+        return Ok(all_groups.clone_referencing_vectors());
     }
     let mut present = vec![false; group_count];
     for &group_idx in grouping_set {
@@ -307,7 +311,7 @@ pub(crate) fn build_groups_chunk_for_set(
         }
         present[group_idx] = true;
     }
-    let mut groups = all_groups.clone();
+    let mut groups = all_groups.clone_referencing_vectors();
     for (group_idx, is_present) in present.into_iter().enumerate() {
         if is_present {
             continue;
@@ -475,27 +479,56 @@ pub(crate) fn create_hash_aggregate_tables(
     let inputs = aggregate_inputs(spec);
     let group_types = group_types(spec)?;
     let strategy = choose_hash_aggregate_table_strategy(spec, &group_types, parallelism)?;
+    let disjoint_filter_groups = direct_filter_dispatch_groups(spec);
+    let initial_lookup_hash_key_count = if spec.grouping_sets.is_empty() {
+        spec.initial_lookup_hash_key_count.min(group_types.len())
+    } else {
+        // Grouping domains omit different logical columns. Until the physical
+        // contract carries one policy per domain, each table owns a full-key
+        // hash contract.
+        group_types.len()
+    };
+    let hash_contract =
+        AggregateHashContract::try_new(group_types.len(), initial_lookup_hash_key_count)?;
+    let table_layout = match strategy {
+        HashAggregateTableStrategy::Flat => AggregateHashTableLayout::Flat,
+        HashAggregateTableStrategy::Radix { partition_bits } => {
+            AggregateHashTableLayout::Radix { partition_bits }
+        }
+    };
+    let table_config = AggregateHashTableConfig::new(
+        table_layout,
+        hash_contract,
+        HashTableCapacityHint::default(),
+    );
     normalized_grouping_sets(spec)?
         .iter()
-        .map(|_| match strategy {
-            HashAggregateTableStrategy::Flat => AggregateHashTable::new_flat_with_memory(
+        .map(|_| {
+            let mut table = AggregateHashTable::new_configured(
                 group_types.clone(),
                 objects.clone(),
                 inputs.clone(),
                 allocator.clone(),
                 memory.clone(),
-            ),
-            HashAggregateTableStrategy::Radix { partition_bits } => {
-                AggregateHashTable::new_radix_with_memory(
-                    group_types.clone(),
-                    objects.clone(),
-                    inputs.clone(),
-                    partition_bits,
-                    allocator.clone(),
-                    memory.clone(),
-                )
+                table_config,
+            )?;
+            for group in &disjoint_filter_groups {
+                table.fuse_disjoint_filter_group(group);
             }
+            Ok(table)
         })
+        .collect()
+}
+
+fn direct_filter_dispatch_groups(spec: &AggregateSpec) -> Vec<Box<[usize]>> {
+    if spec.projection_exprs.is_empty() {
+        return Vec::new();
+    }
+    ExpressionExecutor::with_expressions(&spec.projection_exprs)
+        .physical_program()
+        .varchar_equality_dispatches()
+        .iter()
+        .map(|dispatch| dispatch.outputs.clone())
         .collect()
 }
 
@@ -552,7 +585,18 @@ pub(crate) fn create_perfect_aggregate_table(
             "perfect aggregate sink requires perfect hash planning metadata",
         ));
     };
-    PerfectAggregateHashTable::new_with_memory(
+    let planned_slots = perfect
+        .group_cardinalities
+        .iter()
+        .try_fold(1usize, |slots, cardinality| slots.checked_mul(*cardinality))
+        .ok_or_else(|| paro_error::internal("perfect aggregate planned slot count overflow"))?;
+    if planned_slots != perfect.resource.slots {
+        return Err(paro_error::internal(format!(
+            "perfect aggregate domain disagrees with its resource contract: domain_slots={planned_slots}, contract_slots={}",
+            perfect.resource.slots
+        )));
+    }
+    let mut table = PerfectAggregateHashTable::new_with_memory_contract(
         logical_group_types(spec),
         aggregate_objects(spec)?,
         aggregate_inputs(spec),
@@ -560,7 +604,12 @@ pub(crate) fn create_perfect_aggregate_table(
         perfect.group_cardinalities.to_vec(),
         allocator,
         memory,
-    )
+        perfect.resource.table_bytes_upper,
+    )?;
+    for group in direct_filter_dispatch_groups(spec) {
+        table.fuse_disjoint_filter_group(&group);
+    }
+    Ok(table)
 }
 
 /// Update hash aggregate tables with new payload rows.
@@ -600,6 +649,62 @@ pub(crate) fn update_hash_aggregate_tables_with_scratch(
     addresses: &mut Vector,
     new_groups: &mut SelectionVector,
 ) -> Result<()> {
+    update_hash_aggregate_tables_impl(
+        spec,
+        aggregate_objects,
+        payload,
+        all_groups,
+        grouping_sets,
+        tables,
+        hash_scratch,
+        None,
+        addresses,
+        new_groups,
+    )
+}
+
+/// Update tables while consuming the radix routes produced by growth
+/// planning for this exact batch. The capability slice is explicit so a
+/// caller cannot silently regress to a second hash-and-route pass.
+pub(crate) fn update_hash_aggregate_tables_with_growth_plans(
+    spec: &AggregateSpec,
+    aggregate_objects: &[AggregateObject],
+    payload: &Chunk,
+    all_groups: &Chunk,
+    grouping_sets: &[Box<[usize]>],
+    tables: &mut [AggregateHashTable],
+    hash_scratch: &mut GroupHashScratch,
+    growth_plans: &mut [AggregateHashTableGrowthPlan],
+    addresses: &mut Vector,
+    new_groups: &mut SelectionVector,
+) -> Result<()> {
+    update_hash_aggregate_tables_impl(
+        spec,
+        aggregate_objects,
+        payload,
+        all_groups,
+        grouping_sets,
+        tables,
+        hash_scratch,
+        Some(growth_plans),
+        addresses,
+        new_groups,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_hash_aggregate_tables_impl(
+    spec: &AggregateSpec,
+    aggregate_objects: &[AggregateObject],
+    payload: &Chunk,
+    all_groups: &Chunk,
+    grouping_sets: &[Box<[usize]>],
+    tables: &mut [AggregateHashTable],
+    hash_scratch: &mut GroupHashScratch,
+    mut growth_plans: Option<&mut [AggregateHashTableGrowthPlan]>,
+    addresses: &mut Vector,
+    new_groups: &mut SelectionVector,
+) -> Result<()> {
     if grouping_sets.len() != tables.len() {
         return Err(paro_error::internal(format!(
             "hash aggregate grouping table count mismatch: grouping_sets={} tables={}",
@@ -607,42 +712,79 @@ pub(crate) fn update_hash_aggregate_tables_with_scratch(
             tables.len()
         )));
     }
+    if let Some(plans) = growth_plans.as_ref() {
+        if plans.len() != tables.len() {
+            return Err(paro_error::internal(format!(
+                "hash aggregate growth plan count mismatch: plans={} tables={}",
+                plans.len(),
+                tables.len()
+            )));
+        }
+    }
     let has_distinct = aggregate_objects.iter().any(AggregateObject::is_distinct);
     let has_ordered = aggregate_objects
         .iter()
         .any(|object| !object.order_bys.is_empty());
-    let use_per_filter = has_aggregate_filters(spec) || has_distinct || has_ordered;
-    let filters = if use_per_filter {
-        let mut filters = build_per_aggregate_filters(spec, payload)?;
-        if has_distinct || has_ordered {
-            for (idx, obj) in aggregate_objects.iter().enumerate() {
-                if obj.is_distinct() || !obj.order_bys.is_empty() {
-                    filters[idx] = Some(SelectionVector::try_from_indices(
-                        vec![],
-                        payload.allocator().clone(),
-                    )?);
-                }
-            }
-        }
-        Some(filters)
-    } else {
-        None
-    };
-    for (table, grouping_set) in tables.iter_mut().zip(grouping_sets.iter()) {
+    let has_filters = has_aggregate_filters(spec);
+    let use_per_filter = has_filters || has_distinct || has_ordered;
+    let mut filters = None;
+    for (table_idx, (table, grouping_set)) in
+        tables.iter_mut().zip(grouping_sets.iter()).enumerate()
+    {
         let groups =
             build_groups_chunk_for_set(all_groups, grouping_set.as_ref(), spec.grouping_key_count)?;
-        let hashes = hash_scratch.hash(&groups)?;
         ensure_group_update_scratch(
             addresses,
             new_groups,
             payload.size(),
             payload.allocator().clone(),
         )?;
-        table.find_or_create_groups(&groups, &hashes, addresses, new_groups)?;
-        if let Some(filters) = &filters {
+        let lookup = if let Some(lookup) =
+            table.try_find_or_create_adaptive_integer_groups(&groups, addresses, new_groups)?
+        {
+            lookup
+        } else if let Some(plans) = growth_plans.as_deref_mut() {
+            table.find_or_create_groups_with_growth_plan(
+                &groups,
+                hash_scratch,
+                &mut plans[table_idx],
+                addresses,
+                new_groups,
+            )?
+        } else {
+            table.find_or_create_groups_with_scratch(
+                &groups,
+                hash_scratch,
+                addresses,
+                new_groups,
+            )?
+        };
+        debug_assert_eq!(lookup.new_group_count(), new_groups.len());
+        if has_filters
+            && !has_distinct
+            && !has_ordered
+            && table.try_update_direct_aggregates(payload, addresses)?
+        {
+            continue;
+        }
+        if use_per_filter && filters.is_none() {
+            let mut prepared = build_per_aggregate_filters(spec, payload)?;
+            if has_distinct || has_ordered {
+                for (idx, obj) in aggregate_objects.iter().enumerate() {
+                    if obj.is_distinct() || !obj.order_bys.is_empty() {
+                        prepared[idx] = Some(SelectionVector::try_from_indices(
+                            vec![],
+                            payload.allocator().clone(),
+                        )?);
+                    }
+                }
+            }
+            filters = Some(prepared);
+        }
+        if let Some(filters) = filters.as_ref() {
             table.update_aggregates_per_filter(payload, addresses, filters)?;
         } else {
-            table.update_aggregates(payload, Some(&hashes), addresses, None)?;
+            table.update_aggregates_after_group_lookup(lookup, payload, addresses, None)?;
         }
     }
     Ok(())

@@ -10,7 +10,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::vector::SelectionVector;
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::operator::ColumnBinding;
+use paro_planner::logical::operator::ColumnBinding;
 use paro_storage::tablet::TabletRowIdReader;
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 use paro_transaction::TableId;
@@ -413,9 +413,9 @@ fn materialize_row_fetch_input(
         }
         let reader = fetch
             .reader
-            .as_ref()
+            .as_mut()
             .expect("graph project table reader was initialized above");
-        let fetched = reader.get_by_rowids(&fetch.rowids, &fetch.column_ids)?;
+        let fetched = reader.get_by_rowids(&fetch.rowids)?;
 
         for pos in 0..fetch.required_columns.len() {
             combined_columns.push(fetched.column(pos).cloned().ok_or_else(|| {
@@ -561,10 +561,13 @@ fn remap_graph_project_expression(
                 .copied()
                 .expect("graph project table mapping validated")
         };
-        Some(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(binding.table_index, new_index),
-            col_ref.return_type.clone(),
-        )))
+        Some(Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(binding.table_index, new_index),
+                col_ref.return_type.clone(),
+            )
+            .into(),
+        ))
     }))
 }
 

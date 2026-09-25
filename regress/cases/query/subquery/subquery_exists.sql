@@ -122,6 +122,38 @@ WHERE NOT EXISTS(
 )
 ORDER BY o.id;
 
+-- 6. An existential inner join does not expose build-side multiplicity
+-- @query
+SELECT o.id, o.label
+FROM subquery_exists_outer AS o
+WHERE EXISTS(
+  SELECT 1
+  FROM subquery_exists_lookup AS l
+  JOIN subquery_exists_lookup AS required
+    ON required.grp = l.grp
+   AND required.kind = 'open'
+  WHERE l.grp = o.grp
+)
+ORDER BY o.id;
+
+-- 7. Sibling EXISTS disjunctions share one duplicate-insensitive reduction
+-- @query
+SELECT o.id, o.label
+FROM subquery_exists_outer AS o
+WHERE EXISTS(
+  SELECT 1
+  FROM subquery_exists_lookup AS l
+  WHERE l.grp = o.grp
+    AND l.kind = 'blocked'
+)
+OR EXISTS(
+  SELECT 1
+  FROM subquery_exists_lookup AS l
+  WHERE l.grp = o.grp
+    AND l.quota >= 6
+)
+ORDER BY o.id;
+
 -- @teardown
 DROP TABLE IF EXISTS subquery_exists_outer;
 

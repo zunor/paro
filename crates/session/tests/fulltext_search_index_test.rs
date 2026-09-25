@@ -172,6 +172,218 @@ fn bm25_ranking_is_stable_across_segments() {
     );
 }
 
+#[test]
+fn document_rank_executes_index_tail_overlay_and_compacted_sources() {
+    run_async_test_with_large_stack("document-rank-sources", async {
+        let instance = Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut sink = CollectingSink::new();
+        for sql in [
+            "CREATE TABLE rank_sources (id INT, content VARCHAR)",
+            "INSERT INTO rank_sources VALUES (1, 'vector database vector'), (2, 'vector database')",
+            "INSERT INTO rank_sources VALUES (3, 'database vector'), (4, 'vector'), (5, 'noise')",
+        ] {
+            exec_ok(&mut session, &mut sink, sql).await;
+        }
+        let ranking = "SELECT id FROM rank_sources
+            WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+            ORDER BY ts_rank(to_tsvector('simple', content),
+                plainto_tsquery('simple', 'vector database')) DESC LIMIT 1";
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1]);
+        exec_ok(&mut session, &mut sink,
+            "CREATE INDEX rank_sources_index ON rank_sources USING GIN (to_tsvector('simple', content))").await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1]);
+        exec_ok(
+            &mut session,
+            &mut sink,
+            &format!("EXPLAIN ANALYZE {ranking}"),
+        )
+        .await;
+        assert!(
+            explain_lines(&sink)
+                .iter()
+                .any(|line| line.contains("FULLTEXT_SCAN")),
+            "the score oracle must also exercise the executable index provider"
+        );
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "OPTIMIZE TABLE rank_sources COMPACT",
+        )
+        .await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1]);
+        exec_ok(&mut session, &mut sink, "BEGIN").await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "INSERT INTO rank_sources VALUES (6, 'vector vector database database')",
+        )
+        .await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![6]);
+        exec_ok(&mut session, &mut sink, "ROLLBACK").await;
+        exec_ok(&mut session, &mut sink, "BEGIN").await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "DELETE FROM rank_sources WHERE id IN (1, 2)",
+        )
+        .await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(
+            query_i64_col(&sink, 0),
+            vec![3],
+            "overlay visibility must be applied before index truncation"
+        );
+        exec_ok(&mut session, &mut sink, "ROLLBACK").await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1]);
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "SELECT id FROM rank_sources
+             WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+                 AND length(content) < 20 AND id < 3
+             ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC LIMIT 1",
+        )
+        .await;
+        assert_eq!(query_i64_col(&sink, 0), vec![2]);
+    });
+}
+
+#[test]
+fn exact_vector_provider_applies_overlay_visibility_before_topk() {
+    run_async_test_with_large_stack("vector-overlay-topk", async {
+        let instance = Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut sink = CollectingSink::new();
+        for sql in [
+            "CREATE TABLE vector_visibility (id INT, v VECTOR(2))",
+            "CREATE VECTOR INDEX vector_visibility_index ON vector_visibility(v) distance=l2",
+            "INSERT INTO vector_visibility VALUES (1, '[0,0]'), (2, '[1,0]'), (3, '[2,0]')",
+            "REFRESH VECTOR INDEX vector_visibility_index ON vector_visibility",
+        ] {
+            exec_ok(&mut session, &mut sink, sql).await;
+        }
+        let ranking = "SELECT id FROM vector_visibility ORDER BY v <-> '[0,0]' LIMIT 1";
+        exec_ok(
+            &mut session,
+            &mut sink,
+            &format!("EXPLAIN ANALYZE {ranking}"),
+        )
+        .await;
+        assert!(explain_lines(&sink)
+            .iter()
+            .any(|line| line.contains("VECTOR_SEARCH")));
+        exec_ok(&mut session, &mut sink, "BEGIN").await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "DELETE FROM vector_visibility WHERE id=1",
+        )
+        .await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![2]);
+        exec_ok(&mut session, &mut sink, "ROLLBACK").await;
+        exec_ok(&mut session, &mut sink, ranking).await;
+        assert_eq!(query_i64_col(&sink, 0), vec![1]);
+    });
+}
+
+#[test]
+fn sparse_topk_must_not_replace_the_sql_score_domain() {
+    run_async_test_with_large_stack("sparse-score-domain", async {
+        let mut session = Session::new(1, Instance::new_in_memory());
+        let mut sink = CollectingSink::new();
+        for sql in [
+            "CREATE TABLE sparse_domain (id INT, v BLOB)",
+            "INSERT INTO sparse_domain VALUES (1, sparse_vector('{1:1}')), (2, sparse_vector('{1:2}')), (3, sparse_vector('{2:1}'))",
+            "CREATE VECTOR INDEX sparse_domain_index ON sparse_domain(v) mode='sparse'",
+            "REFRESH VECTOR INDEX sparse_domain_index ON sparse_domain",
+        ] { exec_ok(&mut session, &mut sink, sql).await; }
+        exec_ok(&mut session, &mut sink,
+            "SELECT id FROM sparse_domain ORDER BY sparse_distance(v, sparse_vector('{1:1}')) ASC LIMIT 1").await;
+        assert_eq!(query_i64_col(&sink, 0), vec![3]);
+        exec_ok(&mut session, &mut sink,
+            "SELECT id FROM sparse_domain ORDER BY sparse_distance(v, sparse_vector('{1:1}')) DESC LIMIT 3").await;
+        assert_eq!(query_i64_col(&sink, 0), vec![2, 1, 3]);
+        exec_ok(&mut session, &mut sink,
+            "EXPLAIN ANALYZE SELECT id FROM sparse_domain ORDER BY sparse_distance(v, sparse_vector('{1:1}')) DESC LIMIT 3").await;
+        assert!(
+            explain_lines(&sink)
+                .iter()
+                .all(|line| !line.contains("SPARSE_SEARCH") && !line.contains("ADAPTIVE_SEARCH")),
+            "an index alone does not prove replacement of the complete SQL score domain"
+        );
+    });
+}
+
+#[test]
+fn vector_replacement_preserves_null_rows_and_projected_casts() {
+    run_async_test_with_large_stack("vector-score-domain", async {
+        let instance = Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut sink = CollectingSink::new();
+        for sql in [
+            "CREATE TABLE vector_domain (id INT, v VECTOR(2))",
+            "INSERT INTO vector_domain VALUES (1, '[0.25,0]'), (2, '[1.25,0]'), (3, NULL)",
+        ] {
+            exec_ok(&mut session, &mut sink, sql).await;
+        }
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "SELECT id FROM vector_domain ORDER BY v <-> '[0,0]' NULLS LAST LIMIT 3",
+        )
+        .await;
+        // Dense scalar distance currently treats a NULL vector as a zero
+        // vector. A physical replacement must preserve that logical contract.
+        assert_eq!(query_i64_col(&sink, 0), vec![3, 1, 2]);
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "CREATE VECTOR INDEX vector_domain_index ON vector_domain(v) distance=l2",
+        )
+        .await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "REFRESH VECTOR INDEX vector_domain_index ON vector_domain",
+        )
+        .await;
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "SELECT id FROM vector_domain ORDER BY v <-> '[0,0]' NULLS LAST LIMIT 3",
+        )
+        .await;
+        assert_eq!(query_i64_col(&sink, 0), vec![3, 1, 2]);
+        exec_ok(
+            &mut session,
+            &mut sink,
+            "SELECT id FROM vector_domain ORDER BY v <-> '[0,0]' NULLS LAST LIMIT 1",
+        )
+        .await;
+        assert_eq!(query_i64_col(&sink, 0), vec![3]);
+        exec_ok(&mut session, &mut sink,
+            "SELECT CAST(v <-> '[0,0]' AS INT) AS distance FROM vector_domain WHERE v IS NOT NULL ORDER BY distance LIMIT 2").await;
+        assert_eq!(query_i64_col(&sink, 0), vec![0, 1]);
+        exec_ok(&mut session, &mut sink,
+            "SELECT v <-> '[0,0]' AS distance FROM vector_domain WHERE v IS NOT NULL ORDER BY distance LIMIT 2").await;
+        let values: Vec<_> = sink
+            .assert_single_result()
+            .chunks
+            .iter()
+            .flat_map(|chunk| (0..chunk.len()).map(|row| chunk.column(0).unwrap().get_value(row)))
+            .collect();
+        assert_eq!(values, vec![Value::Double(0.25), Value::Double(1.25)]);
+    });
+}
+
 async fn run_restart_recovery_keeps_fulltext_index_usable() {
     let base_dir = create_unique_test_dir("fulltext_search", "restart");
     let mut sink = CollectingSink::new();

@@ -94,6 +94,7 @@ impl SinkExec {
             Self::ClientResult(_)
                 | Self::Materialize(_)
                 | Self::HashJoinBuild(_)
+                | Self::HashAggregateBuild(_)
                 | Self::TopNBuild(_)
                 | Self::PartitionAggregateWindowBuild(_)
         )

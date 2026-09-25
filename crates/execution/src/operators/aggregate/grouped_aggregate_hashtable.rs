@@ -9,26 +9,65 @@ use std::sync::Arc;
 use paro_common::allocator::{Allocator, ArenaAllocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
+use paro_common::memory::{
+    AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
-use paro_function::aggregate::{AggregateCombineType, AggregateInputData, AggregateStateInput};
+use paro_function::aggregate::{
+    AggregateCombineType, AggregateInputData, AggregateStateInput, DirectGroupedAggregateProgram,
+};
 
 use super::aggregate_kernel::{
     combine_states, destroy_states, filtered_input_vectors_for_aggregate, finalize_states,
     initialize_states, input_vectors_for_aggregate, serialize_aggregate_state_blob,
     update_filtered_states, update_states, with_aggregate_input_data, AggregatePayload,
 };
-use super::aggregate_object::AggregateObject;
+use super::aggregate_object::{compile_direct_update_program, AggregateObject};
 use super::aggregate_state::AggregateStateLayout;
+#[cfg(test)]
 use super::group_hash::hash_group_columns;
+use super::group_hash::{
+    hash_group_columns_prefix, AggregateHashContract, GroupHashScratch, IncomingHashContract,
+    LookupHashContract, RoutingHashContract,
+};
 use super::tuple_layout::{TupleLayout, TupleScatterSource, VarlenHeap};
+use adaptive_integer_index::AdaptiveIntegerGroupIndexState;
 
 const MIN_CAPACITY: usize = 8;
 const LOAD_FACTOR_NUMERATOR: usize = 3; // 0.6
 const LOAD_FACTOR_DENOMINATOR: usize = 5;
 const INLINE_KEY_MAX_BYTES: usize = 8;
+/// A planned prefix is only an optimization hint. Once a probe crosses this
+/// bound, the table rebuilds its lookup index from the complete serialized
+/// keys. This caps the amount of work that a stale or correlated NDV estimate
+/// can impose before the estimate is discarded.
+pub(crate) const MAX_PREFIX_PROBE_DISTANCE: usize = 32;
+
+#[must_use = "aggregate hash telemetry must be merged into its operator-level owner"]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AggregateHashRuntimeStats {
+    pub full_key_fallback_count: u64,
+    pub max_prefix_probe_distance: u64,
+    /// 100 means perfectly balanced; e.g. 400 means the hottest radix
+    /// partition received four times its ideal share of a routed batch.
+    pub max_radix_partition_skew_percent: u64,
+}
+
+impl AggregateHashRuntimeStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.full_key_fallback_count = self
+            .full_key_fallback_count
+            .saturating_add(other.full_key_fallback_count);
+        self.max_prefix_probe_distance = self
+            .max_prefix_probe_distance
+            .max(other.max_prefix_probe_distance);
+        self.max_radix_partition_skew_percent = self
+            .max_radix_partition_skew_percent
+            .max(other.max_radix_partition_skew_percent);
+    }
+}
 
 /// Soft upper bound for eager hash-table allocation.
 ///
@@ -40,6 +79,54 @@ const INLINE_KEY_MAX_BYTES: usize = 8;
 pub(crate) struct HashTableCapacityHint {
     pub expected_rows: usize,
     pub max_fixed_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HashTableGrowthRequirement {
+    pub persistent_bytes: usize,
+    pub overlap_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HashTableInitialSizing {
+    Minimum,
+    Fixed(usize),
+    Estimated(HashTableCapacityHint),
+}
+
+/// Construction policy for a flat aggregate table. Hash semantics and sizing
+/// travel as one value instead of being encoded by a growing matrix of
+/// similarly named constructors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupedAggregateHashTableConfig {
+    hash_contract: AggregateHashContract,
+    sizing: HashTableInitialSizing,
+}
+
+impl GroupedAggregateHashTableConfig {
+    pub(crate) fn minimum(hash_contract: AggregateHashContract) -> Self {
+        Self {
+            hash_contract,
+            sizing: HashTableInitialSizing::Minimum,
+        }
+    }
+
+    pub(crate) fn estimated(
+        hash_contract: AggregateHashContract,
+        capacity_hint: HashTableCapacityHint,
+    ) -> Self {
+        Self {
+            hash_contract,
+            sizing: HashTableInitialSizing::Estimated(capacity_hint),
+        }
+    }
+
+    pub(crate) fn fixed(hash_contract: AggregateHashContract, capacity: usize) -> Self {
+        Self {
+            hash_contract,
+            sizing: HashTableInitialSizing::Fixed(capacity),
+        }
+    }
 }
 
 impl HashTableCapacityHint {
@@ -117,6 +204,17 @@ struct InlineKey {
     null_mask: u64,
 }
 
+impl InlineKey {
+    fn from_prepared(source: &TupleScatterSource<'_>, row: usize) -> Result<Self> {
+        let mut bytes = [0; INLINE_KEY_MAX_BYTES];
+        let null_mask = source.copy_fixed_key(row, &mut bytes)?;
+        Ok(Self {
+            bits: u64::from_le_bytes(bytes),
+            null_mask,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InlineKeyLayout {
     group_types: Vec<LogicalType>,
@@ -147,6 +245,7 @@ impl InlineKeyLayout {
         })
     }
 
+    #[cfg(test)]
     fn encode_row(&self, groups: &Chunk, row_idx: usize) -> Result<InlineKey> {
         if row_idx >= groups.size() {
             return Err(paro_error::internal(format!(
@@ -254,14 +353,21 @@ pub struct GroupedAggregateHashTable {
     layout: TupleLayout,
     state_layout: AggregateStateLayout,
     aggregate_objects: Vec<AggregateObject>,
+    direct_update_program: Option<DirectGroupedAggregateProgram>,
     aggregate_inputs: Vec<Vec<usize>>,
     aggregate_return_types: Vec<LogicalType>,
     varlen_heap: VarlenHeap,
     aggregate_allocator: ArenaAllocator,
     inline_key_layout: Option<InlineKeyLayout>,
+    adaptive_integer_index: AdaptiveIntegerGroupIndexState,
     count: usize,
     capacity: usize,
     bitmask: usize,
+    /// Owns both the immutable full-key routing policy and the adaptive lookup
+    /// policy. Keeping them in a single typed contract prevents insertion,
+    /// spill, and merge paths from silently exchanging two bare widths.
+    hash_contract: AggregateHashContract,
+    hash_runtime_stats: AggregateHashRuntimeStats,
 }
 
 impl GroupedAggregateHashTable {
@@ -290,33 +396,14 @@ impl GroupedAggregateHashTable {
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
-        Self::with_capacity(
+        let hash_contract = AggregateHashContract::try_new(group_types.len(), group_types.len())?;
+        Self::new_configured(
             group_types,
             aggregate_objects,
             aggregate_inputs,
-            MIN_CAPACITY,
             allocator,
             memory,
-        )
-    }
-
-    pub(crate) fn new_with_memory_capacity_hint(
-        group_types: Vec<LogicalType>,
-        aggregate_objects: Vec<AggregateObject>,
-        aggregate_inputs: Vec<Vec<usize>>,
-        allocator: Arc<dyn Allocator>,
-        memory: MemoryAccountingContext,
-        capacity_hint: HashTableCapacityHint,
-    ) -> Result<Self> {
-        let initial_capacity =
-            initial_capacity_for_hint(&group_types, &aggregate_objects, capacity_hint)?;
-        Self::with_capacity(
-            group_types,
-            aggregate_objects,
-            aggregate_inputs,
-            initial_capacity,
-            allocator,
-            memory,
+            GroupedAggregateHashTableConfig::minimum(hash_contract),
         )
     }
 
@@ -344,6 +431,12 @@ impl GroupedAggregateHashTable {
         self.aggregate_return_types.len()
     }
 
+    pub(crate) fn fuse_disjoint_filter_group(&mut self, filter_inputs: &[usize]) -> bool {
+        self.direct_update_program
+            .as_mut()
+            .is_some_and(|program| program.fuse_disjoint_filter_group(filter_inputs))
+    }
+
     pub fn with_capacity(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
@@ -352,9 +445,47 @@ impl GroupedAggregateHashTable {
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
+        let hash_contract = AggregateHashContract::try_new(group_types.len(), group_types.len())?;
+        Self::new_configured(
+            group_types,
+            aggregate_objects,
+            aggregate_inputs,
+            allocator,
+            memory,
+            GroupedAggregateHashTableConfig::fixed(hash_contract, initial_capacity),
+        )
+    }
+
+    pub(crate) fn new_configured(
+        group_types: Vec<LogicalType>,
+        aggregate_objects: Vec<AggregateObject>,
+        aggregate_inputs: Vec<Vec<usize>>,
+        allocator: Arc<dyn Allocator>,
+        memory: MemoryAccountingContext,
+        config: GroupedAggregateHashTableConfig,
+    ) -> Result<Self> {
+        if config.hash_contract.key_width() != group_types.len() {
+            return Err(paro_error::internal(format!(
+                "Aggregate hash contract/key mismatch: contract={}, groups={}",
+                config.hash_contract.key_width(),
+                group_types.len()
+            )));
+        }
         validate_aggregate_inputs(&aggregate_objects, &aggregate_inputs)?;
+        let initial_capacity = match config.sizing {
+            HashTableInitialSizing::Minimum => MIN_CAPACITY,
+            HashTableInitialSizing::Fixed(capacity) => capacity,
+            HashTableInitialSizing::Estimated(hint) => {
+                initial_capacity_for_hint(&group_types, &aggregate_objects, hint)?
+            }
+        };
         let layout = TupleLayout::build(&group_types, &aggregate_objects)?;
         let state_layout = AggregateStateLayout::new(&aggregate_objects)?;
+        let direct_update_program = {
+            let program =
+                compile_direct_update_program(&aggregate_objects, &aggregate_inputs, &state_layout);
+            program.handles_all().then_some(program)
+        };
         let aggregate_return_types = aggregate_objects
             .iter()
             .map(|object| object.return_type.clone())
@@ -403,6 +534,7 @@ impl GroupedAggregateHashTable {
             layout,
             state_layout,
             aggregate_objects,
+            direct_update_program,
             aggregate_inputs,
             aggregate_return_types,
             varlen_heap: VarlenHeap::new_with_memory(
@@ -410,9 +542,12 @@ impl GroupedAggregateHashTable {
             ),
             aggregate_allocator: ArenaAllocator::new(allocator),
             inline_key_layout,
+            adaptive_integer_index: AdaptiveIntegerGroupIndexState::Candidate,
             count: 0,
             capacity,
             bitmask,
+            hash_contract: config.hash_contract,
+            hash_runtime_stats: AggregateHashRuntimeStats::default(),
         })
     }
 
@@ -440,7 +575,41 @@ impl GroupedAggregateHashTable {
     /// Hash grouped keys using Paro vector hash implementation.
     pub fn hash_groups(&self, groups: &Chunk) -> Result<Vector> {
         self.validate_group_chunk(groups)?;
-        hash_group_columns(groups)
+        hash_group_columns_prefix(groups, self.hash_contract.lookup().width())
+    }
+
+    pub(crate) fn hash_routing_groups(&self, groups: &Chunk) -> Result<Vector> {
+        self.validate_group_chunk(groups)?;
+        hash_group_columns_prefix(groups, self.hash_contract.routing().width())
+    }
+
+    pub(crate) fn hash_groups_with_scratch<'a>(
+        &self,
+        groups: &Chunk,
+        scratch: &'a mut GroupHashScratch,
+    ) -> Result<&'a Vector> {
+        self.validate_group_chunk(groups)?;
+        scratch.hash_prefix(groups, self.hash_contract.lookup().width())
+    }
+
+    pub(crate) fn take_hash_runtime_stats(&mut self) -> AggregateHashRuntimeStats {
+        std::mem::take(&mut self.hash_runtime_stats)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn merge_hash_runtime_stats(&mut self, stats: AggregateHashRuntimeStats) {
+        self.hash_runtime_stats.merge(stats);
+    }
+
+    pub(crate) fn varlen_bytes_upper_bound(
+        &self,
+        groups: &Chunk,
+        source_rows: Option<&[u32]>,
+    ) -> Result<usize> {
+        self.validate_group_chunk(groups)?;
+        self.layout
+            .prepare_scatter(groups)?
+            .out_of_line_bytes_upper_bound(source_rows)
     }
 
     /// Probe and insert grouped keys, returning state addresses for each input row.
@@ -451,6 +620,39 @@ impl GroupedAggregateHashTable {
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
     ) -> Result<usize> {
+        self.find_or_create_groups_with_hash_contract(
+            groups,
+            hashes,
+            IncomingHashContract::Lookup(self.hash_contract.lookup()),
+            addresses,
+            new_groups,
+        )
+    }
+
+    pub(crate) fn find_or_create_groups_with_routing_hashes(
+        &mut self,
+        groups: &Chunk,
+        hashes: &Vector,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<usize> {
+        self.find_or_create_groups_with_hash_contract(
+            groups,
+            hashes,
+            IncomingHashContract::Routing(self.hash_contract.routing()),
+            addresses,
+            new_groups,
+        )
+    }
+
+    fn find_or_create_groups_with_hash_contract(
+        &mut self,
+        groups: &Chunk,
+        hashes: &Vector,
+        incoming_contract: IncomingHashContract,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<usize> {
         self.validate_group_chunk(groups)?;
         validate_hashes(hashes, groups.size())?;
         let hash_format = hashes.try_decode_ref(groups.size())?;
@@ -458,6 +660,7 @@ impl GroupedAggregateHashTable {
         self.find_or_create_groups_with(
             groups,
             groups.size(),
+            incoming_contract,
             |input_idx| input_idx,
             |_, source_row| {
                 let hash_idx = hash_format.physical_index(source_row);
@@ -485,6 +688,7 @@ impl GroupedAggregateHashTable {
         groups: &Chunk,
         source_rows: &[u32],
         hashes: &[u64],
+        incoming_contract: IncomingHashContract,
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
     ) -> Result<usize> {
@@ -507,6 +711,7 @@ impl GroupedAggregateHashTable {
         self.find_or_create_groups_with(
             groups,
             source_rows.len(),
+            incoming_contract,
             |input_idx| source_rows[input_idx] as usize,
             |input_idx, _| Ok(hashes[input_idx]),
             addresses,
@@ -518,11 +723,16 @@ impl GroupedAggregateHashTable {
         &mut self,
         groups: &Chunk,
         input_row_count: usize,
+        incoming_contract: IncomingHashContract,
         source_row_at: impl Fn(usize) -> usize,
         hash_at: impl Fn(usize, usize) -> Result<u64>,
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
     ) -> Result<usize> {
+        // A generic insertion may introduce keys outside the observed dense
+        // domain. The canonical hash table remains complete; discard only the
+        // optional acceleration sidecar before mutating it through this path.
+        self.adaptive_integer_index = AdaptiveIntegerGroupIndexState::Disabled;
         validate_addresses_vector(addresses, groups.size())?;
         addresses.try_set_count(groups.size())?;
         if input_row_count == 0 {
@@ -535,6 +745,22 @@ impl GroupedAggregateHashTable {
         self.ensure_capacity_for(input_row_count)?;
         self.ensure_row_storage_capacity(input_row_count)?;
 
+        if incoming_contract.width() > self.layout.group_count() {
+            return Err(paro_error::internal(format!(
+                "Invalid incoming aggregate hash contract: groups={}, contract={incoming_contract:?}",
+                self.layout.group_count(),
+            )));
+        }
+        let recalculated_hashes =
+            if incoming_contract.width() == self.hash_contract.lookup().width() {
+                None
+            } else {
+                Some(hash_group_columns_prefix(
+                    groups,
+                    self.hash_contract.lookup().width(),
+                )?)
+            };
+
         let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
         let mut new_state_ptrs = Vec::new();
         if new_groups.capacity() < input_row_count {
@@ -544,14 +770,20 @@ impl GroupedAggregateHashTable {
         new_groups.set_len(input_row_count);
         let new_group_data = new_groups.as_mut_slice().as_mut_ptr();
         let mut new_group_count = 0usize;
-        let inline_key_layout = self.inline_key_layout.clone();
-        if let Some(inline_layout) = inline_key_layout {
+        let observe_prefix_probes = self.hash_contract.lookup_is_prefix();
+        let mut max_prefix_probe_distance = 0usize;
+        if self.inline_key_layout.is_some() {
             let inline_key_data = self.inline_key_storage_mut_ptr()?;
             for input_idx in 0..input_row_count {
                 let row_idx = source_row_at(input_idx);
-                let hash = hash_at(input_idx, row_idx)?;
-                let inline_key = inline_layout.encode_row(groups, row_idx)?;
+                let hash = if let Some(hashes) = recalculated_hashes.as_ref() {
+                    hashes.as_slice::<u64>()[row_idx]
+                } else {
+                    hash_at(input_idx, row_idx)?
+                };
+                let inline_key = InlineKey::from_prepared(&scatter_source, row_idx)?;
                 let mut slot = self.slot_for_hash(hash);
+                let mut probe_distance = 0usize;
                 loop {
                     let entry = self.entries[slot];
                     if !entry.is_occupied() {
@@ -590,14 +822,23 @@ impl GroupedAggregateHashTable {
                         break;
                     }
 
+                    probe_distance += 1;
+                    if observe_prefix_probes {
+                        max_prefix_probe_distance = max_prefix_probe_distance.max(probe_distance);
+                    }
                     slot = (slot + 1) & self.bitmask;
                 }
             }
         } else {
             for input_idx in 0..input_row_count {
                 let row_idx = source_row_at(input_idx);
-                let hash = hash_at(input_idx, row_idx)?;
+                let hash = if let Some(hashes) = recalculated_hashes.as_ref() {
+                    hashes.as_slice::<u64>()[row_idx]
+                } else {
+                    hash_at(input_idx, row_idx)?
+                };
                 let mut slot = self.slot_for_hash(hash);
+                let mut probe_distance = 0usize;
                 loop {
                     let entry = self.entries[slot];
                     if !entry.is_occupied() {
@@ -635,10 +876,20 @@ impl GroupedAggregateHashTable {
                         break;
                     }
 
+                    probe_distance += 1;
+                    if observe_prefix_probes {
+                        max_prefix_probe_distance = max_prefix_probe_distance.max(probe_distance);
+                    }
                     slot = (slot + 1) & self.bitmask;
                 }
             }
         }
+
+        // Strategy transitions happen only after the data-plane batch has
+        // released every lookup-sidecar pointer. Besides keeping the unsafe
+        // aliasing contract honest, this bounds a bad prefix hint to one
+        // vector batch before the canonical rows rebuild a full-key index.
+        self.finish_prefix_probe_batch(max_prefix_probe_distance)?;
 
         if !new_state_ptrs.is_empty() {
             let new_addresses = pointer_vector_from_slice(&new_state_ptrs, self.allocator())?;
@@ -677,6 +928,14 @@ impl GroupedAggregateHashTable {
         #[cfg(debug_assertions)]
         self.validate_state_addresses(addresses, payload.size())?;
 
+        if filter.is_none() {
+            if let Some(program) = self.direct_update_program.as_ref() {
+                if unsafe { program.execute(payload, addresses, payload.size())? } {
+                    return Ok(());
+                }
+            }
+        }
+
         let payload_desc = AggregatePayload {
             chunk: payload,
             aggregate_inputs: &self.aggregate_inputs,
@@ -707,6 +966,34 @@ impl GroupedAggregateHashTable {
         Ok(())
     }
 
+    /// Execute the complete precompiled update program without constructing
+    /// per-aggregate dictionary inputs or FILTER selections.
+    ///
+    /// `false` is a no-mutation decline: callers may safely fall back to the
+    /// generic aggregate ABI for unsupported functions or vector shapes.
+    pub(crate) fn try_update_direct_aggregates(
+        &mut self,
+        payload: &Chunk,
+        addresses: &Vector,
+    ) -> Result<bool> {
+        if payload.size() == 0 || self.aggregate_objects.is_empty() {
+            return Ok(true);
+        }
+        if addresses.len() < payload.size() {
+            return Err(paro_error::internal(format!(
+                "Address vector too small for direct aggregate update: addresses={} payload_rows={}",
+                addresses.len(),
+                payload.size()
+            )));
+        }
+        #[cfg(debug_assertions)]
+        self.validate_state_addresses(addresses, payload.size())?;
+        let Some(program) = self.direct_update_program.as_ref() else {
+            return Ok(false);
+        };
+        unsafe { program.execute(payload, addresses, payload.size()) }
+    }
+
     pub fn update_aggregates_per_filter(
         &mut self,
         payload: &Chunk,
@@ -718,6 +1005,12 @@ impl GroupedAggregateHashTable {
         }
         #[cfg(debug_assertions)]
         self.validate_state_addresses(addresses, payload.size())?;
+
+        if let Some(program) = self.direct_update_program.as_ref() {
+            if unsafe { program.execute(payload, addresses, payload.size())? } {
+                return Ok(());
+            }
+        }
 
         for (agg_idx, (object, filter)) in self
             .aggregate_objects
@@ -1011,10 +1304,11 @@ impl GroupedAggregateHashTable {
 
         for row in 0..batch_size {
             let source_ptr = self.row_ptr(position.offset + row);
+            let hash = self.serialized_routing_hash(position.offset + row)?;
             result
                 .column_mut(0)
                 .ok_or_else(|| paro_error::internal("Missing aggregate state hash column"))?
-                .set_value(row, &Value::UBigInt(self.layout.load_hash(source_ptr)));
+                .set_value(row, &Value::UBigInt(hash));
             for group_idx in 0..group_count {
                 let value = self.layout.deserialize_group_value(
                     source_ptr,
@@ -1078,12 +1372,13 @@ impl GroupedAggregateHashTable {
 
         for row in 0..batch_size {
             let source_ptr = self.row_ptr(position.offset + row);
+            let hash = self.serialized_routing_hash(position.offset + row)?;
             result
                 .column_mut(0)
                 .ok_or_else(|| {
                     paro_error::internal("Missing aggregate serialized state hash column")
                 })?
-                .set_value(row, &Value::UBigInt(self.layout.load_hash(source_ptr)));
+                .set_value(row, &Value::UBigInt(hash));
             for group_idx in 0..group_count {
                 let value = self.layout.deserialize_group_value(
                     source_ptr,
@@ -1147,6 +1442,7 @@ impl GroupedAggregateHashTable {
 
         self.data.clear();
         self.data.shrink_to_fit_and_refund();
+        self.adaptive_integer_index = AdaptiveIntegerGroupIndexState::Disabled;
         self.entries.clear();
         self.entries.shrink_to_fit_and_refund();
         if let Some(inline_keys) = &mut self.inline_keys {
@@ -1173,6 +1469,7 @@ impl GroupedAggregateHashTable {
                 .inline_keys
                 .as_ref()
                 .map_or(0, |keys| keys.capacity() * size_of::<InlineKey>())
+            + self.adaptive_integer_index.memory_usage()
     }
 
     pub fn external_accounted_memory_usage(&self) -> usize {
@@ -1231,54 +1528,148 @@ impl GroupedAggregateHashTable {
         if new_capacity <= self.capacity {
             return Ok(());
         }
-
-        let mut new_entries = accounted_vec_for_context(
-            &self.memory.with_class(MemoryAccountingClass::Metadata),
-            MemoryTag::HashTable,
-            MemoryAccountingClass::Metadata,
-        )?;
-        new_entries.try_resize_with(new_capacity, AggregateHTEntry::empty)?;
-        let mut new_inline_keys = if self.inline_key_layout.is_some() {
-            let mut keys = accounted_vec_for_context(
-                &self.memory.with_class(MemoryAccountingClass::Metadata),
-                MemoryTag::HashTable,
-                MemoryAccountingClass::Metadata,
-            )?;
-            keys.try_resize_with(new_capacity, InlineKey::default)?;
-            Some(keys)
-        } else {
-            None
-        };
         if self.inline_key_layout.is_some() != self.inline_keys.is_some() {
             return Err(paro_error::internal(
                 "Aggregate inline-key layout and storage disagree",
             ));
         }
-        let new_bitmask = new_capacity - 1;
-        for (old_slot, old_entry) in self.entries.iter().copied().enumerate() {
-            if !old_entry.is_occupied() {
-                continue;
-            }
-            let row_idx = old_entry.row_idx();
+
+        // The sink pre-reserves the allocator's old/new overlap before taking
+        // the table lock. Grow the owned representation in place, then rebuild
+        // the lookup index from the canonical tuple rows. Tuple rows remain
+        // the recovery source throughout the transition.
+        self.entries
+            .try_resize_with(new_capacity, AggregateHTEntry::empty)?;
+        if let Some(inline_keys) = self.inline_keys.as_mut() {
+            inline_keys.try_resize_with(new_capacity, InlineKey::default)?;
+        }
+        self.rebuild_lookup_index(new_capacity)?;
+        self.capacity = new_capacity;
+        self.bitmask = new_capacity - 1;
+        Ok(())
+    }
+
+    /// Publish one batch's work under the speculative prefix contract and, if
+    /// needed, perform its one-way transition at the batch boundary.
+    fn finish_prefix_probe_batch(&mut self, max_probe_distance: usize) -> Result<()> {
+        if !self.hash_contract.lookup_is_prefix() {
+            return Ok(());
+        }
+        self.hash_runtime_stats.max_prefix_probe_distance = self
+            .hash_runtime_stats
+            .max_prefix_probe_distance
+            .max(max_probe_distance as u64);
+        if max_probe_distance >= MAX_PREFIX_PROBE_DISTANCE {
+            self.promote_lookup_hash_to_full()?;
+        }
+        Ok(())
+    }
+
+    /// Replace a speculative prefix lookup index with a full-key index.
+    ///
+    /// Tuple rows and aggregate states are canonical and never move. Only the
+    /// stored hash and lookup sidecars are rebuilt, so every state address
+    /// already returned for the current batch remains valid.
+    fn promote_lookup_hash_to_full(&mut self) -> Result<bool> {
+        if !self.hash_contract.lookup_is_prefix() {
+            return Ok(false);
+        }
+        let full_group_count = self.hash_contract.routing().width();
+        for row_idx in 0..self.count {
+            let row = self.row_ptr(row_idx);
+            let hash = unsafe {
+                self.layout.hash_serialized_group_prefix(
+                    row,
+                    full_group_count,
+                    &self.varlen_heap,
+                )?
+            };
+            self.layout.store_hash(row.cast_mut(), hash);
+        }
+        self.rebuild_lookup_index(self.capacity)?;
+        let promoted = self.hash_contract.promote_lookup_to_full();
+        debug_assert!(promoted);
+        self.hash_runtime_stats.full_key_fallback_count = self
+            .hash_runtime_stats
+            .full_key_fallback_count
+            .saturating_add(1);
+        Ok(true)
+    }
+
+    pub(super) fn lookup_hash_contract(&self) -> LookupHashContract {
+        self.hash_contract.lookup()
+    }
+
+    pub(super) fn routing_hash_contract(&self) -> RoutingHashContract {
+        self.hash_contract.routing()
+    }
+
+    pub(super) fn serialized_hash_for_lookup_contract(
+        &self,
+        row_idx: usize,
+        contract: LookupHashContract,
+    ) -> Result<u64> {
+        self.serialized_hash_for_contract(row_idx, IncomingHashContract::Lookup(contract))
+    }
+
+    pub(super) fn serialized_routing_hash(&self, row_idx: usize) -> Result<u64> {
+        self.serialized_hash_for_contract(
+            row_idx,
+            IncomingHashContract::Routing(self.hash_contract.routing()),
+        )
+    }
+
+    fn serialized_hash_for_contract(
+        &self,
+        row_idx: usize,
+        contract: IncomingHashContract,
+    ) -> Result<u64> {
+        if row_idx >= self.count {
+            return Err(paro_error::internal(format!(
+                "Serialized group hash row out of bounds: row={row_idx}, count={}",
+                self.count
+            )));
+        }
+        if contract.width() == self.hash_contract.lookup().width() {
+            return Ok(self.layout.load_hash(self.row_ptr(row_idx)));
+        }
+        unsafe {
+            self.layout.hash_serialized_group_prefix(
+                self.row_ptr(row_idx),
+                contract.width(),
+                &self.varlen_heap,
+            )
+        }
+    }
+
+    fn rebuild_lookup_index(&mut self, capacity: usize) -> Result<()> {
+        self.entries.fill(AggregateHTEntry::empty());
+        if let Some(inline_keys) = self.inline_keys.as_mut() {
+            inline_keys.fill(InlineKey::default());
+        }
+        let new_bitmask = capacity - 1;
+        for row_idx in 0..self.count {
             let hash = self.layout.load_hash(self.row_ptr(row_idx));
+            let inline_key = self
+                .inline_key_layout
+                .as_ref()
+                .map(|layout| unsafe {
+                    layout.encode_serialized_row(&self.layout, self.row_ptr(row_idx))
+                })
+                .transpose()?;
             let mut slot = (hash as usize) & new_bitmask;
             loop {
-                if !new_entries[slot].is_occupied() {
-                    new_entries[slot] = AggregateHTEntry::from_hash_and_row(hash, row_idx)?;
-                    if let (Some(old_keys), Some(new_keys)) =
-                        (self.inline_keys.as_ref(), new_inline_keys.as_mut())
+                if !self.entries[slot].is_occupied() {
+                    self.entries[slot] = AggregateHTEntry::from_hash_and_row(hash, row_idx)?;
+                    if let (Some(inline_key), Some(keys)) = (inline_key, self.inline_keys.as_mut())
                     {
-                        new_keys[slot] = old_keys[old_slot];
+                        keys[slot] = inline_key;
                     }
                     break;
                 }
                 slot = (slot + 1) & new_bitmask;
             }
         }
-        self.entries = new_entries;
-        self.inline_keys = new_inline_keys;
-        self.capacity = new_capacity;
-        self.bitmask = new_bitmask;
         Ok(())
     }
 
@@ -1322,6 +1713,13 @@ impl GroupedAggregateHashTable {
                 other.inline_key_width()
             )));
         }
+        if self.hash_contract.routing() != other.hash_contract.routing() {
+            return Err(paro_error::internal(format!(
+                "Cannot combine hash tables with different routing contracts: left={:?}, right={:?}",
+                self.hash_contract.routing(),
+                other.hash_contract.routing()
+            )));
+        }
         if self.aggregate_objects.len() != other.aggregate_objects.len() {
             return Err(paro_error::internal(format!(
                 "Cannot combine hash tables with different aggregate counts: left={}, right={}",
@@ -1338,6 +1736,12 @@ impl GroupedAggregateHashTable {
             if left.payload_size != right.payload_size
                 || left.child_count != right.child_count
                 || left.return_type != right.return_type
+                || !left.function.execution_semantics_equal(&right.function)
+                || !paro_function::scalar::function_data_equals(
+                    left.bind_info.as_ref(),
+                    right.bind_info.as_ref(),
+                )
+                || left.aggr_type != right.aggr_type
             {
                 return Err(paro_error::internal(format!(
                     "Aggregate object mismatch at index {idx}: \
@@ -1474,8 +1878,107 @@ row_width {}/{} agg_state_offset {}/{}",
     }
 
     fn ensure_capacity_for(&mut self, incoming_rows: usize) -> Result<()> {
-        if incoming_rows == 0 {
+        let target_capacity = self.target_capacity_for(incoming_rows)?;
+        if target_capacity <= self.capacity {
             return Ok(());
+        }
+        self.resize(target_capacity)
+    }
+
+    /// Physical allocator overlap needed by the next lookup/row-storage
+    /// transition. The caller must retain this envelope before entering the
+    /// table owner lock; otherwise query-memory reclaim would recursively try
+    /// to acquire that same lock.
+    pub(crate) fn growth_requirement(
+        &self,
+        incoming_rows: usize,
+        incoming_varlen_bytes: usize,
+    ) -> Result<HashTableGrowthRequirement> {
+        let target_capacity = self.target_capacity_for(incoming_rows)?;
+        let (lookup_growth, lookup_overlap) = if target_capacity > self.capacity {
+            let entries_current = self
+                .entries
+                .capacity()
+                .saturating_mul(size_of::<AggregateHTEntry>());
+            let entries_target = target_capacity.saturating_mul(size_of::<AggregateHTEntry>());
+            let inline_current = self.inline_keys.as_ref().map_or(0, |keys| {
+                keys.capacity().saturating_mul(size_of::<InlineKey>())
+            });
+            let inline_target = self.inline_keys.as_ref().map_or(0, |_| {
+                target_capacity.saturating_mul(size_of::<InlineKey>())
+            });
+            (
+                entries_target
+                    .saturating_sub(entries_current)
+                    .saturating_add(inline_target.saturating_sub(inline_current)),
+                entries_current.max(inline_current),
+            )
+        } else {
+            (0, 0)
+        };
+        let target_rows = self.count.checked_add(incoming_rows).ok_or_else(|| {
+            paro_error::internal("aggregate row-storage transition count overflow")
+        })?;
+        let target_words = bytes_to_words(
+            target_rows
+                .checked_mul(self.layout.row_width)
+                .ok_or_else(|| paro_error::internal("aggregate row-storage transition overflow"))?,
+        )?;
+        let (row_growth, row_overlap) = if target_words > self.data.capacity() {
+            let current = self.data.capacity().saturating_mul(size_of::<u64>());
+            let target = target_words.saturating_mul(size_of::<u64>());
+            (target.saturating_sub(current), current)
+        } else {
+            (0, 0)
+        };
+        let (varlen_growth, varlen_overlap) =
+            self.varlen_heap.growth_requirement(incoming_varlen_bytes)?;
+        Ok(HashTableGrowthRequirement {
+            persistent_bytes: lookup_growth
+                .saturating_add(row_growth)
+                .saturating_add(varlen_growth),
+            overlap_bytes: lookup_overlap.max(row_overlap).max(varlen_overlap),
+        })
+    }
+
+    /// Move already-issued persistent capacity into the table's owned grants.
+    /// Subsequent physical allocation therefore cannot call query reclaim
+    /// while the owner lock is held. The unconsumed remainder is the transient
+    /// allocator-overlap envelope and stays live until the update completes.
+    pub(crate) fn prepare_growth(
+        &mut self,
+        incoming_rows: usize,
+        incoming_varlen_bytes: usize,
+        reservation: &MemoryGrant,
+    ) -> Result<()> {
+        let target_capacity = self.target_capacity_for(incoming_rows)?;
+        if target_capacity > self.capacity {
+            transfer_growth_capacity::<AggregateHTEntry>(
+                &self.entries,
+                target_capacity,
+                reservation,
+            )?;
+            if let Some(inline_keys) = self.inline_keys.as_ref() {
+                transfer_growth_capacity::<InlineKey>(inline_keys, target_capacity, reservation)?;
+            }
+        }
+        let target_rows = self
+            .count
+            .checked_add(incoming_rows)
+            .ok_or_else(|| paro_error::internal("aggregate prepared row-storage count overflow"))?;
+        let target_words = bytes_to_words(
+            target_rows
+                .checked_mul(self.layout.row_width)
+                .ok_or_else(|| paro_error::internal("aggregate prepared row-storage overflow"))?,
+        )?;
+        transfer_growth_capacity::<u64>(&self.data, target_words, reservation)?;
+        self.varlen_heap
+            .prepare_growth(incoming_varlen_bytes, reservation)
+    }
+
+    fn target_capacity_for(&self, incoming_rows: usize) -> Result<usize> {
+        if incoming_rows == 0 {
+            return Ok(self.capacity);
         }
         let target_count = self.count.checked_add(incoming_rows).ok_or_else(|| {
             paro_error::internal(format!(
@@ -1483,10 +1986,6 @@ row_width {}/{} agg_state_offset {}/{}",
                 self.count
             ))
         })?;
-        if target_count <= resize_threshold(self.capacity) {
-            return Ok(());
-        }
-
         let mut target_capacity = self.capacity;
         while target_count > resize_threshold(target_capacity) {
             target_capacity = target_capacity.checked_mul(2).ok_or_else(|| {
@@ -1496,7 +1995,7 @@ row_width {}/{} agg_state_offset {}/{}",
                 ))
             })?;
         }
-        self.resize(target_capacity)
+        Ok(target_capacity)
     }
 
     fn ensure_row_storage_capacity(&mut self, incoming_rows: usize) -> Result<()> {
@@ -1516,9 +2015,6 @@ row_width {}/{} agg_state_offset {}/{}",
             })?;
         let target_words = bytes_to_words(target_bytes)?;
         if target_words > self.data.capacity() {
-            if self.data.capacity() > self.data.len() {
-                self.data.shrink_to_fit_and_refund();
-            }
             let additional = target_words.saturating_sub(self.data.len());
             self.data.try_reserve(additional)?;
         }
@@ -1526,6 +2022,7 @@ row_width {}/{} agg_state_offset {}/{}",
     }
 
     fn release_finalized_lookup_storage(&mut self) {
+        self.adaptive_integer_index = AdaptiveIntegerGroupIndexState::Disabled;
         self.entries.clear();
         self.entries.shrink_to_fit_and_refund();
         if let Some(inline_keys) = &mut self.inline_keys {
@@ -1592,6 +2089,21 @@ row_width {}/{} agg_state_offset {}/{}",
     }
 }
 
+fn transfer_growth_capacity<T>(
+    target: &AccountedVec<T>,
+    target_capacity: usize,
+    reservation: &MemoryGrant,
+) -> Result<()> {
+    let current_bytes = target.capacity().saturating_mul(size_of::<T>());
+    let target_bytes = target_capacity.saturating_mul(size_of::<T>());
+    let delta = target_bytes.saturating_sub(current_bytes);
+    if delta == 0 {
+        return Ok(());
+    }
+    reservation.split(delta)?.merge_into(target.grant())?;
+    Ok(())
+}
+
 impl Drop for GroupedAggregateHashTable {
     fn drop(&mut self) {
         let _ = self.destroy();
@@ -1655,6 +2167,7 @@ fn inline_key_component_width(logical_type: &LogicalType) -> Option<usize> {
     }
 }
 
+#[cfg(test)]
 fn write_inline_component_bytes(
     key_bytes: &mut [u8; INLINE_KEY_MAX_BYTES],
     offset: usize,
@@ -1901,6 +2414,9 @@ fn fixed_allocation_bytes(
 
 #[path = "grouped_aggregate_hashtable_merge.rs"]
 mod merge;
+
+#[path = "grouped_aggregate_hashtable_integer_index.rs"]
+mod adaptive_integer_index;
 
 #[path = "grouped_aggregate_hashtable_lookup.rs"]
 mod lookup;

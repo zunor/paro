@@ -71,10 +71,11 @@ QUERY PLAN
 ORDER_BY  (rows=1)
   Sort Key: grp ASC NULLS LAST
   ->  PROJECTION  (rows=1)
-    Output: grp, sum_x
-    ->  AGGREGATE  (rows=1)
-      Group Key: agg_h_values.grp
-      Aggregates: sum(agg_h_values.x)
-      ->  PROJECTION  (rows=5)
-        Output: grp, x
-        ->  VALUES  (rows=5)
+        Output: grp, sum_x
+        ->  AGGREGATE  (rows=1)
+              Group Key: agg_h_values.grp
+              Aggregates: sum(agg_h_values.x)
+              Having: sum(agg_h_values.x) >= 3
+              ->  PROJECTION  (rows=5)
+                    Output: grp, x
+                    ->  VALUES  (rows=5)

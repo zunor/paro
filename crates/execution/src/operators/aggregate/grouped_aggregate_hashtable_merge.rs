@@ -6,160 +6,282 @@
 use super::*;
 
 impl GroupedAggregateHashTable {
+    /// Merge owned fragments. Unlike borrowed `combine_many`, this boundary
+    /// may move the first non-empty table into an empty destination, including
+    /// its arena, key heap, index and allocation leases. Never pick a larger
+    /// later fragment: that would reorder floating-point/ordered combine.
+    pub(crate) fn combine_owned(&mut self, mut sources: Vec<Self>) -> Result<()> {
+        // Validate the whole frontier before moving any ownership. A failed
+        // admission must not publish a partially substituted table.
+        for source in &sources {
+            self.ensure_compatible(source)?;
+        }
+        if self.count == 0 {
+            if let Some(first) = sources.iter_mut().find(|source| source.count != 0) {
+                if self.memory.has_same_target(&first.memory)
+                    && self.aggregate_inputs == first.aggregate_inputs
+                    && self
+                        .aggregate_objects
+                        .iter()
+                        .zip(&first.aggregate_objects)
+                        .all(|(left, right)| {
+                            left.filter == right.filter && left.order_bys == right.order_bys
+                        })
+                {
+                    // Allocator adapter identity need not match: each owned
+                    // buffer and arena retains the allocator which created it.
+                    // The accounting destination, however, must be identical.
+                    std::mem::swap(self, first);
+                }
+            }
+        }
+        self.combine_many(&mut sources)
+    }
+
     /// Combine another table without round-tripping serialized group keys
     /// through column vectors. Stored hashes are reused, fixed-width keys stay
     /// in row form, and only out-of-line varlen bytes move between heaps.
     pub fn combine(&mut self, other: &mut Self) -> Result<()> {
-        self.ensure_compatible(other)?;
-        if other.count == 0 {
+        self.combine_many(std::slice::from_mut(other))
+    }
+
+    /// Combine several completed tables as one ownership transfer.
+    ///
+    /// The upper bound is reserved once and all temporary address vectors are
+    /// reused across sources. This matters for parallel aggregate finalization:
+    /// a partition normally receives one fragment from every build worker, and
+    /// reserving fragment-by-fragment would repeatedly rehash the same target.
+    pub(crate) fn combine_many(&mut self, others: &mut [Self]) -> Result<()> {
+        let mut incoming_rows = 0usize;
+        let mut largest_source = 0usize;
+        for other in others.iter() {
+            self.ensure_compatible(other)?;
+            incoming_rows = incoming_rows
+                .checked_add(other.count)
+                .ok_or_else(|| paro_error::internal("aggregate merge source row count overflow"))?;
+            largest_source = largest_source.max(other.count);
+        }
+        if incoming_rows == 0 {
+            for other in others.iter_mut() {
+                self.hash_runtime_stats
+                    .merge(other.take_hash_runtime_stats());
+            }
             return Ok(());
         }
 
-        // Combining can insert at most every source row. Reserve that upper bound once so
-        // lookup and row storage remain stable throughout the merge. Besides avoiding
-        // geometric reallocation, this keeps aggregate-state pointers produced for a batch
-        // valid until the batch's combine callbacks have consumed them.
-        self.reserve_for_insertions(other.count)?;
+        // Combining can insert at most every source row. Besides avoiding
+        // geometric reallocation, this keeps aggregate-state pointers stable
+        // until the batch's combine callbacks have consumed them.
+        self.reserve_for_insertions(incoming_rows)?;
         let has_aggregates = !self.aggregate_objects.is_empty();
-        let address_capacity = other.count.min(VECTOR_SIZE);
-        let mut source_addresses = has_aggregates
+        let direct_program = self
+            .direct_update_program
+            .clone()
+            .filter(DirectGroupedAggregateProgram::supports_trivial_state_copy);
+        let uses_generic_combine = has_aggregates && direct_program.is_none();
+        let address_capacity = largest_source.min(VECTOR_SIZE);
+        let mut source_addresses = uses_generic_combine
             .then(|| Vector::try_new(LogicalType::BigInt, address_capacity, self.allocator()))
             .transpose()?;
-        let mut target_addresses = has_aggregates
+        let mut target_addresses = uses_generic_combine
+            .then(|| Vector::try_new(LogicalType::BigInt, address_capacity, self.allocator()))
+            .transpose()?;
+        let mut new_addresses = uses_generic_combine
             .then(|| Vector::try_new(LogicalType::BigInt, address_capacity, self.allocator()))
             .transpose()?;
         let inline_layout = self.inline_key_layout.clone();
-        let inline_key_data = inline_layout
-            .as_ref()
-            .map(|_| self.inline_key_storage_mut_ptr())
-            .transpose()?;
 
-        let mut row_offset = 0usize;
-        while row_offset < other.count {
-            let batch_size = (other.count - row_offset).min(VECTOR_SIZE);
+        for other in others.iter_mut() {
+            let mut row_offset = 0usize;
+            while row_offset < other.count {
+                let batch_size = (other.count - row_offset).min(VECTOR_SIZE);
+                let observe_prefix_probes = self.hash_contract.lookup_is_prefix();
+                let mut max_prefix_probe_distance = 0usize;
 
-            let (source_address_data, target_address_data) =
-                match (&mut source_addresses, &mut target_addresses) {
-                    (Some(source), Some(target)) => {
+                let (source_address_data, target_address_data, new_address_data) = match (
+                    &mut source_addresses,
+                    &mut target_addresses,
+                    &mut new_addresses,
+                ) {
+                    (Some(source), Some(target), Some(new)) => {
                         source.try_set_count(batch_size)?;
                         target.try_set_count(batch_size)?;
+                        new.try_set_count(batch_size)?;
                         (
                             Some(unsafe { source.flat_data_mut::<*mut u8>() }),
                             Some(unsafe { target.flat_data_mut::<*mut u8>() }),
+                            Some(unsafe { new.flat_data_mut::<*mut u8>() }),
                         )
                     }
-                    (None, None) => (None, None),
+                    (None, None, None) => (None, None, None),
                     _ => {
                         return Err(paro_error::internal(
                             "aggregate merge address vectors were initialized inconsistently",
                         ));
                     }
                 };
-            let mut new_state_ptrs = Vec::with_capacity(batch_size);
-
-            for batch_idx in 0..batch_size {
-                let source_row_idx = row_offset + batch_idx;
-                let source_row = other.row_ptr(source_row_idx);
-                let hash = other.layout.load_hash(source_row);
-                let inline_key = inline_layout
+                let mut new_state_count = 0usize;
+                // This raw sidecar pointer is deliberately scoped to one data
+                // batch. A strategy transition may rebuild the lookup index
+                // after the scope, before the next batch reacquires it.
+                let inline_key_data = inline_layout
                     .as_ref()
-                    .map(|layout| unsafe {
-                        layout.encode_serialized_row(&other.layout, source_row)
-                    })
+                    .map(|_| self.inline_key_storage_mut_ptr())
                     .transpose()?;
-                if let Some(addresses) = source_address_data {
-                    unsafe {
-                        *addresses.add(batch_idx) = other.state_ptr(source_row_idx);
+                for batch_idx in 0..batch_size {
+                    let source_row_idx = row_offset + batch_idx;
+                    let source_row = other.row_ptr(source_row_idx);
+                    let source_state = other.state_ptr(source_row_idx);
+                    // Runtime fallback is local to each table. Derive the
+                    // source row's hash under the target's active contract
+                    // instead of assuming independently built workers made
+                    // the same adaptive decision.
+                    let hash = other.serialized_hash_for_lookup_contract(
+                        source_row_idx,
+                        self.lookup_hash_contract(),
+                    )?;
+                    let inline_key = inline_layout
+                        .as_ref()
+                        .map(|layout| unsafe {
+                            layout.encode_serialized_row(&other.layout, source_row)
+                        })
+                        .transpose()?;
+                    if let Some(addresses) = source_address_data {
+                        unsafe {
+                            *addresses.add(batch_idx) = source_state;
+                        }
+                    }
+
+                    let mut slot = self.slot_for_hash(hash);
+                    let mut probe_distance = 0usize;
+                    loop {
+                        let entry = self.entries[slot];
+                        if !entry.is_occupied() {
+                            let target_row_idx =
+                                self.append_serialized_group_row(other, source_row_idx, hash)?;
+                            self.entries[slot] =
+                                AggregateHTEntry::from_hash_and_row(hash, target_row_idx)?;
+                            if let (Some(inline_key), Some(inline_key_data)) =
+                                (inline_key, inline_key_data)
+                            {
+                                // SAFETY: both lookup arrays were reserved together
+                                // before merging and remain stable for the whole merge.
+                                unsafe {
+                                    *inline_key_data.add(slot) = inline_key;
+                                }
+                            }
+                            self.count += 1;
+                            let target_state = self.state_ptr(target_row_idx);
+                            if direct_program.is_some() {
+                                // The admitted direct program proves every
+                                // state field is self-contained and trivially
+                                // copyable. A new group can therefore inherit
+                                // the complete source state without initialize
+                                // plus vectorized combine round-trips.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        source_state,
+                                        target_state,
+                                        self.state_layout.total_size(),
+                                    );
+                                }
+                            } else if let (Some(addresses), Some(new_addresses)) =
+                                (target_address_data, new_address_data)
+                            {
+                                unsafe {
+                                    *addresses.add(batch_idx) = target_state;
+                                    *new_addresses.add(new_state_count) = target_state;
+                                }
+                                new_state_count += 1;
+                            }
+                            break;
+                        }
+
+                        let keys_match = if let Some(inline_key) = inline_key {
+                            let inline_key_data = inline_key_data.ok_or_else(|| {
+                                paro_error::internal("Aggregate inline-key sidecar disappeared")
+                            })?;
+                            // SAFETY: `slot` is within both equally-sized lookup arrays.
+                            entry.matches_hash(hash)
+                                && unsafe { *inline_key_data.add(slot) } == inline_key
+                        } else {
+                            entry.matches_hash(hash)
+                                && unsafe {
+                                    self.layout.compare_serialized_groups(
+                                        self.row_ptr(entry.row_idx()),
+                                        &self.varlen_heap,
+                                        source_row,
+                                        &other.varlen_heap,
+                                    )?
+                                }
+                        };
+                        if keys_match {
+                            let target_state = self.state_ptr(entry.row_idx());
+                            if let Some(program) = direct_program.as_ref() {
+                                // SAFETY: source and target belong to distinct
+                                // compatible tables and the program was
+                                // compiled for this exact state layout.
+                                let combined = unsafe {
+                                    program.combine_direct_rows(source_state, target_state)
+                                };
+                                debug_assert!(combined);
+                            } else if let Some(addresses) = target_address_data {
+                                unsafe {
+                                    *addresses.add(batch_idx) = target_state;
+                                }
+                            }
+                            break;
+                        }
+                        probe_distance += 1;
+                        if observe_prefix_probes {
+                            max_prefix_probe_distance =
+                                max_prefix_probe_distance.max(probe_distance);
+                        }
+                        slot = (slot + 1) & self.bitmask;
                     }
                 }
 
-                let mut slot = self.slot_for_hash(hash);
-                loop {
-                    let entry = self.entries[slot];
-                    if !entry.is_occupied() {
-                        let target_row_idx =
-                            self.append_serialized_group_row(other, source_row_idx, hash)?;
-                        self.entries[slot] =
-                            AggregateHTEntry::from_hash_and_row(hash, target_row_idx)?;
-                        if let (Some(inline_key), Some(inline_key_data)) =
-                            (inline_key, inline_key_data)
-                        {
-                            // SAFETY: both lookup arrays were reserved together
-                            // before merging and remain stable for the whole merge.
-                            unsafe {
-                                *inline_key_data.add(slot) = inline_key;
-                            }
-                        }
-                        self.count += 1;
-                        let target_state = self.state_ptr(target_row_idx);
-                        if let Some(addresses) = target_address_data {
-                            unsafe {
-                                *addresses.add(batch_idx) = target_state;
-                            }
-                            new_state_ptrs.push(target_state);
-                        }
-                        break;
-                    }
-
-                    let keys_match = if let Some(inline_key) = inline_key {
-                        let inline_key_data = inline_key_data.ok_or_else(|| {
-                            paro_error::internal("Aggregate inline-key sidecar disappeared")
+                if uses_generic_combine {
+                    if new_state_count > 0 {
+                        let new_addresses = new_addresses.as_mut().ok_or_else(|| {
+                            paro_error::internal("aggregate merge new-state addresses are missing")
                         })?;
-                        // SAFETY: `slot` is within both equally-sized lookup arrays.
-                        entry.matches_hash(hash)
-                            && unsafe { *inline_key_data.add(slot) } == inline_key
-                    } else {
-                        entry.matches_hash(hash)
-                            && unsafe {
-                                self.layout.compare_serialized_groups(
-                                    self.row_ptr(entry.row_idx()),
-                                    &self.varlen_heap,
-                                    source_row,
-                                    &other.varlen_heap,
-                                )?
-                            }
-                    };
-                    if keys_match {
-                        if let Some(addresses) = target_address_data {
-                            unsafe {
-                                *addresses.add(batch_idx) = self.state_ptr(entry.row_idx());
-                            }
-                        }
-                        break;
+                        new_addresses.try_set_count(new_state_count)?;
+                        initialize_states(
+                            &self.state_layout,
+                            &self.aggregate_objects,
+                            new_addresses,
+                            new_state_count,
+                        )?;
                     }
-                    slot = (slot + 1) & self.bitmask;
-                }
-            }
-
-            if has_aggregates {
-                if !new_state_ptrs.is_empty() {
-                    let new_addresses =
-                        pointer_vector_from_slice(&new_state_ptrs, self.allocator())?;
-                    initialize_states(
-                        &self.state_layout,
+                    let mut input_data = AggregateInputData::new(
+                        None,
+                        &mut self.aggregate_allocator,
+                        AggregateCombineType::AllowDestructive,
+                    );
+                    combine_states(
                         &self.aggregate_objects,
-                        &new_addresses,
-                        new_state_ptrs.len(),
+                        &mut input_data,
+                        source_addresses.as_ref().ok_or_else(|| {
+                            paro_error::internal("aggregate merge source addresses are missing")
+                        })?,
+                        target_addresses.as_ref().ok_or_else(|| {
+                            paro_error::internal("aggregate merge target addresses are missing")
+                        })?,
+                        batch_size,
                     )?;
                 }
-                let mut input_data = AggregateInputData::new(
-                    None,
-                    &mut self.aggregate_allocator,
-                    AggregateCombineType::AllowDestructive,
-                );
-                combine_states(
-                    &self.aggregate_objects,
-                    &mut input_data,
-                    source_addresses.as_ref().ok_or_else(|| {
-                        paro_error::internal("aggregate merge source addresses are missing")
-                    })?,
-                    target_addresses.as_ref().ok_or_else(|| {
-                        paro_error::internal("aggregate merge target addresses are missing")
-                    })?,
-                    batch_size,
-                )?;
+                self.finish_prefix_probe_batch(max_prefix_probe_distance)?;
+                row_offset += batch_size;
             }
-            row_offset += batch_size;
+        }
+        // A completed source owns both its tuples and the observations made
+        // while constructing them. Transfer the latter with the former so a
+        // worker-local fallback is still visible when only the final target
+        // is drained into EXPLAIN ANALYZE.
+        for other in others.iter_mut() {
+            self.hash_runtime_stats
+                .merge(other.take_hash_runtime_stats());
         }
         Ok(())
     }

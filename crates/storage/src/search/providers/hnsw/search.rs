@@ -255,7 +255,9 @@ impl VectorSearchCursor {
         // boundary. Both singleton and generation-owned partition artifacts
         // borrow the same proof objects, so changing the physical partition
         // envelope cannot change predicate semantics.
-        let requires_segment_filters = predicate.is_some()
+        let has_overlay_deletes = self.snapshot.has_overlay_delete_vectors();
+        let requires_segment_filters = has_overlay_deletes
+            || predicate.is_some()
             || visible_segments
                 .iter()
                 .any(|segment| segment.has_persistent_deletes);
@@ -264,9 +266,20 @@ impl VectorSearchCursor {
                 visible_segments,
                 parallelism_slots,
                 |(_, segment)| -> Result<PreparedSegmentFilter> {
-                    let row_set = segment
-                        .segment
-                        .build_hnsw_filter_with_epoch(snapshot_version, predicate)?;
+                    // Visibility is an admission predicate, not a post-TopK
+                    // filter. Otherwise a deleted nearest neighbor consumes
+                    // a slot and the next visible vector is lost.
+                    let row_set: Option<Arc<dyn ExactRowSet>> = if has_overlay_deletes {
+                        let rows: roaring::RoaringBitmap =
+                            visible_row_ids(&self.snapshot, segment, predicate)?
+                                .into_iter()
+                                .collect();
+                        Some(Arc::new(rows))
+                    } else {
+                        segment
+                            .segment
+                            .build_hnsw_filter_with_epoch(snapshot_version, predicate)?
+                    };
                     if predicate.is_some() && row_set.is_none() {
                         return Err(paro_error::internal(
                             "filtered vector search did not prepare an exact segment row set",

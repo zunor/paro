@@ -109,26 +109,20 @@ COPY (
 -- @query file
 FILE '/tmp/paro_copy_t4_4_alias.json';
 
-SET threads = 4;
+-- PER_THREAD_OUTPUT follows the workers actually admitted for this query;
+-- the session ceiling does not promise an output shard count. Pin one worker
+-- here so the SQL-level path contract is deterministic.
+SET threads = 1;
 
 COPY (
   SELECT i AS id, 'name_' || i::VARCHAR AS name
   FROM generate_series(1, 20000) AS t(i)
-) TO '/tmp/paro_copy_t4_3_parallel.csv'
+) TO '/tmp/paro_copy_t1_3_parallel.csv'
   WITH (FORMAT csv, PER_THREAD_OUTPUT true);
 
 -- @statement ok
 -- @normalize copy_rowcount
-COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_0.csv' WITH (FORMAT csv);
--- @statement ok
--- @normalize copy_rowcount
-COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_1.csv' WITH (FORMAT csv);
--- @statement ok
--- @normalize copy_rowcount
-COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_2.csv' WITH (FORMAT csv);
--- @statement ok
--- @normalize copy_rowcount
-COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t4_3_parallel_3.csv' WITH (FORMAT csv);
+COPY dml_copy_to_per_thread_verify FROM '/tmp/paro_copy_t1_3_parallel_0.csv' WITH (FORMAT csv);
 
 -- @query
 SELECT COUNT(*) AS copied_rows,

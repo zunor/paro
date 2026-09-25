@@ -14,7 +14,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
 use paro_context::test_support::TestStatementContextBuilder;
 use paro_planner::expression::{Expression, ReferenceExpression};
-use paro_planner::operator::join::JoinComparisonType;
+use paro_planner::logical::operator::join::JoinComparisonType;
 use paro_storage::buffer::{BufferPool, MemoryTag};
 use paro_storage::index::{Predicate, PredicateTree};
 use paro_storage::row::RowValidityType;
@@ -57,12 +57,13 @@ fn duplicate_consumer_completion_cannot_release_join_build_early() {
             Arc::new(BufferPool::new(16 * 1024 * 1024)),
             test_allocator(),
             vec![JoinCondition::new(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
                 JoinComparisonType::Equal,
             )],
             vec![LogicalType::Integer],
             JoinType::Inner,
+            false,
             MemoryAccountingContext::detached(
                 paro_common::allocator::MemoryTag::HashTable,
                 MemoryAccountingClass::Revocable,
@@ -202,12 +203,13 @@ fn join_build_finalize_publishes_exact_runtime_filter() {
             Arc::new(BufferPool::new(16 * 1024 * 1024)),
             allocator.clone(),
             vec![JoinCondition::new(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
                 JoinComparisonType::Equal,
             )],
             vec![LogicalType::Integer],
             JoinType::Inner,
+            true,
             MemoryAccountingContext::detached(
                 paro_common::allocator::MemoryTag::HashTable,
                 MemoryAccountingClass::Revocable,
@@ -247,6 +249,34 @@ fn join_build_finalize_publishes_exact_runtime_filter() {
             values: paro_storage::index::FixedMembership::i32(vec![10, 20, 30]),
         })
     );
+}
+
+#[test]
+fn join_build_without_contract_never_publishes_runtime_filter() {
+    let handle = JoinBuildHandle::new(metadata());
+    handle
+        .initialize_table(
+            Arc::new(BufferPool::new(16 * 1024 * 1024)),
+            test_allocator(),
+            vec![JoinCondition::new(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                JoinComparisonType::Equal,
+            )],
+            vec![LogicalType::Integer],
+            JoinType::Inner,
+            false,
+            MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::HashTable,
+                MemoryAccountingClass::Revocable,
+            ),
+        )
+        .expect("initialize hash table");
+
+    handle.finalize_in_memory().expect("finalize build");
+
+    assert!(!handle.runtime_filter_ready());
+    assert!(handle.runtime_filter_predicate(0, 7).is_none());
 }
 
 #[test]
@@ -293,12 +323,13 @@ fn hash_join_build_spill_reclaimer_externalizes_after_finish_enable() {
             Arc::new(BufferPool::new(16 * 1024 * 1024)),
             allocator.clone(),
             vec![JoinCondition::new(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
                 JoinComparisonType::Equal,
             )],
             vec![LogicalType::Integer],
             JoinType::Inner,
+            false,
             memory.clone(),
         )
         .expect("initialize hash table");
@@ -331,7 +362,7 @@ fn hash_join_build_spill_reclaimer_externalizes_after_finish_enable() {
     assert_eq!(stats.spilled_bytes, before);
     assert!(handle.is_external());
     assert!(handle.completion.is_complete());
-    assert!(handle.runtime_filter_ready());
+    assert!(!handle.runtime_filter_ready());
     assert_eq!(table.build_rows_size_in_bytes(), 0);
     assert_eq!(handle.spill.partition_counts().0, 2);
     assert_eq!(reclaimer.reclaimable_bytes(), 0);
@@ -350,12 +381,13 @@ fn hash_join_local_build_spill_reclaimer_buffers_unmerged_build_rows() {
             Arc::new(BufferPool::new(16 * 1024 * 1024)),
             allocator.clone(),
             vec![JoinCondition::new(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
                 JoinComparisonType::Equal,
             )],
             vec![LogicalType::Integer],
             JoinType::Inner,
+            false,
             memory.clone(),
         )
         .expect("initialize hash table");
@@ -363,8 +395,8 @@ fn hash_join_local_build_spill_reclaimer_buffers_unmerged_build_rows() {
         Arc::new(BufferPool::new(16 * 1024 * 1024)),
         allocator.clone(),
         vec![JoinCondition::new(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             JoinComparisonType::Equal,
         )],
         vec![LogicalType::Integer],

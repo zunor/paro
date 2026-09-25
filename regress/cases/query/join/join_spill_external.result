@@ -165,7 +165,7 @@ SELECT
 FROM generate_series(1, 3000) AS t(g);
 INSERT 0 3000
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT count(r.v)
 FROM join_spill_skew_l l
@@ -173,8 +173,8 @@ LEFT JOIN join_spill_skew_r r
   ON l.k = r.k;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=3000 loops=<loops>)
-  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=3000 loops=<loops> runtime_filter_installed_count=1)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=3000 loops=<loops>) logical_node_id=1
+  SINK #1 HASH_JOIN_BUILD (actual time=<time-range> rows=3000 loops=<loops>)
 PIPELINE 1
   SOURCE #2 ROWSET_SCAN (actual time=<time-range> rows=3000 loops=<loops>)
   TRANSFORM #3 HASH_JOIN_PROBE (actual time=<time-range> rows=0 loops=<loops>)
@@ -183,10 +183,13 @@ PIPELINE 2
   SOURCE #5 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=3001000 loops=<loops>)
   SINK #6 UNGROUPED_AGGREGATE (actual time=<time-range> rows=3001000 loops=<loops>)
 PIPELINE 3
-  SOURCE #7 UNGROUPED_AGGREGATE_EMIT (actual time=<time-range> rows=1 loops=<loops>)
-  TRANSFORM #8 PROJECTION (actual time=<time-range> rows=1 loops=<loops>)
-  SINK #9 CLIENT_RESULT (actual time=<time-range> rows=1 loops=<loops>)
-PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=1 runtime_filter_no_wait=0
+  SOURCE #7 HASH_JOIN_UNMATCHED (actual time=<time-range> rows=0 loops=<loops>)
+  SINK #8 UNGROUPED_AGGREGATE (actual time=<time-range> rows=0 loops=<loops>)
+PIPELINE 4
+  SOURCE #9 UNGROUPED_AGGREGATE_EMIT (actual time=<time-range> rows=1 loops=<loops>)
+  TRANSFORM #10 PROJECTION (actual time=<time-range> rows=1 loops=<loops>)
+  SINK #11 CLIENT_RESULT (actual time=<time-range> rows=1 loops=<loops>)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 1

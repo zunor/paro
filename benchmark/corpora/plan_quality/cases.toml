@@ -1,0 +1,133 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+# Each SELECT is an explicit semantic boundary with an independent fixture
+# cardinality. Boundaries remain identifiable when physical trees change.
+[[cases]]
+query = "cte_disjoint_union_key"
+expected_rows = 4
+sql = """
+WITH t AS MATERIALIZED (
+ SELECT order_key, sum(quantity) AS total, 's' AS tag FROM quality_detail GROUP BY order_key
+ UNION ALL
+ SELECT order_key, sum(quantity) AS total, 'c' AS tag FROM quality_detail GROUP BY order_key
+)
+SELECT a.order_key, b.total FROM t a JOIN t b ON a.order_key=b.order_key
+WHERE a.tag='s' AND b.tag='c'
+"""
+
+[[cases]]
+query = "cte_overlapping_union_duplicates"
+expected_rows = 16
+sql = """
+WITH t AS MATERIALIZED (
+ SELECT order_key, sum(quantity) AS total, 's' AS tag FROM quality_detail GROUP BY order_key
+ UNION ALL
+ SELECT order_key, sum(quantity) AS total, 's' AS tag FROM quality_detail GROUP BY order_key
+)
+SELECT a.order_key, b.total FROM t a JOIN t b ON a.order_key=b.order_key
+WHERE a.tag='s' AND b.tag='s'
+"""
+
+[[cases]]
+query = "vector_category"
+expected_rows = 2
+sql = "SELECT id FROM quality_vector WHERE category = 'x'"
+
+[[cases]]
+query = "vector_filtered_topn"
+expected_rows = 2
+sql = "SELECT id FROM quality_vector WHERE category = 'x' ORDER BY emb <+> '[1,0,0]' LIMIT 2"
+
+[[cases]]
+query = "vector_filtered_topn_scan"
+expected_rows = 2
+sql = "SELECT id FROM quality_vector WHERE category = 'x' ORDER BY emb <+> '[1,0,0]' LIMIT 2"
+oracle_sql = "SELECT id FROM quality_vector WHERE category = 'x'"
+selector = { operator = "ROWSET_SCAN", relation = "public.quality_vector", properties = { "Pushed Predicate" = "category = 'x'" } }
+
+[[cases]]
+query = "aggregate_group_domain"
+expected_rows = 5
+sql = "SELECT order_key, sum(quantity) FROM quality_detail GROUP BY order_key"
+
+[[cases]]
+query = "aggregate_having_domain"
+expected_rows = 3
+sql = "SELECT order_key, sum(quantity) FROM quality_detail GROUP BY order_key HAVING sum(quantity) > 100.00"
+
+[[cases]]
+query = "aggregate_join_subsumption"
+expected_rows = 2
+sql = """
+SELECT p.order_key, p.label, sum(d.quantity) AS total_quantity
+FROM quality_preserved p JOIN quality_detail d ON d.order_key = p.order_key
+WHERE p.order_key IN (
+  SELECT order_key FROM quality_detail GROUP BY order_key HAVING sum(quantity) > 100.00
+)
+GROUP BY p.order_key, p.label ORDER BY p.order_key
+"""
+
+[[cases]]
+query = "subsumed_inner_having"
+expected_rows = 3
+expected_result_rows = 2
+# The oracle counts rows after HAVING. Accept either a fused aggregate emit
+# predicate or a standalone Filter directly over the same aggregate, never
+# the pre-HAVING aggregate merely because its grouping key matches.
+selector = { alternatives = [ { operator = "AGGREGATE", properties = { "Group Key" = "public.quality_detail.order_key", "Having" = "sum(public.quality_detail.quantity) > 100.00" } }, { operator = "FILTER", properties = { "Filter" = "sum(public.quality_detail.quantity) > 100.00" }, child = { operator = "AGGREGATE", properties = { "Group Key" = "public.quality_detail.order_key" } } } ] }
+oracle_sql = "SELECT order_key, sum(quantity) FROM quality_detail GROUP BY order_key HAVING sum(quantity) > 100.00"
+sql = """
+SELECT p.order_key, p.label, sum(d.quantity) AS total_quantity
+FROM quality_preserved p JOIN quality_detail d ON d.order_key = p.order_key
+WHERE p.order_key IN (
+  SELECT order_key FROM quality_detail GROUP BY order_key HAVING sum(quantity) > 100.00
+)
+GROUP BY p.order_key, p.label ORDER BY p.order_key
+"""
+
+[[cases]]
+query = "subsumed_join_output"
+expected_rows = 3
+expected_result_rows = 2
+selector = { operator = "HASH_JOIN", properties = { "Join Type" = "INNER" } }
+oracle_sql = """
+SELECT p.order_key, p.label, d.total
+FROM quality_preserved p JOIN (
+  SELECT order_key, sum(quantity) AS total FROM quality_detail
+  GROUP BY order_key HAVING sum(quantity) > 100.00
+) d ON d.order_key = p.order_key
+"""
+sql = """
+SELECT p.order_key, p.label, sum(d.quantity) AS total_quantity
+FROM quality_preserved p JOIN quality_detail d ON d.order_key = p.order_key
+WHERE p.order_key IN (
+  SELECT order_key FROM quality_detail GROUP BY order_key HAVING sum(quantity) > 100.00
+)
+GROUP BY p.order_key, p.label ORDER BY p.order_key
+"""
+
+[[cases]]
+query = "singleton_nullable_unique"
+expected_rows = 3
+nonincreasing_metrics = ["aggregate_nodes"]
+sql = """
+SELECT c_count, count(*) AS customer_distribution
+FROM (
+  SELECT c.customer_key, count(o.order_key) AS c_count
+  FROM quality_customer c LEFT JOIN quality_orders o
+    ON c.customer_key = o.customer_key
+   AND o.comment NOT LIKE '%special%requests%'
+  GROUP BY c.customer_key
+) counts GROUP BY c_count ORDER BY c_count
+"""
+
+[[cases]]
+query = "duplicate_null_grouping"
+expected_rows = 2
+sql = """
+SELECT c.customer_key, count(o.order_key)
+FROM quality_null_customer c LEFT JOIN quality_orders o
+  ON c.customer_key = o.customer_key
+GROUP BY c.customer_key
+"""

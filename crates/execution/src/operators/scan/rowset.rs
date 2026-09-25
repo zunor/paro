@@ -9,11 +9,11 @@ use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
+use paro_common::task_supply::MIN_USEFUL_PIPELINE_WORK_BYTES;
 use paro_common::types::LogicalType;
-use paro_common::vector::VECTOR_SIZE;
 use paro_function::scalar::FunctionExecContext;
 
-use paro_planner::operator::JoinComparisonType;
+use paro_planner::logical::operator::JoinComparisonType;
 use paro_storage::index::{collect_predicate_columns, Predicate, PredicateTree};
 use paro_storage::rowset::{RowsetSharedPtr, SegmentOptions, SegmentSharedPtr};
 use paro_storage::table::segment_reorderer::{reorder_segments, SegmentOrderOptions};
@@ -32,13 +32,12 @@ use crate::runtime::state::{
     SourceLocal,
 };
 
-/// Bounds for scheduler-aware scan morsels.
-///
-/// Large scans retain coarse morsels so reader construction stays amortized.
-/// Smaller scans are split just far enough to occupy the query's worker set;
-/// this matters for single-segment dimension tables feeding blocking joins.
-const MIN_ROWSET_MORSEL_ROWS: u64 = VECTOR_SIZE as u64;
-const MAX_ROWSET_MORSEL_ROWS: u64 = 256 * 1024;
+/// Admission-time packetization targets. Rows are derived from projected
+/// decode width and predicate work, so a wide scan is not forced through the
+/// same fixed row packet as a narrow key scan.
+const MIN_SCAN_PACKET_WORK_BYTES: u64 = 512 * 1024;
+const TARGET_SCAN_PACKET_WORK_BYTES: u64 = MIN_USEFUL_PIPELINE_WORK_BYTES;
+const SCAN_PACKETS_PER_TASK: u64 = 2;
 
 #[derive(Debug, Clone)]
 pub struct RowsetSourceExec {
@@ -62,7 +61,8 @@ pub struct RowsetSourceDesc {
 #[derive(Debug, Clone)]
 pub struct RowsetDynamicRuntimeFilterDesc {
     pub handle: HandleRef<JoinBuildHandle>,
-    pub build_key_index: usize,
+    pub artifact: crate::physical::Fingerprint,
+    pub runtime_filter_key_index: usize,
     pub probe_column_id: u32,
 }
 
@@ -99,7 +99,8 @@ impl RowsetSourceDesc {
             .iter()
             .map(|filter| RowsetDynamicRuntimeFilterDesc {
                 handle: HandleRef::new(filter.handle),
-                build_key_index: filter.build_key_index,
+                artifact: filter.artifact,
+                runtime_filter_key_index: filter.runtime_filter_key_index,
                 probe_column_id: filter.probe_column_id,
             })
             .collect::<Vec<_>>()
@@ -174,7 +175,12 @@ impl RowsetSourceExec {
             &self.desc.column_projection,
             &self.desc.table.columns,
         );
-        let morsels = build_scan_morsels(&segments, ctx.query.session.number_of_threads().max(1));
+        let scan_row_work_bytes = scan_row_work_bytes(&self.desc, prepared_predicate.as_ref());
+        let morsels = build_scan_morsels(
+            &segments,
+            ctx.query.max_parallel_tasks(),
+            scan_row_work_bytes,
+        );
 
         Ok(SourceGlobal::Rowset(Arc::new(RowsetSourceGlobal {
             table_index: self.desc.table_index,
@@ -182,6 +188,7 @@ impl RowsetSourceExec {
             storage_snapshot,
             segments: segments.into_boxed_slice(),
             morsels,
+            row_work_bytes: scan_row_work_bytes,
             next_morsel: Default::default(),
             column_projection,
             overlay_delete_vectors,
@@ -273,8 +280,8 @@ impl RowsetSourceExec {
                     self.desc.table.name()
                 )));
             }
-            if let Some(predicate) =
-                handle.runtime_filter_predicate(filter.build_key_index, filter.probe_column_id)
+            if let Some(predicate) = handle
+                .runtime_filter_predicate(filter.runtime_filter_key_index, filter.probe_column_id)
             {
                 predicates.push(predicate);
                 has_runtime_conjunct = true;
@@ -324,11 +331,281 @@ impl RowsetSourceExec {
                 }
             }
         }
+        order_conjuncts_by_selectivity(&mut predicates, &self.desc.table);
         Ok(EffectivePredicate {
             tree: combine_predicates(predicates),
             has_runtime_conjunct,
         })
     }
+}
+
+/// Order independent top-level conjuncts using facts available only after
+/// runtime-filter publication.  Frozen exact domains provide a substantially
+/// better signal than physical column order for staged rowset evaluation.
+/// Unknown predicates retain their original relative order.
+fn order_conjuncts_by_selectivity(
+    predicates: &mut [PredicateTree],
+    table: &paro_catalog::entry::TableCatalogEntry,
+) {
+    let Some(storage) = table.get_storage() else {
+        return;
+    };
+    // Cache hints so sorting several dynamic filters does not repeatedly
+    // aggregate table statistics. Cost class and evidence are distinct:
+    // unknown selectivity must not masquerade as a proven 100% predicate.
+    predicates.sort_by_cached_key(|predicate| {
+        let hint = predicate_ordering_hint(predicate, storage);
+        (
+            hint.cost_class,
+            hint.selectivity.is_none(),
+            hint.selectivity.unwrap_or(1.0).clamp(0.0, 1.0).to_bits(),
+            hint.fallback_rank,
+        )
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PredicateCostClass {
+    Fixed,
+    General,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PredicateOrderingHint {
+    selectivity: Option<f64>,
+    cost_class: PredicateCostClass,
+    /// A non-selectivity tie breaker for predicates with no domain bound.
+    /// Exact membership lists retain useful relative ordering without being
+    /// mislabeled as a fraction in the absence of an NDV denominator.
+    fallback_rank: u64,
+}
+
+fn predicate_ordering_hint(
+    tree: &PredicateTree,
+    storage: &paro_storage::table::table_handle::TableHandle,
+) -> PredicateOrderingHint {
+    match tree {
+        PredicateTree::Leaf(predicate) => {
+            let Some(column_id) = predicate.index_column_id() else {
+                return PredicateOrderingHint {
+                    selectivity: None,
+                    cost_class: PredicateCostClass::General,
+                    fallback_rank: u64::MAX,
+                };
+            };
+            let distinct = storage
+                .column_statistics(column_id as usize)
+                .map(|statistics| statistics.distinct_evidence().point)
+                .filter(|distinct| *distinct > 0)
+                .map(|distinct| distinct as f64);
+            let (selectivity, fallback_rank) = match predicate {
+                Predicate::Eq { .. } => (distinct.map(|count| 1.0 / count), 1),
+                Predicate::In { values, .. } => (
+                    distinct.map(|count| (values.len() as f64 / count).clamp(0.0, 1.0)),
+                    values.len() as u64,
+                ),
+                Predicate::FixedIn { values, .. } => (
+                    distinct.map(|count| (values.len() as f64 / count).clamp(0.0, 1.0)),
+                    values.len() as u64,
+                ),
+                predicate @ (Predicate::Range { .. }
+                | Predicate::Ge { .. }
+                | Predicate::Le { .. }
+                | Predicate::Gt { .. }
+                | Predicate::Lt { .. }) => {
+                    let (lower, upper, lower_inclusive, upper_inclusive) = match predicate {
+                        Predicate::Range { lower, upper, .. } => {
+                            (Some(lower), Some(upper), true, true)
+                        }
+                        Predicate::Ge { value, .. } => (Some(value), None, true, true),
+                        Predicate::Gt { value, .. } => (Some(value), None, false, true),
+                        Predicate::Le { value, .. } => (None, Some(value), true, true),
+                        Predicate::Lt { value, .. } => (None, Some(value), true, false),
+                        _ => unreachable!("ordered predicate shape was matched"),
+                    };
+                    (
+                        storage
+                            .column_statistics(column_id as usize)
+                            .and_then(|statistics| {
+                                ordered_range_selectivity_bounds(
+                                    &statistics.statistics().min_value()?,
+                                    &statistics.statistics().max_value()?,
+                                    lower,
+                                    upper,
+                                    lower_inclusive,
+                                    upper_inclusive,
+                                )
+                            }),
+                        u64::MAX,
+                    )
+                }
+                _ => {
+                    return PredicateOrderingHint {
+                        selectivity: None,
+                        cost_class: PredicateCostClass::General,
+                        fallback_rank: u64::MAX,
+                    };
+                }
+            };
+            PredicateOrderingHint {
+                selectivity,
+                cost_class: PredicateCostClass::Fixed,
+                fallback_rank,
+            }
+        }
+        PredicateTree::And(children) => {
+            let mut product = 1.0;
+            let mut known = true;
+            let mut zero = false;
+            let mut cost_class = PredicateCostClass::Fixed;
+            for child in children {
+                let hint = predicate_ordering_hint(child, storage);
+                cost_class = cost_class.max(hint.cost_class);
+                match hint.selectivity {
+                    Some(selectivity) => {
+                        zero |= selectivity == 0.0;
+                        product *= selectivity;
+                    }
+                    None => known = false,
+                }
+            }
+            PredicateOrderingHint {
+                selectivity: if zero {
+                    Some(0.0)
+                } else if known {
+                    Some(product.clamp(0.0, 1.0))
+                } else {
+                    None
+                },
+                cost_class,
+                fallback_rank: u64::MAX,
+            }
+        }
+        PredicateTree::Or(children) => {
+            let mut sum = 0.0;
+            let mut known = true;
+            let mut cost_class = PredicateCostClass::Fixed;
+            for child in children {
+                let hint = predicate_ordering_hint(child, storage);
+                cost_class = cost_class.max(hint.cost_class);
+                match hint.selectivity {
+                    Some(selectivity) => sum += selectivity,
+                    None => known = false,
+                }
+            }
+            PredicateOrderingHint {
+                selectivity: known.then(|| sum.clamp(0.0, 1.0)),
+                cost_class,
+                fallback_rank: u64::MAX,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderedRangeDomain {
+    SignedInteger(u8),
+    UnsignedInteger(u8),
+    Decimal(u8),
+    Date,
+    Timestamp,
+    TimestampTz,
+    Time,
+    Floating,
+}
+
+impl OrderedRangeDomain {
+    const fn is_discrete(self) -> bool {
+        !matches!(self, Self::Floating)
+    }
+}
+
+fn ordered_range_coordinate(value: &Value) -> Option<(OrderedRangeDomain, f64)> {
+    let coordinate = match value {
+        Value::TinyInt(value) => (OrderedRangeDomain::SignedInteger(8), *value as f64),
+        Value::SmallInt(value) => (OrderedRangeDomain::SignedInteger(16), *value as f64),
+        Value::Integer(value) => (OrderedRangeDomain::SignedInteger(32), *value as f64),
+        Value::BigInt(value) => (OrderedRangeDomain::SignedInteger(64), *value as f64),
+        Value::HugeInt(value) => (OrderedRangeDomain::SignedInteger(128), *value as f64),
+        Value::UTinyInt(value) => (OrderedRangeDomain::UnsignedInteger(8), *value as f64),
+        Value::USmallInt(value) => (OrderedRangeDomain::UnsignedInteger(16), *value as f64),
+        Value::UInteger(value) => (OrderedRangeDomain::UnsignedInteger(32), *value as f64),
+        Value::UBigInt(value) => (OrderedRangeDomain::UnsignedInteger(64), *value as f64),
+        Value::UHugeInt(value) => (OrderedRangeDomain::UnsignedInteger(128), *value as f64),
+        Value::Decimal(value, _, scale) => (OrderedRangeDomain::Decimal(*scale), *value as f64),
+        Value::Date(value) => (OrderedRangeDomain::Date, *value as f64),
+        Value::Timestamp(value) => (OrderedRangeDomain::Timestamp, *value as f64),
+        Value::TimestampTz(value) => (OrderedRangeDomain::TimestampTz, *value as f64),
+        Value::Time(value) => (OrderedRangeDomain::Time, *value as f64),
+        Value::Float(value) => (OrderedRangeDomain::Floating, *value as f64),
+        Value::Double(value) => (OrderedRangeDomain::Floating, *value),
+        _ => return None,
+    };
+    coordinate.1.is_finite().then_some(coordinate)
+}
+
+/// Estimate the fraction of a complete ordered domain covered by an exact,
+/// inclusive runtime range. This is used only to order equivalent conjuncts;
+/// a missing or incomparable domain falls back without changing semantics.
+#[cfg(test)]
+fn ordered_range_selectivity(
+    minimum: &Value,
+    maximum: &Value,
+    lower: &Value,
+    upper: &Value,
+) -> Option<f64> {
+    ordered_range_selectivity_bounds(minimum, maximum, Some(lower), Some(upper), true, true)
+}
+
+fn ordered_range_selectivity_bounds(
+    minimum: &Value,
+    maximum: &Value,
+    lower: Option<&Value>,
+    upper: Option<&Value>,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+) -> Option<f64> {
+    let (minimum_domain, minimum) = ordered_range_coordinate(minimum)?;
+    let (maximum_domain, maximum) = ordered_range_coordinate(maximum)?;
+    let (lower_domain, mut lower) = match lower {
+        Some(lower) => ordered_range_coordinate(lower)?,
+        None => (minimum_domain, minimum),
+    };
+    let (upper_domain, mut upper) = match upper {
+        Some(upper) => ordered_range_coordinate(upper)?,
+        None => (maximum_domain, maximum),
+    };
+    if minimum_domain != maximum_domain
+        || minimum_domain != lower_domain
+        || minimum_domain != upper_domain
+        || minimum > maximum
+        || lower > upper
+    {
+        return None;
+    }
+    if minimum_domain.is_discrete() {
+        if !lower_inclusive {
+            lower += 1.0;
+        }
+        if !upper_inclusive {
+            upper -= 1.0;
+        }
+    }
+    let lower = lower.max(minimum);
+    let upper = upper.min(maximum);
+    if lower > upper {
+        return Some(0.0);
+    }
+    let unit = if minimum_domain.is_discrete() {
+        1.0
+    } else {
+        0.0
+    };
+    let domain = maximum - minimum + unit;
+    if domain == 0.0 {
+        return Some(1.0);
+    }
+    Some(((upper - lower + unit) / domain).clamp(0.0, 1.0))
 }
 
 struct EffectivePredicate {
@@ -631,11 +908,12 @@ fn rescale_decimal_boundary(
 fn build_scan_morsels(
     segments: &[(RowsetSharedPtr, SegmentSharedPtr)],
     parallelism: usize,
+    row_work_bytes: u64,
 ) -> Box<[RowsetScanMorsel]> {
     let total_rows = segments.iter().fold(0u64, |total, (_, segment)| {
         total.saturating_add(segment.num_rows())
     });
-    let morsel_rows = rowset_morsel_rows(total_rows, parallelism);
+    let morsel_rows = rowset_morsel_rows(total_rows, parallelism, row_work_bytes);
     segments
         .iter()
         .enumerate()
@@ -653,26 +931,97 @@ fn build_scan_morsels(
         .into_boxed_slice()
 }
 
-fn rowset_morsel_rows(total_rows: u64, parallelism: usize) -> u64 {
+fn rowset_morsel_rows(total_rows: u64, parallelism: usize, row_work_bytes: u64) -> u64 {
     if parallelism <= 1 {
         // Morsels are scheduling units, not storage batches. With only one
         // worker there is nobody to steal trailing work, so splitting a
         // segment merely rebuilds its reader and reopens its columns. Keep one
         // morsel per segment while respecting step_by's platform-sized input.
         let max_step = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
-        return total_rows.max(MIN_ROWSET_MORSEL_ROWS).min(max_step);
+        return total_rows.max(1).min(max_step);
     }
 
     let parallelism = u64::try_from(parallelism).unwrap_or(u64::MAX).max(1);
+    let row_work_bytes = row_work_bytes.max(1);
+    let minimum_rows = MIN_SCAN_PACKET_WORK_BYTES.div_ceil(row_work_bytes).max(1);
+    let target_rows = TARGET_SCAN_PACKET_WORK_BYTES
+        .div_ceil(row_work_bytes)
+        .max(minimum_rows);
+    let desired_packets = parallelism.saturating_mul(SCAN_PACKETS_PER_TASK).max(1);
     total_rows
-        .div_ceil(parallelism)
-        .clamp(MIN_ROWSET_MORSEL_ROWS, MAX_ROWSET_MORSEL_ROWS)
+        .div_ceil(desired_packets)
+        .max(1)
+        .clamp(minimum_rows, target_rows)
+        .min(u64::try_from(usize::MAX).unwrap_or(u64::MAX))
+}
+
+fn scan_row_work_bytes(
+    desc: &RowsetSourceDesc,
+    predicate: Option<&PreparedRowsetPredicate>,
+) -> u64 {
+    let projected = desc.returned_types.iter().fold(0_u64, |width, logical| {
+        width.saturating_add(scan_type_work_bytes(logical))
+    });
+    let predicate_work = predicate.map_or(0, |predicate| {
+        let decoded_columns = predicate.columns.iter().fold(0_u64, |width, column_id| {
+            let column_width = desc
+                .table
+                .columns
+                .get(*column_id as usize)
+                .map(|column| scan_type_work_bytes(&column.logical_type))
+                .unwrap_or(8);
+            width.saturating_add(column_width)
+        });
+        decoded_columns.saturating_add(predicate_leaf_count(&predicate.tree).saturating_mul(8))
+    });
+    // Validity checks, selection-vector writes, and row visibility are paid
+    // even by zero-column COUNT(*) scans.
+    projected.saturating_add(predicate_work).saturating_add(8)
+}
+
+fn scan_type_work_bytes(logical: &LogicalType) -> u64 {
+    match logical {
+        LogicalType::Varchar
+        | LogicalType::VarcharCollation(_)
+        | LogicalType::TsVector
+        | LogicalType::TsQuery
+        | LogicalType::Blob
+        | LogicalType::Json
+        | LogicalType::Jsonb
+        | LogicalType::StringLiteral => 32,
+        LogicalType::List(_) => 32,
+        LogicalType::Array(element, length) => scan_type_work_bytes(element)
+            .saturating_mul(u64::try_from(*length).unwrap_or(u64::MAX))
+            .max(8),
+        LogicalType::Struct(fields) => fields
+            .iter()
+            .fold(0_u64, |width, (_, field)| {
+                width.saturating_add(scan_type_work_bytes(field))
+            })
+            .max(8),
+        _ => u64::try_from(logical.type_size())
+            .unwrap_or(u64::MAX)
+            .max(1),
+    }
+}
+
+fn predicate_leaf_count(tree: &PredicateTree) -> u64 {
+    match tree {
+        PredicateTree::Leaf(_) => 1,
+        PredicateTree::And(children) | PredicateTree::Or(children) => {
+            children.iter().fold(0_u64, |count, child| {
+                count.saturating_add(predicate_leaf_count(child))
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_catalog::entry::ColumnDefinition;
+    use paro_catalog::entry::{CatalogObjectId, ColumnDefinition, TableCatalogEntry};
+    use paro_storage::index::FixedMembership;
+    use paro_storage::table::table_factory::TableFactory;
 
     fn scalar_filter(comparison: JoinComparisonType) -> RowsetDynamicScalarFilterDesc {
         RowsetDynamicScalarFilterDesc {
@@ -767,23 +1116,113 @@ mod tests {
     }
 
     #[test]
-    fn morsels_expose_workers_without_fragmenting_large_scans() {
-        assert_eq!(rowset_morsel_rows(25, 4), MIN_ROWSET_MORSEL_ROWS);
-        assert_eq!(rowset_morsel_rows(10_000, 4), MIN_ROWSET_MORSEL_ROWS);
-        assert_eq!(rowset_morsel_rows(200_000, 4), 50_000);
-        assert_eq!(rowset_morsel_rows(800_000, 4), 200_000);
-        assert_eq!(rowset_morsel_rows(6_000_000, 4), MAX_ROWSET_MORSEL_ROWS);
+    fn exact_runtime_domains_order_staged_conjuncts_by_selectivity() {
+        let table = TableCatalogEntry::new(
+            "test".to_string(),
+            "main".to_string(),
+            "predicate_order".to_string(),
+            vec![
+                ColumnDefinition::new("a".to_string(), LogicalType::Integer),
+                ColumnDefinition::new("b".to_string(), LogicalType::Integer),
+            ],
+            Arc::new(
+                TableFactory::default()
+                    .create_table(&[LogicalType::Integer, LogicalType::Integer])
+                    .unwrap(),
+            ),
+            CatalogObjectId::from_raw(42_001),
+            0,
+        );
+        let mut predicates = vec![
+            PredicateTree::leaf(Predicate::FixedIn {
+                column_id: 1,
+                values: FixedMembership::i32((0..10).collect()),
+            }),
+            PredicateTree::leaf(Predicate::FixedIn {
+                column_id: 0,
+                values: FixedMembership::i32(vec![1, 2]),
+            }),
+        ];
+
+        order_conjuncts_by_selectivity(&mut predicates, &table);
+
+        assert!(matches!(
+            &predicates[0],
+            PredicateTree::Leaf(Predicate::FixedIn { column_id: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn exact_runtime_range_selectivity_uses_the_observed_ordered_domain() {
+        let selectivity = ordered_range_selectivity(
+            &Value::BigInt(1),
+            &Value::BigInt(1_000),
+            &Value::BigInt(101),
+            &Value::BigInt(110),
+        )
+        .expect("comparable integral range");
+        assert!((selectivity - 0.01).abs() < f64::EPSILON);
+
+        let selectivity = ordered_range_selectivity(
+            &Value::Date(0),
+            &Value::Date(99),
+            &Value::Date(10),
+            &Value::Date(19),
+        )
+        .expect("comparable date range");
+        assert!((selectivity - 0.1).abs() < f64::EPSILON);
+
+        assert_eq!(
+            ordered_range_selectivity(
+                &Value::Integer(0),
+                &Value::Integer(99),
+                &Value::BigInt(10),
+                &Value::BigInt(19),
+            ),
+            None
+        );
+
+        let minimum = Value::Integer(0);
+        let maximum = Value::Integer(99);
+        let bound = Value::Integer(10);
+        assert_eq!(
+            ordered_range_selectivity_bounds(&minimum, &maximum, Some(&bound), None, true, true,),
+            Some(0.9),
+        );
+        assert_eq!(
+            ordered_range_selectivity_bounds(&minimum, &maximum, Some(&bound), None, false, true,),
+            Some(0.89),
+        );
+        assert_eq!(
+            ordered_range_selectivity_bounds(&minimum, &maximum, None, Some(&bound), true, true,),
+            Some(0.11),
+        );
+        assert_eq!(
+            ordered_range_selectivity_bounds(&minimum, &maximum, None, Some(&bound), true, false,),
+            Some(0.1),
+        );
+    }
+
+    #[test]
+    fn morsels_balance_tail_work_at_the_admitted_task_count() {
+        assert_eq!(rowset_morsel_rows(25, 4, 32), 16 * 1024);
+        assert_eq!(rowset_morsel_rows(200_000, 4, 32), 25_000);
+        assert_eq!(rowset_morsel_rows(800_000, 4, 32), 100_000);
+        assert_eq!(rowset_morsel_rows(6_000_000, 4, 32), 128 * 1024);
+    }
+
+    #[test]
+    fn packet_rows_shrink_for_wide_or_predicate_heavy_scans() {
+        assert_eq!(rowset_morsel_rows(6_000_000, 4, 8), 512 * 1024);
+        assert_eq!(rowset_morsel_rows(6_000_000, 4, 256), 16 * 1024);
     }
 
     #[test]
     fn morsel_policy_handles_empty_and_single_thread_scans() {
-        assert_eq!(rowset_morsel_rows(0, 0), MIN_ROWSET_MORSEL_ROWS);
-        assert_eq!(rowset_morsel_rows(200_000, 1), 200_000);
-        assert_eq!(rowset_morsel_rows(6_000_000, 1), 6_000_000);
-        assert_eq!(
-            rowset_morsel_rows(u64::MAX, usize::MAX),
-            MIN_ROWSET_MORSEL_ROWS
-        );
+        assert_eq!(rowset_morsel_rows(0, 0, 32), 1);
+        assert_eq!(rowset_morsel_rows(200_000, 1, 32), 200_000);
+        assert_eq!(rowset_morsel_rows(6_000_000, 1, 32), 6_000_000);
+        assert_eq!(rowset_morsel_rows(u64::MAX, usize::MAX, 32), 16 * 1024);
     }
 
     #[test]

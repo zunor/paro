@@ -10,31 +10,108 @@ use paro_external::routine::identity::RoutineCallIdentity;
 
 use super::{
     AggregateExpression, CaseExpression, CastExpression, ColumnRefExpression, ComparisonExpression,
-    ConjunctionExpression, ConstantExpression, ExpressionIterator, FunctionExpression,
-    OperatorExpression, ParameterExpression, ReferenceExpression, SubqueryExpression,
-    WindowExpression, WindowFrameBound, WindowInvocation,
+    ConjunctionExpression, ConstantExpression, ExpressionIterator, ExpressionVisitDecision,
+    FunctionExpression, OperatorExpression, ParameterExpression, ReferenceExpression,
+    SharedExpressionPayload, SubqueryExpression, WindowExpression, WindowFrameBound,
+    WindowInvocation,
 };
-use crate::operator::ColumnBinding;
+use crate::logical::operator::ColumnBinding;
 
 /// Expression represents a semantic-aware version of a SQL expression.
 #[derive(Debug, Clone)]
 pub enum Expression {
-    Constant(ConstantExpression),
-    ColumnRef(ColumnRefExpression),
-    Function(FunctionExpression),
-    Cast(CastExpression),
-    Conjunction(ConjunctionExpression),
-    Case(CaseExpression),
-    Comparison(ComparisonExpression),
-    Operator(OperatorExpression),
-    Parameter(ParameterExpression),
-    Reference(ReferenceExpression),
-    Aggregate(AggregateExpression),
-    Subquery(SubqueryExpression),
-    Window(WindowExpression),
+    Constant(SharedExpressionPayload<ConstantExpression>),
+    ColumnRef(SharedExpressionPayload<ColumnRefExpression>),
+    Function(SharedExpressionPayload<FunctionExpression>),
+    Cast(SharedExpressionPayload<CastExpression>),
+    Conjunction(SharedExpressionPayload<ConjunctionExpression>),
+    Case(SharedExpressionPayload<CaseExpression>),
+    Comparison(SharedExpressionPayload<ComparisonExpression>),
+    Operator(SharedExpressionPayload<OperatorExpression>),
+    Parameter(SharedExpressionPayload<ParameterExpression>),
+    Reference(SharedExpressionPayload<ReferenceExpression>),
+    Aggregate(SharedExpressionPayload<AggregateExpression>),
+    Subquery(SharedExpressionPayload<SubqueryExpression>),
+    Window(SharedExpressionPayload<WindowExpression>),
 }
 
+// One tag and one immutable payload handle, irrespective of scalar kind.
+const _: () = assert!(std::mem::size_of::<Expression>() <= 16);
+
 impl Expression {
+    pub(crate) fn evaluation_cache(&self) -> &std::sync::OnceLock<super::EvaluationProperties> {
+        match self {
+            Self::Constant(value) => value.evaluation_cache(),
+            Self::ColumnRef(value) => value.evaluation_cache(),
+            Self::Function(value) => value.evaluation_cache(),
+            Self::Cast(value) => value.evaluation_cache(),
+            Self::Conjunction(value) => value.evaluation_cache(),
+            Self::Case(value) => value.evaluation_cache(),
+            Self::Comparison(value) => value.evaluation_cache(),
+            Self::Operator(value) => value.evaluation_cache(),
+            Self::Parameter(value) => value.evaluation_cache(),
+            Self::Reference(value) => value.evaluation_cache(),
+            Self::Aggregate(value) => value.evaluation_cache(),
+            Self::Subquery(value) => value.evaluation_cache(),
+            Self::Window(value) => value.evaluation_cache(),
+        }
+    }
+
+    /// Query-local allocation identity. This is never a semantic fingerprint
+    /// and cannot be persisted or used without the allocation's lifetime.
+    pub fn allocation_identity(&self) -> super::ExpressionIdentity {
+        match self {
+            Self::Constant(value) => value.allocation_identity(),
+            Self::ColumnRef(value) => value.allocation_identity(),
+            Self::Function(value) => value.allocation_identity(),
+            Self::Cast(value) => value.allocation_identity(),
+            Self::Conjunction(value) => value.allocation_identity(),
+            Self::Case(value) => value.allocation_identity(),
+            Self::Comparison(value) => value.allocation_identity(),
+            Self::Operator(value) => value.allocation_identity(),
+            Self::Parameter(value) => value.allocation_identity(),
+            Self::Reference(value) => value.allocation_identity(),
+            Self::Aggregate(value) => value.allocation_identity(),
+            Self::Subquery(value) => value.allocation_identity(),
+            Self::Window(value) => value.allocation_identity(),
+        }
+    }
+
+    pub fn witness(&self) -> super::ExpressionWitness {
+        match self {
+            Self::Constant(value) => value.witness(),
+            Self::ColumnRef(value) => value.witness(),
+            Self::Function(value) => value.witness(),
+            Self::Cast(value) => value.witness(),
+            Self::Conjunction(value) => value.witness(),
+            Self::Case(value) => value.witness(),
+            Self::Comparison(value) => value.witness(),
+            Self::Operator(value) => value.witness(),
+            Self::Parameter(value) => value.witness(),
+            Self::Reference(value) => value.witness(),
+            Self::Aggregate(value) => value.witness(),
+            Self::Subquery(value) => value.witness(),
+            Self::Window(value) => value.witness(),
+        }
+    }
+
+    pub(crate) fn release_children_into(&mut self, pending: &mut Vec<Expression>) {
+        match self {
+            Self::Constant(value) => value.release_into(pending),
+            Self::ColumnRef(value) => value.release_into(pending),
+            Self::Function(value) => value.release_into(pending),
+            Self::Cast(value) => value.release_into(pending),
+            Self::Conjunction(value) => value.release_into(pending),
+            Self::Case(value) => value.release_into(pending),
+            Self::Comparison(value) => value.release_into(pending),
+            Self::Operator(value) => value.release_into(pending),
+            Self::Parameter(value) => value.release_into(pending),
+            Self::Reference(value) => value.release_into(pending),
+            Self::Aggregate(value) => value.release_into(pending),
+            Self::Subquery(value) => value.release_into(pending),
+            Self::Window(value) => value.release_into(pending),
+        }
+    }
     pub fn return_type(&self) -> LogicalType {
         match self {
             Expression::Constant(expr) => expr.return_type.clone(),
@@ -69,14 +146,14 @@ impl Expression {
     }
 
     pub fn contains_external_routine(&self) -> bool {
-        if matches!(self, Expression::Function(expr) if expr.crosses_execution_boundary()) {
-            return true;
-        }
-
         let mut contains_external = false;
-        ExpressionIterator::enumerate_children(self, |child| {
-            if !contains_external {
-                contains_external = child.contains_external_routine();
+        ExpressionIterator::visit(self, &mut |expression| {
+            if matches!(expression, Expression::Function(function) if function.crosses_execution_boundary())
+            {
+                contains_external = true;
+                ExpressionVisitDecision::SkipChildren
+            } else {
+                ExpressionVisitDecision::Descend
             }
         });
         contains_external
@@ -95,15 +172,15 @@ impl Expression {
     where
         F: Fn(&ColumnRefExpression) -> Option<Expression>,
     {
-        if let Expression::ColumnRef(column_ref) = self {
-            if let Some(replacement) = f(column_ref) {
-                *self = replacement;
+        ExpressionIterator::visit_mut(self, &mut |expression| {
+            if let Expression::ColumnRef(column_ref) = expression {
+                if let Some(replacement) = f(column_ref) {
+                    *expression = replacement;
+                }
+                ExpressionVisitDecision::SkipChildren
+            } else {
+                ExpressionVisitDecision::Descend
             }
-            return;
-        }
-
-        ExpressionIterator::enumerate_children_mut(self, |child| {
-            child.replace_column_ref_in_place(f);
         });
     }
 
@@ -114,15 +191,15 @@ impl Expression {
     }
 
     fn replace_groups_in_place(&mut self, groups: &[Expression]) {
-        for (i, group) in groups.iter().enumerate() {
-            if self.equals(group) {
-                *self = Expression::Reference(ReferenceExpression::new(i, self.return_type()));
-                return;
+        ExpressionIterator::visit_mut(self, &mut |expression| {
+            if let Some(index) = groups.iter().position(|group| expression.equals(group)) {
+                let return_type = expression.return_type();
+                *expression =
+                    Expression::Reference(ReferenceExpression::new(index, return_type).into());
+                ExpressionVisitDecision::SkipChildren
+            } else {
+                ExpressionVisitDecision::Descend
             }
-        }
-
-        ExpressionIterator::enumerate_children_mut(self, |child| {
-            child.replace_groups_in_place(groups);
         });
     }
 
@@ -138,19 +215,20 @@ impl Expression {
     /// A subquery is a query-level boundary: aggregates owned by its plan must not be hoisted into
     /// the surrounding SELECT.
     pub fn extract_aggregates_in_place(&mut self, aggregates: &mut Vec<Expression>, offset: usize) {
-        if let Expression::Aggregate(aggregate) = self {
-            let index = offset + aggregates.len();
-            let return_type = aggregate.return_type.clone();
-            let replacement = Expression::Reference(ReferenceExpression::new(index, return_type));
-            aggregates.push(std::mem::replace(self, replacement));
-            return;
-        }
-        if matches!(self, Expression::Subquery(_)) {
-            return;
-        }
-
-        ExpressionIterator::enumerate_children_mut(self, |child| {
-            child.extract_aggregates_in_place(aggregates, offset);
+        ExpressionIterator::visit_mut(self, &mut |expression| {
+            if let Expression::Aggregate(aggregate) = expression {
+                let index = offset + aggregates.len();
+                let return_type = aggregate.return_type.clone();
+                let replacement =
+                    Expression::Reference(ReferenceExpression::new(index, return_type).into());
+                aggregates.push(std::mem::replace(expression, replacement));
+                return ExpressionVisitDecision::SkipChildren;
+            }
+            if matches!(expression, Expression::Subquery(_)) {
+                ExpressionVisitDecision::SkipChildren
+            } else {
+                ExpressionVisitDecision::Descend
+            }
         });
     }
 
@@ -159,183 +237,273 @@ impl Expression {
     /// Window bindings use a producer-local column index. The physical position is resolved after
     /// the child plan has been finalized, so subquery planning cannot invalidate the binding.
     pub fn extract_windows_in_place(&mut self, windows: &mut Vec<Expression>, window_index: usize) {
-        if matches!(self, Expression::Window(_)) {
-            let return_type = self.return_type();
-            let existing = self
+        ExpressionIterator::visit_mut(self, &mut |expression| {
+            if !matches!(expression, Expression::Window(_)) {
+                return if matches!(expression, Expression::Subquery(_)) {
+                    ExpressionVisitDecision::SkipChildren
+                } else {
+                    ExpressionVisitDecision::Descend
+                };
+            }
+            let return_type = expression.return_type();
+            let existing = expression
                 .evaluation_properties()
                 .can_share_evaluation()
-                .then(|| windows.iter().position(|window| window.equals(self)))
+                .then(|| windows.iter().position(|window| window.equals(expression)))
                 .flatten();
             let output_index = existing.unwrap_or(windows.len());
-            let replacement = Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(window_index, output_index),
-                return_type,
-            ));
+            let replacement = Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(window_index, output_index),
+                    return_type,
+                )
+                .into(),
+            );
 
             if existing.is_some() {
-                *self = replacement;
+                *expression = replacement;
             } else {
-                windows.push(std::mem::replace(self, replacement));
+                windows.push(std::mem::replace(expression, replacement));
             }
-            return;
-        }
-        if matches!(self, Expression::Subquery(_)) {
-            return;
-        }
-
-        ExpressionIterator::enumerate_children_mut(self, |child| {
-            child.extract_windows_in_place(windows, window_index);
+            ExpressionVisitDecision::SkipChildren
         });
     }
 
     /// Check if two expressions are semantically equal.
     pub fn equals(&self, other: &Expression) -> bool {
-        match (self, other) {
-            (Expression::ColumnRef(a), Expression::ColumnRef(b)) => {
-                a.binding == b.binding && a.depth == b.depth
+        // Expressions can be much deeper than the surrounding SQL (for
+        // example a generated OR chain or a nested CASE).  Keep equality on
+        // the same explicit work stack as fingerprinting so a user supplied
+        // expression cannot overflow the native stack.
+        enum Pending<'a> {
+            Expression(&'a Expression, &'a Expression),
+            Aggregate(&'a AggregateExpression, &'a AggregateExpression),
+            Invocation(&'a WindowInvocation, &'a WindowInvocation),
+            FrameBound(&'a WindowFrameBound, &'a WindowFrameBound),
+        }
+
+        let mut pending = vec![Pending::Expression(self, other)];
+        // Both DAGs are borrowed throughout this comparison, so allocation
+        // pairs cannot be reused or mutated. Check each pair once, without
+        // treating pointer identity as semantic equality (NaN, subqueries
+        // and opaque routine bind data need the normal local comparison).
+        let mut compared = std::collections::HashSet::new();
+        while let Some(item) = pending.pop() {
+            if let Pending::Expression(left, right) = &item {
+                if !compared.insert((left.allocation_identity(), right.allocation_identity())) {
+                    continue;
+                }
             }
-            (Expression::Constant(a), Expression::Constant(b)) => a.value == b.value,
-            (Expression::Function(a), Expression::Function(b)) => {
-                routine_identities_equal(a.routine_identity(), b.routine_identity(), || {
-                    a.function.name == b.function.name
-                }) && a.function.arguments == b.function.arguments
-                    && a.children.len() == b.children.len()
-                    && a.children
-                        .iter()
-                        .zip(&b.children)
-                        .all(|(ca, cb)| ca.equals(cb))
-                    && match (&a.function.bind_data, &b.function.bind_data) {
-                        (Some(ad), Some(bd)) => ad.equals(&**bd),
-                        (None, None) => true,
-                        _ => false,
+            match item {
+                Pending::Expression(left, right) => match (left, right) {
+                    (Expression::ColumnRef(a), Expression::ColumnRef(b)) => {
+                        if a.binding != b.binding || a.depth != b.depth {
+                            return false;
+                        }
                     }
-            }
-            (Expression::Cast(a), Expression::Cast(b)) => {
-                a.target_type == b.target_type && a.child.equals(&b.child)
-            }
-            (Expression::Conjunction(a), Expression::Conjunction(b)) => {
-                a.conjunction_type == b.conjunction_type
-                    && a.children.len() == b.children.len()
-                    && a.children
+                    (Expression::Constant(a), Expression::Constant(b)) => {
+                        if a.value != b.value {
+                            return false;
+                        }
+                    }
+                    (Expression::Function(a), Expression::Function(b)) => {
+                        if !routine_identities_equal(
+                            a.routine_identity(),
+                            b.routine_identity(),
+                            || a.function.name == b.function.name,
+                        ) || a.function.arguments != b.function.arguments
+                            || a.children.len() != b.children.len()
+                        {
+                            return false;
+                        }
+                        match (&a.function.bind_data, &b.function.bind_data) {
+                            (Some(ad), Some(bd)) if !ad.equals(&**bd) => return false,
+                            (None, None) | (Some(_), Some(_)) => {}
+                            _ => return false,
+                        }
+                        pending.extend(
+                            a.children
+                                .iter()
+                                .zip(&b.children)
+                                .map(|(left, right)| Pending::Expression(left, right)),
+                        );
+                    }
+                    (Expression::Cast(a), Expression::Cast(b)) => {
+                        if a.target_type != b.target_type || a.try_cast != b.try_cast {
+                            return false;
+                        }
+                        pending.push(Pending::Expression(&a.child, &b.child));
+                    }
+                    (Expression::Conjunction(a), Expression::Conjunction(b)) => {
+                        if a.conjunction_type != b.conjunction_type
+                            || a.children.len() != b.children.len()
+                        {
+                            return false;
+                        }
+                        pending.extend(
+                            a.children
+                                .iter()
+                                .zip(&b.children)
+                                .map(|(left, right)| Pending::Expression(left, right)),
+                        );
+                    }
+                    (Expression::Case(a), Expression::Case(b)) => {
+                        if a.return_type != b.return_type {
+                            return false;
+                        }
+                        pending.push(Pending::Expression(&a.check, &b.check));
+                        pending.push(Pending::Expression(&a.result_if_true, &b.result_if_true));
+                        pending.push(Pending::Expression(&a.result_if_false, &b.result_if_false));
+                    }
+                    (Expression::Comparison(a), Expression::Comparison(b)) => {
+                        if a.comparison_type != b.comparison_type {
+                            return false;
+                        }
+                        pending.push(Pending::Expression(&a.left, &b.left));
+                        pending.push(Pending::Expression(&a.right, &b.right));
+                    }
+                    (Expression::Operator(a), Expression::Operator(b)) => {
+                        if a.operator_type != b.operator_type
+                            || a.children.len() != b.children.len()
+                        {
+                            return false;
+                        }
+                        pending.extend(
+                            a.children
+                                .iter()
+                                .zip(&b.children)
+                                .map(|(left, right)| Pending::Expression(left, right)),
+                        );
+                    }
+                    (Expression::Parameter(a), Expression::Parameter(b)) => {
+                        if a.slot != b.slot || a.return_type() != b.return_type() {
+                            return false;
+                        }
+                    }
+                    (Expression::Reference(a), Expression::Reference(b)) => {
+                        if a.index != b.index || a.return_type != b.return_type {
+                            return false;
+                        }
+                    }
+                    (Expression::Aggregate(a), Expression::Aggregate(b)) => {
+                        pending.push(Pending::Aggregate(a, b));
+                    }
+                    (Expression::Window(a), Expression::Window(b)) => {
+                        if a.partitions.len() != b.partitions.len()
+                            || a.orders.len() != b.orders.len()
+                            || a.frame.frame_type != b.frame.frame_type
+                            || a.frame.start_is_preceding != b.frame.start_is_preceding
+                            || a.frame.end_is_preceding != b.frame.end_is_preceding
+                            || a.ignore_nulls != b.ignore_nulls
+                        {
+                            return false;
+                        }
+                        pending.push(Pending::Invocation(&a.invocation, &b.invocation));
+                        pending.extend(
+                            a.partitions
+                                .iter()
+                                .zip(&b.partitions)
+                                .map(|(left, right)| Pending::Expression(left, right)),
+                        );
+                        if a.orders.iter().zip(&b.orders).any(|(left, right)| {
+                            left.ascending != right.ascending
+                                || left.nulls_first != right.nulls_first
+                        }) {
+                            return false;
+                        }
+                        pending.extend(a.orders.iter().zip(&b.orders).map(|(left, right)| {
+                            Pending::Expression(&left.expression, &right.expression)
+                        }));
+                        pending.push(Pending::FrameBound(
+                            &a.frame.start_bound,
+                            &b.frame.start_bound,
+                        ));
+                        pending.push(Pending::FrameBound(&a.frame.end_bound, &b.frame.end_bound));
+                    }
+                    _ => return false,
+                },
+                Pending::Aggregate(left, right) => {
+                    if !left.function.execution_semantics_equal(&right.function)
+                        || left.return_type != right.return_type
+                        || left.aggr_type != right.aggr_type
+                        || left.children.len() != right.children.len()
+                        || left.order_bys.len() != right.order_bys.len()
+                    {
+                        return false;
+                    }
+                    match (&left.filter, &right.filter) {
+                        (Some(left), Some(right)) => pending.push(Pending::Expression(left, right)),
+                        (None, None) => {}
+                        _ => return false,
+                    }
+                    match (&left.bind_info, &right.bind_info) {
+                        (Some(left), Some(right)) if !left.equals(&**right) => return false,
+                        (None, None) | (Some(_), Some(_)) => {}
+                        _ => return false,
+                    }
+                    pending.extend(
+                        left.children
+                            .iter()
+                            .zip(&right.children)
+                            .map(|(left, right)| Pending::Expression(left, right)),
+                    );
+                    if left
+                        .order_bys
                         .iter()
-                        .zip(&b.children)
-                        .all(|(ca, cb)| ca.equals(cb))
+                        .zip(&right.order_bys)
+                        .any(|(left, right)| {
+                            left.ascending != right.ascending
+                                || left.nulls_first != right.nulls_first
+                        })
+                    {
+                        return false;
+                    }
+                    pending.extend(left.order_bys.iter().zip(&right.order_bys).map(
+                        |(left, right)| Pending::Expression(&left.expression, &right.expression),
+                    ));
+                }
+                Pending::Invocation(left, right) => match (left, right) {
+                    (
+                        WindowInvocation::Native {
+                            function: left_function,
+                            arguments: left_arguments,
+                        },
+                        WindowInvocation::Native {
+                            function: right_function,
+                            arguments: right_arguments,
+                        },
+                    ) => {
+                        if left_function.name != right_function.name
+                            || left_function.function_type != right_function.function_type
+                            || left_function.arguments != right_function.arguments
+                            || left_function.return_type != right_function.return_type
+                            || left_arguments.len() != right_arguments.len()
+                        {
+                            return false;
+                        }
+                        pending.extend(
+                            left_arguments
+                                .iter()
+                                .zip(right_arguments)
+                                .map(|(left, right)| Pending::Expression(left, right)),
+                        );
+                    }
+                    (WindowInvocation::Aggregate(left), WindowInvocation::Aggregate(right)) => {
+                        pending.push(Pending::Aggregate(left, right));
+                    }
+                    _ => return false,
+                },
+                Pending::FrameBound(left, right) => match (left, right) {
+                    (WindowFrameBound::Unbounded, WindowFrameBound::Unbounded)
+                    | (WindowFrameBound::CurrentRow, WindowFrameBound::CurrentRow) => {}
+                    (WindowFrameBound::Offset(left), WindowFrameBound::Offset(right)) => {
+                        pending.push(Pending::Expression(left, right));
+                    }
+                    _ => return false,
+                },
             }
-            (Expression::Case(a), Expression::Case(b)) => {
-                a.check.equals(&b.check)
-                    && a.result_if_true.equals(&b.result_if_true)
-                    && a.result_if_false.equals(&b.result_if_false)
-            }
-            (Expression::Comparison(a), Expression::Comparison(b)) => {
-                a.comparison_type == b.comparison_type
-                    && a.left.equals(&b.left)
-                    && a.right.equals(&b.right)
-            }
-            (Expression::Operator(a), Expression::Operator(b)) => {
-                a.operator_type == b.operator_type
-                    && a.children.len() == b.children.len()
-                    && a.children
-                        .iter()
-                        .zip(&b.children)
-                        .all(|(ca, cb)| ca.equals(cb))
-            }
-            (Expression::Parameter(a), Expression::Parameter(b)) => a.slot == b.slot,
-            (Expression::Reference(a), Expression::Reference(b)) => a.index == b.index,
-            (Expression::Aggregate(a), Expression::Aggregate(b)) => {
-                aggregate_expressions_equal(a, b)
-            }
-            (Expression::Window(a), Expression::Window(b)) => {
-                window_invocations_equal(&a.invocation, &b.invocation)
-                    && a.partitions.len() == b.partitions.len()
-                    && a.partitions
-                        .iter()
-                        .zip(&b.partitions)
-                        .all(|(pa, pb)| pa.equals(pb))
-                    && a.orders.len() == b.orders.len()
-                    && a.orders.iter().zip(&b.orders).all(|(ao, bo)| {
-                        ao.ascending == bo.ascending
-                            && ao.nulls_first == bo.nulls_first
-                            && ao.expression.equals(&bo.expression)
-                    })
-                    && a.frame.frame_type == b.frame.frame_type
-                    && a.frame.start_is_preceding == b.frame.start_is_preceding
-                    && a.frame.end_is_preceding == b.frame.end_is_preceding
-                    && window_frame_bounds_equal(&a.frame.start_bound, &b.frame.start_bound)
-                    && window_frame_bounds_equal(&a.frame.end_bound, &b.frame.end_bound)
-                    && a.ignore_nulls == b.ignore_nulls
-            }
-            _ => false,
         }
-    }
-}
-
-fn aggregate_expressions_equal(left: &AggregateExpression, right: &AggregateExpression) -> bool {
-    left.function.execution_semantics_equal(&right.function)
-        && left.return_type == right.return_type
-        && left.children.len() == right.children.len()
-        && left
-            .children
-            .iter()
-            .zip(&right.children)
-            .all(|(left, right)| left.equals(right))
-        && left.aggr_type == right.aggr_type
-        && match (&left.filter, &right.filter) {
-            (Some(left), Some(right)) => left.equals(right),
-            (None, None) => true,
-            _ => false,
-        }
-        && left.order_bys.len() == right.order_bys.len()
-        && left
-            .order_bys
-            .iter()
-            .zip(&right.order_bys)
-            .all(|(left, right)| {
-                left.ascending == right.ascending
-                    && left.nulls_first == right.nulls_first
-                    && left.expression.equals(&right.expression)
-            })
-        && match (&left.bind_info, &right.bind_info) {
-            (Some(left), Some(right)) => left.equals(&**right),
-            (None, None) => true,
-            _ => false,
-        }
-}
-
-fn window_invocations_equal(left: &WindowInvocation, right: &WindowInvocation) -> bool {
-    match (left, right) {
-        (
-            WindowInvocation::Native {
-                function: left_function,
-                arguments: left_arguments,
-            },
-            WindowInvocation::Native {
-                function: right_function,
-                arguments: right_arguments,
-            },
-        ) => {
-            left_function.name == right_function.name
-                && left_function.function_type == right_function.function_type
-                && left_function.arguments == right_function.arguments
-                && left_function.return_type == right_function.return_type
-                && left_arguments.len() == right_arguments.len()
-                && left_arguments
-                    .iter()
-                    .zip(right_arguments)
-                    .all(|(left, right)| left.equals(right))
-        }
-        (WindowInvocation::Aggregate(left), WindowInvocation::Aggregate(right)) => {
-            aggregate_expressions_equal(left, right)
-        }
-        _ => false,
-    }
-}
-
-fn window_frame_bounds_equal(left: &WindowFrameBound, right: &WindowFrameBound) -> bool {
-    match (left, right) {
-        (WindowFrameBound::Unbounded, WindowFrameBound::Unbounded)
-        | (WindowFrameBound::CurrentRow, WindowFrameBound::CurrentRow) => true,
-        (WindowFrameBound::Offset(left), WindowFrameBound::Offset(right)) => left.equals(right),
-        _ => false,
+        true
     }
 }
 
@@ -354,28 +522,27 @@ fn routine_identities_equal(
 mod tests {
     use super::Expression;
     use crate::expression::{
-        AggregateExpression, ColumnRefExpression, ConstantExpression, FunctionExpression,
-        OrderByExpression, ReferenceExpression, WindowExpression, WindowFrame, WindowFrameBound,
-        WindowFrameType,
+        AggregateExpression, ColumnRefExpression, ConjunctionExpression, ConjunctionType,
+        ConstantExpression, FunctionExpression, OrderByExpression, WindowExpression, WindowFrame,
+        WindowFrameBound, WindowFrameType,
     };
-    use crate::operator::ColumnBinding;
+    use crate::logical::operator::ColumnBinding;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_function::aggregate::distributive::count::get_count_star_function;
     use paro_function::window::WindowFunction;
 
     fn int_column(column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(10, column_index),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(10, column_index), LogicalType::Integer)
+                .into(),
+        )
     }
 
     fn int_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(value),
-            LogicalType::Integer,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+        )
     }
 
     fn random_call() -> Expression {
@@ -384,32 +551,31 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(FunctionExpression::new(
-            function,
-            vec![],
-            LogicalType::Double,
-        ))
+        Expression::Function(FunctionExpression::new(function, vec![], LogicalType::Double).into())
     }
 
     fn window_expression(start_bound: WindowFrameBound) -> Expression {
-        Expression::Window(WindowExpression::native(
-            WindowFunction::first_value(LogicalType::Integer),
-            vec![int_column(0)],
-            vec![int_column(1)],
-            vec![OrderByExpression {
-                expression: int_column(2),
-                ascending: true,
-                nulls_first: false,
-            }],
-            WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start_bound,
-                start_is_preceding: true,
-                end_bound: WindowFrameBound::CurrentRow,
-                end_is_preceding: false,
-            },
-            false,
-        ))
+        Expression::Window(
+            WindowExpression::native(
+                WindowFunction::first_value(LogicalType::Integer),
+                vec![int_column(0)],
+                vec![int_column(1)],
+                vec![OrderByExpression {
+                    expression: int_column(2),
+                    ascending: true,
+                    nulls_first: false,
+                }],
+                WindowFrame {
+                    frame_type: WindowFrameType::Rows,
+                    start_bound,
+                    start_is_preceding: true,
+                    end_bound: WindowFrameBound::CurrentRow,
+                    end_is_preceding: false,
+                },
+                false,
+            )
+            .into(),
+        )
     }
 
     #[test]
@@ -422,7 +588,7 @@ mod tests {
         let Expression::Window(window) = rewritten else {
             panic!("expected window expression");
         };
-        let WindowFrameBound::Offset(offset) = window.frame.start_bound else {
+        let WindowFrameBound::Offset(offset) = window.into_inner().frame.start_bound else {
             panic!("expected frame offset");
         };
         assert!(matches!(*offset, Expression::Constant(_)));
@@ -436,22 +602,20 @@ mod tests {
         let Expression::Window(window) = rewritten else {
             panic!("expected window expression");
         };
-        let WindowFrameBound::Offset(offset) = window.frame.start_bound else {
+        let WindowFrameBound::Offset(offset) = window.into_inner().frame.start_bound else {
             panic!("expected frame offset");
         };
         assert!(matches!(
             *offset,
-            Expression::Reference(ReferenceExpression { index: 0, .. })
+            Expression::Reference(reference) if reference.index == 0
         ));
     }
 
     #[test]
     fn extract_aggregates_visits_window_clauses() {
-        let aggregate = Expression::Aggregate(AggregateExpression::new(
-            get_count_star_function(),
-            vec![],
-            LogicalType::BigInt,
-        ));
+        let aggregate = Expression::Aggregate(
+            AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+        );
         let mut expression = window_expression(WindowFrameBound::CurrentRow);
         let Expression::Window(window) = &mut expression else {
             unreachable!();
@@ -467,8 +631,8 @@ mod tests {
             panic!("expected window expression");
         };
         assert!(matches!(
-            window.orders[0].expression,
-            Expression::Reference(ReferenceExpression { index: 3, .. })
+            &window.orders[0].expression,
+            Expression::Reference(reference) if reference.index == 3
         ));
     }
 
@@ -476,12 +640,15 @@ mod tests {
     fn extract_aggregates_preserves_window_owned_aggregate_kernel() {
         let aggregate =
             AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt);
-        let mut expression = Expression::Window(WindowExpression::aggregate(
-            aggregate,
-            vec![int_column(0)],
-            vec![],
-            WindowFrame::default(),
-        ));
+        let mut expression = Expression::Window(
+            WindowExpression::aggregate(
+                aggregate,
+                vec![int_column(0)],
+                vec![],
+                WindowFrame::default(),
+            )
+            .into(),
+        );
         let mut aggregates = Vec::new();
 
         expression.extract_aggregates_in_place(&mut aggregates, 0);
@@ -559,5 +726,50 @@ mod tests {
         };
         window.ignore_nulls = true;
         assert!(!original.equals(&different_null_treatment));
+    }
+
+    #[test]
+    fn equality_preserves_semantics_across_different_sharing_shapes() {
+        fn shared(mut expression: Expression) -> Expression {
+            for _ in 0..18 {
+                expression = Expression::Conjunction(
+                    ConjunctionExpression::new(
+                        ConjunctionType::Or,
+                        vec![expression.clone(), expression],
+                    )
+                    .into(),
+                );
+            }
+            expression
+        }
+        let original = shared(int_constant(1));
+        assert!(original.equals(&original.clone()));
+        assert!(original.equals(&shared(int_constant(1))));
+        assert!(!original.equals(&shared(int_constant(2))));
+        let Expression::Conjunction(children) = &original else {
+            unreachable!()
+        };
+        let different_arity = Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::Or, vec![children.children[0].clone()])
+                .into(),
+        );
+        assert!(!original.equals(&different_arity));
+    }
+
+    #[test]
+    fn equality_handles_deep_conjunction_without_native_recursion() {
+        let mut left = int_constant(1);
+        let mut right = int_constant(1);
+        for _ in 0..10_000 {
+            left = Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::And, vec![left]).into(),
+            );
+            right = Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::And, vec![right]).into(),
+            );
+        }
+        assert!(left.equals(&right));
+        drop(left);
+        drop(right);
     }
 }

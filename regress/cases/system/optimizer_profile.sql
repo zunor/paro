@@ -5,9 +5,9 @@ SELECT 1;
 
 SELECT count(*) > 0 AS has_rows FROM paro_optimizers();
 
-SELECT name, enabled
+SELECT name, kind
 FROM paro_optimizers()
-WHERE name IN ('expression_rewriter', 'filter_pushdown', 'join_order')
+WHERE name IN ('semantic_normalization', 'region_optimization', 'physical_selection', 'physical_extraction')
 ORDER BY name;
 
 SELECT count(*) > 0 AS has_invocations

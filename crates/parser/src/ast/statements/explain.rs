@@ -40,6 +40,11 @@ pub enum ExplainKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Drive, DriveMut)]
 pub enum ExplainOption {
+    Compile,
+    Analyze,
+    Detail,
+    FormatText,
+    FormatJson,
     Verbose,
     Logical,
     Optimized,

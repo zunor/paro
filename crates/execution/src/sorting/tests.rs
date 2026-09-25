@@ -26,10 +26,13 @@ use crate::sorting::sorted_run_merger::{
 fn build_int_sort() -> Sort {
     Sort::new(
         vec![OrderByNode {
-            expression: Expression::Reference(ReferenceExpression {
-                index: 0,
-                return_type: LogicalType::Integer,
-            }),
+            expression: Expression::Reference(
+                ReferenceExpression {
+                    index: 0,
+                    return_type: LogicalType::Integer,
+                }
+                .into(),
+            ),
             ascending: true,
             nulls_first: false,
         }],
@@ -43,10 +46,13 @@ fn build_int_sort() -> Sort {
 fn build_varchar_sort() -> Sort {
     Sort::new(
         vec![OrderByNode {
-            expression: Expression::Reference(ReferenceExpression {
-                index: 0,
-                return_type: LogicalType::Varchar,
-            }),
+            expression: Expression::Reference(
+                ReferenceExpression {
+                    index: 0,
+                    return_type: LogicalType::Varchar,
+                }
+                .into(),
+            ),
             ascending: true,
             nulls_first: false,
         }],
@@ -301,10 +307,13 @@ fn external_run_release_frontier_keeps_suffix_scan_valid() {
 fn lossy_float_key_encoding_retains_original_key_rows() {
     let sort = Sort::new(
         vec![OrderByNode {
-            expression: Expression::Reference(ReferenceExpression {
-                index: 0,
-                return_type: LogicalType::Float,
-            }),
+            expression: Expression::Reference(
+                ReferenceExpression {
+                    index: 0,
+                    return_type: LogicalType::Float,
+                }
+                .into(),
+            ),
             ascending: true,
             nulls_first: false,
         }],

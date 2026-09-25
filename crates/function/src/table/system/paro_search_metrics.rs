@@ -354,6 +354,26 @@ fn search_metric_data_from_snapshot(snapshot: &StorageMetricsSnapshot) -> Vec<Se
             "search_hnsw_integrity_verified_bytes_total",
             snapshot.search_hnsw_integrity_verified_bytes_total,
         ),
+        (
+            "search_decoded_page_cache_hits_total",
+            snapshot.decoded_page_cache_hits,
+        ),
+        (
+            "search_decoded_page_cache_misses_total",
+            snapshot.decoded_page_cache_misses,
+        ),
+        (
+            "search_decoded_page_cache_first_touch_admissions_total",
+            snapshot.decoded_page_cache_first_touch_admissions,
+        ),
+        (
+            "search_decoded_page_cache_probation_promotions_total",
+            snapshot.decoded_page_cache_probation_promotions,
+        ),
+        (
+            "search_decoded_page_cache_policy_rejections_total",
+            snapshot.decoded_page_cache_policy_rejections,
+        ),
     ] {
         push_value(&mut entries, name, MetricDimensions::default(), value);
     }
@@ -933,6 +953,7 @@ mod tests {
             17,
             HnswSearchOutcome::new(HnswSearchPath::AdaptiveGraph).with_predicate_refinement(true),
         );
+        storage_metrics().inc_decoded_page_cache_probation_promotion();
 
         let input = TableFunctionInitInput::new_for_test(None, &[]);
         let state_box = paro_search_metrics_init_global(&input).unwrap().unwrap();
@@ -962,6 +983,10 @@ mod tests {
         );
         assert!(state.entries.iter().any(|entry| {
             entry.metric_name == "search_hnsw_predicate_refined_segment_searches_total"
+                && entry.value >= 1
+        }));
+        assert!(state.entries.iter().any(|entry| {
+            entry.metric_name == "search_decoded_page_cache_probation_promotions_total"
                 && entry.value >= 1
         }));
     }

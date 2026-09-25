@@ -4,8 +4,12 @@
 from pathlib import Path
 import unittest
 
-from benchmark.harness.executor import BenchmarkExecutor
-from benchmark.harness.loader import WorkloadDef, _parse_byte_size
+from benchmark.harness.executor import (
+    BenchmarkExecutor,
+    QueryExecutionResult,
+    WorkloadExecutionResult,
+)
+from benchmark.harness.loader import QueryDef, WorkloadDef, _parse_byte_size
 
 
 class WorkloadRequirementTests(unittest.TestCase):
@@ -44,6 +48,68 @@ class WorkloadRequirementTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "buffer-pool memory limit"):
             executor._validate_workload_requirements(object(), workload)
+
+    def test_relative_median_guard_compares_queries_from_the_same_run(self) -> None:
+        executor = BenchmarkExecutor(
+            connection={},
+            iterations=1,
+            warmup=0,
+            timeout_seconds=1,
+            collect_memory=False,
+        )
+        workload = WorkloadDef(
+            name="optimizer_planning",
+            description="",
+            run_order=1,
+            minimum_server_buffer_pool_bytes=0,
+            root=Path("."),
+            params={},
+            setup_sql="",
+            teardown_sql="",
+            build_sql=None,
+            queries=(
+                QueryDef(
+                    id="disabled",
+                    file=Path("disabled.sql"),
+                    sql="EXPLAIN SELECT 1",
+                    validate="none",
+                ),
+                QueryDef(
+                    id="enabled",
+                    file=Path("enabled.sql"),
+                    sql="EXPLAIN SELECT 1",
+                    validate="none",
+                    max_median_ratio_to="disabled",
+                    max_median_ratio=1.2,
+                ),
+            ),
+        )
+        result = WorkloadExecutionResult(
+            name=workload.name,
+            params={},
+            queries=[
+                QueryExecutionResult(
+                    id="disabled",
+                    validate_mode="none",
+                    expected=None,
+                    samples_ms=[1.0, 1.0, 1.0],
+                    validation_result="PASS",
+                ),
+                QueryExecutionResult(
+                    id="enabled",
+                    validate_mode="none",
+                    expected=None,
+                    samples_ms=[1.3, 1.3, 1.3],
+                    validation_result="PASS",
+                ),
+            ],
+        )
+
+        executor._apply_relative_latency_guards(workload, result)
+
+        enabled = result.queries[1]
+        self.assertEqual(enabled.validation_result, "FAIL")
+        self.assertAlmostEqual(enabled.relative_median_ratio or 0.0, 1.3)
 
 
 if __name__ == "__main__":

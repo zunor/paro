@@ -370,15 +370,16 @@ impl DefaultTableFunctionGenerator {
         };
         use paro_function::table::system::{
             create_paro_columns_function_set, create_paro_commit_frontiers_function_set,
-            create_paro_commit_poison_function_set, create_paro_databases_function_set,
-            create_paro_graph_statistics_function_set, create_paro_indexes_function_set,
-            create_paro_logs_function_set, create_paro_memory_function_set,
-            create_paro_optimizers_function_set, create_paro_pg_cursors_function_set,
-            create_paro_pg_prepared_statements_function_set, create_paro_pg_settings_function_set,
-            create_paro_property_graphs_function_set, create_paro_schemas_function_set,
-            create_paro_search_metrics_function_set, create_paro_storage_info_function_set,
-            create_paro_tables_function_set, create_paro_temporary_files_function_set,
-            create_paro_views_function_set, create_pragma_database_size_function_set,
+            create_paro_commit_poison_function_set, create_paro_constraints_function_set,
+            create_paro_databases_function_set, create_paro_graph_statistics_function_set,
+            create_paro_indexes_function_set, create_paro_logs_function_set,
+            create_paro_memory_function_set, create_paro_optimizers_function_set,
+            create_paro_pg_cursors_function_set, create_paro_pg_prepared_statements_function_set,
+            create_paro_pg_settings_function_set, create_paro_property_graphs_function_set,
+            create_paro_schemas_function_set, create_paro_search_metrics_function_set,
+            create_paro_storage_info_function_set, create_paro_tables_function_set,
+            create_paro_temporary_files_function_set, create_paro_views_function_set,
+            create_pragma_database_size_function_set,
         };
         use paro_function::table::unnest::create_unnest_function_set;
 
@@ -394,6 +395,7 @@ impl DefaultTableFunctionGenerator {
             create_paro_schemas_function_set(),
             create_paro_tables_function_set(),
             create_paro_columns_function_set(),
+            create_paro_constraints_function_set(),
             create_paro_views_function_set(),
             create_paro_indexes_function_set(),
             create_paro_pg_settings_function_set(),

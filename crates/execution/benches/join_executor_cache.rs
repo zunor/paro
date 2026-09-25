@@ -53,15 +53,18 @@ fn bench_state() -> &'static BenchState {
                 paro_common::test_utils::test_allocator(),
             ),
             join_key_exprs: vec![
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
             ],
             any_match_input: single_row_chunk(3, 2),
-            any_match_expr: Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::GreaterThan,
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
-            )),
+            any_match_expr: Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::GreaterThan,
+                    Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                    Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
+                )
+                .into(),
+            ),
         }
     })
 }

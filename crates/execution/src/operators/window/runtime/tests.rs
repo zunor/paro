@@ -14,38 +14,33 @@ use paro_planner::expression::{
     AggregateExpression, ColumnRefExpression, ConstantExpression, Expression, OrderByExpression,
     ReferenceExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
 };
-use paro_planner::operator::ColumnBinding;
+use paro_planner::logical::operator::ColumnBinding;
 
 use super::build_window_output_chunks;
 use crate::physical::specs::WindowSpec;
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, ty))
+    Expression::Reference(ReferenceExpression::new(index, ty).into())
 }
 
 fn column_ref(index: usize, ty: LogicalType) -> Expression {
-    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(7, index), ty))
+    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(7, index), ty).into())
 }
 
 fn int_constant(value: i32) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Integer(value),
-        LogicalType::Integer,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+    )
 }
 
 fn bigint_constant(value: i64) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::BigInt(value),
-        LogicalType::BigInt,
-    ))
+    Expression::Constant(ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into())
 }
 
 fn null_bigint_constant() -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Null(LogicalType::BigInt),
-        LogicalType::BigInt,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Null(LogicalType::BigInt), LogicalType::BigInt).into(),
+    )
 }
 
 fn rank_over(partition_idx: usize, order_idx: usize) -> WindowExpression {
@@ -324,7 +319,7 @@ fn window_breaker_uses_bound_decimal_min_kernel() {
 }
 
 #[test]
-fn sorted_window_fallback_recomputes_ordered_aggregate_frames_with_bound_kernel() {
+fn sorted_window_evaluates_ordered_aggregate_frames_with_bound_kernel() {
     let (sum, _) = get_sum_function()
         .bind(&[LogicalType::Integer])
         .expect("integer SUM binding");
@@ -356,6 +351,258 @@ fn sorted_window_fallback_recomputes_ordered_aggregate_frames_with_bound_kernel(
     assert_eq!(result.get_value(0), Value::BigInt(10));
     assert_eq!(result.get_value(1), Value::BigInt(30));
     assert_eq!(result.get_value(2), Value::BigInt(60));
+}
+
+#[test]
+fn append_only_frames_match_independent_recomputation_and_update_each_row_once() {
+    use super::{frame, WindowRowKey};
+    use paro_common::vector::Vector;
+    use paro_function::aggregate::{AggregateInputData, AggregateStateInput};
+    thread_local! { static UPDATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { static INPUT_BUFFERS: std::cell::RefCell<std::collections::BTreeSet<usize>> = const { std::cell::RefCell::new(std::collections::BTreeSet::new()) }; }
+    unsafe fn count_updates(
+        inputs: &[&Vector],
+        data: &AggregateInputData,
+        states: &AggregateStateInput,
+        count: usize,
+    ) {
+        UPDATED.with(|value| value.set(value.get() + count));
+        INPUT_BUFFERS.with(|buffers| {
+            buffers
+                .borrow_mut()
+                .insert(inputs[0].flat_data::<i32>() as usize);
+        });
+        let (sum, _) = get_sum_function().bind(&[LogicalType::Integer]).unwrap();
+        (sum.update)(inputs, data, states, count);
+    }
+    let (mut sum, _) = get_sum_function().bind(&[LogicalType::Integer]).unwrap();
+    sum.update = count_updates;
+    let expression = WindowExpression::aggregate(
+        AggregateExpression::new(
+            sum,
+            vec![reference(0, LogicalType::Integer)],
+            LogicalType::BigInt,
+        ),
+        vec![],
+        vec![],
+        WindowFrame::default(),
+    );
+    let values: Vec<_> = (0..VECTOR_SIZE)
+        .map(|i| {
+            if i % 13 == 0 {
+                Value::Null(LogicalType::Integer)
+            } else {
+                Value::Integer(i as i32)
+            }
+        })
+        .collect();
+    let chunks = vec![
+        value_order_input_chunk(&values, &vec![0; VECTOR_SIZE]),
+        value_order_input_chunk(&[Value::Integer(7)], &[1]),
+    ];
+    let keys: Vec<_> = chunks
+        .iter()
+        .enumerate()
+        .flat_map(|(chunk_idx, chunk)| {
+            (0..chunk.size()).map(move |row_idx| WindowRowKey { chunk_idx, row_idx })
+        })
+        .collect();
+    let ranges = vec![0..0, 0..1, 0..3, 0..3, 0..keys.len()];
+    let expected: Vec<_> = ranges
+        .iter()
+        .map(|range| {
+            frame::aggregate_window_value(
+                &chunks,
+                &keys,
+                range.clone(),
+                &expression,
+                test_allocator(),
+            )
+            .unwrap()
+        })
+        .collect();
+    UPDATED.with(|value| value.set(0));
+    INPUT_BUFFERS.with(|buffers| buffers.borrow_mut().clear());
+    let mut actual = Vec::new();
+    frame::visit_append_only_aggregate_frames(
+        &chunks,
+        &keys,
+        ranges,
+        &expression,
+        test_allocator(),
+        |_, value| {
+            actual.push(value);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(UPDATED.with(|value| value.get()), keys.len());
+    // Chunk's reset contract swaps its active and spare vectors. The number
+    // of backing buffers is fixed at two, independent of the frame count.
+    assert_eq!(INPUT_BUFFERS.with(|buffers| buffers.borrow().len()), 2);
+    assert!(frame::visit_append_only_aggregate_frames(
+        &chunks,
+        &keys,
+        [0..3, 1..4],
+        &expression,
+        test_allocator(),
+        |_, _| Ok(())
+    )
+    .is_err());
+    assert!(frame::visit_append_only_aggregate_frames(
+        &chunks,
+        &keys,
+        [0..3, 0..2],
+        &expression,
+        test_allocator(),
+        |_, _| Ok(())
+    )
+    .is_err());
+}
+
+#[test]
+fn append_only_frames_destroy_state_on_output_error() {
+    use super::{frame, WindowRowKey};
+    use paro_common::vector::Vector;
+    use paro_function::aggregate::AggregateInputData;
+    thread_local! { static DESTROYED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    unsafe fn destroy(_: &Vector, _: &AggregateInputData, count: usize) {
+        DESTROYED.with(|value| value.set(value.get() + count));
+    }
+    let (mut sum, _) = get_sum_function().bind(&[LogicalType::Integer]).unwrap();
+    sum.destructor = Some(destroy);
+    let expression = WindowExpression::aggregate(
+        AggregateExpression::new(
+            sum,
+            vec![reference(0, LogicalType::Integer)],
+            LogicalType::BigInt,
+        ),
+        vec![],
+        vec![],
+        WindowFrame::default(),
+    );
+    DESTROYED.with(|value| value.set(0));
+    let error = frame::visit_append_only_aggregate_frames(
+        &[value_order_input_chunk(&[Value::Integer(1)], &[1])],
+        &[WindowRowKey {
+            chunk_idx: 0,
+            row_idx: 0,
+        }],
+        std::iter::once(0..1),
+        &expression,
+        test_allocator(),
+        |_, _| Err(paro_common::error::internal("output failed")),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("output failed"));
+    assert_eq!(DESTROYED.with(|value| value.get()), 1);
+}
+
+#[test]
+fn append_only_workspace_owns_varlen_values_across_resets() {
+    use super::{frame, WindowRowKey};
+    let ty = LogicalType::Varchar;
+    let (function, _) = get_min_function().bind(std::slice::from_ref(&ty)).unwrap();
+    let expression = WindowExpression::aggregate(
+        AggregateExpression::new(function, vec![reference(0, ty.clone())], ty.clone()),
+        vec![],
+        vec![],
+        WindowFrame::default(),
+    );
+    let values = [
+        Value::Null(ty.clone()),
+        Value::Varchar("z".repeat(128)),
+        Value::Varchar("a".repeat(256)),
+        Value::Null(ty.clone()),
+    ];
+    let mut chunk = Chunk::try_initialize(&[ty], values.len(), test_allocator()).unwrap();
+    chunk.try_set_cardinality(values.len()).unwrap();
+    for (row, value) in values.iter().enumerate() {
+        chunk.set_value(0, row, value).unwrap();
+    }
+    let keys = (0..values.len())
+        .map(|row_idx| WindowRowKey {
+            chunk_idx: 0,
+            row_idx,
+        })
+        .collect::<Vec<_>>();
+    let mut actual = Vec::new();
+    frame::visit_append_only_aggregate_frames(
+        &[chunk],
+        &keys,
+        (1..=values.len()).map(|end| 0..end),
+        &expression,
+        test_allocator(),
+        |_, value| {
+            actual.push(value);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        actual,
+        vec![
+            values[0].clone(),
+            values[1].clone(),
+            values[2].clone(),
+            values[2].clone()
+        ]
+    );
+}
+
+#[test]
+fn append_only_filtered_range_peers_preserve_empty_and_non_null_prefixes() {
+    let (sum, _) = get_sum_function().bind(&[LogicalType::Integer]).unwrap();
+    let aggregate = AggregateExpression::new(
+        sum,
+        vec![reference(0, LogicalType::Integer)],
+        LogicalType::BigInt,
+    )
+    .with_filter(Some(reference(2, LogicalType::Boolean)));
+    let expression = WindowExpression::aggregate(
+        aggregate,
+        vec![],
+        vec![OrderByExpression {
+            expression: reference(1, LogicalType::Integer),
+            ascending: true,
+            nulls_first: false,
+        }],
+        WindowFrame::default(),
+    );
+    let types = vec![
+        LogicalType::Integer,
+        LogicalType::Integer,
+        LogicalType::Boolean,
+    ];
+    let mut input = Chunk::try_initialize(&types, 5, test_allocator()).unwrap();
+    input.try_set_cardinality(5).unwrap();
+    for (row, (order, filter)) in [
+        (1, Value::Boolean(false)),
+        (2, Value::Null(LogicalType::Boolean)),
+        (3, Value::Boolean(true)),
+        (3, Value::Boolean(true)),
+        (4, Value::Boolean(false)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        input.set_value(0, row, &Value::Integer(10)).unwrap();
+        input.set_value(1, row, &Value::Integer(order)).unwrap();
+        input.set_value(2, row, &filter).unwrap();
+    }
+    let output = build_window_output_chunks(
+        &window_spec_for_types(vec![expression], types),
+        &[input],
+        test_allocator(),
+    )
+    .unwrap();
+    let result = output[0].column(3).unwrap();
+    assert_eq!(result.get_value(0), Value::Null(LogicalType::BigInt));
+    assert_eq!(result.get_value(1), Value::Null(LogicalType::BigInt));
+    for row in 2..5 {
+        assert_eq!(result.get_value(row), Value::BigInt(20));
+    }
 }
 
 #[test]
@@ -455,7 +702,7 @@ fn window_breaker_rejects_non_direct_sort_expressions() {
         Vec::new(),
         vec![int_constant(1)],
         vec![OrderByExpression {
-            expression: Expression::Window(rank_over(0, 1)),
+            expression: Expression::Window(rank_over(0, 1).into()),
             ascending: true,
             nulls_first: false,
         }],
@@ -475,7 +722,7 @@ fn window_breaker_rejects_non_direct_frame_offsets() {
         WindowFunction::last_value(LogicalType::Integer),
         vec![reference(0, LogicalType::Integer)],
         rows_frame(
-            WindowFrameBound::Offset(Box::new(Expression::Window(rank_over(0, 1)))),
+            WindowFrameBound::Offset(Box::new(Expression::Window(rank_over(0, 1).into()))),
             true,
             WindowFrameBound::CurrentRow,
             false,
@@ -770,10 +1017,10 @@ fn lead_and_lag_apply_ignore_nulls_while_navigating_the_partition() {
 fn rows_frame_offsets_reject_null_and_negative_values() {
     for (offset, expected) in [
         (
-            Expression::Constant(ConstantExpression::new(
-                Value::Null(LogicalType::Integer),
-                LogicalType::Integer,
-            )),
+            Expression::Constant(
+                ConstantExpression::new(Value::Null(LogicalType::Integer), LogicalType::Integer)
+                    .into(),
+            ),
             "window frame offset must not be null",
         ),
         (int_constant(-1), "window frame offset must not be negative"),

@@ -3,26 +3,37 @@
 
 //! Query optimizer passes and supporting infrastructure.
 
-pub mod context;
-pub mod cost_model;
-pub mod optimizer;
-pub mod optimizer_type;
-pub(crate) mod pipeline_passes;
-pub mod profiler;
-pub mod rewriter;
+pub(crate) mod context;
+pub(crate) mod cost;
+mod optimizer;
+pub(crate) mod physical;
+pub(crate) mod statement;
 pub(crate) mod verify;
 
-pub mod aggregate;
-pub mod column;
-pub mod cte;
-pub mod expression;
-pub mod external;
-pub mod filter;
-pub mod graph;
-pub mod join;
-pub mod join_order;
-pub mod limit;
-pub mod rules;
-pub mod search;
-pub mod statistics;
-pub mod subquery;
+pub use optimizer::{OptimizedStatement, Optimizer};
+
+pub(crate) mod estimate;
+pub(crate) mod region;
+pub(crate) mod rewrite;
+
+pub(crate) mod diagnostics;
+
+pub use diagnostics::work::begin as begin_optimizer_observation;
+
+/// Explicit test/benchmark entry points, absent from normal dependencies.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub use crate::diagnostics::profile::{
+        publish_optimizer_profile_snapshot, OptimizerComponent, OptimizerProfileSnapshot,
+        OptimizerProfileSnapshotEntry,
+    };
+    pub use crate::physical::{PhysicalBuildContext, PhysicalPlanBuilder};
+    pub use crate::rewrite::expr::rewriter::ExpressionRewriter;
+    pub use crate::rewrite::expr::rules::expression_matcher::{
+        AnyExpressionMatcher, ExpressionMatcher,
+    };
+    pub use crate::rewrite::expr::rules::rule::{Rule, RuleResult};
+}
+
+#[cfg(test)]
+mod tests;

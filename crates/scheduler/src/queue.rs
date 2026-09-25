@@ -36,8 +36,6 @@ pub struct ConcurrentTaskQueue {
     state: Mutex<QueueState>,
     /// Number of tasks currently in the queue
     tasks_in_queue: AtomicUsize,
-    /// Mutex for the condvar
-    lock: Mutex<()>,
     /// Condvar to wake up sleeping workers
     cv: Condvar,
 }
@@ -48,7 +46,6 @@ impl ConcurrentTaskQueue {
         Self {
             state: Mutex::new(QueueState::default()),
             tasks_in_queue: AtomicUsize::new(0),
-            lock: Mutex::new(()),
             cv: Condvar::new(),
         }
     }
@@ -69,9 +66,9 @@ impl ConcurrentTaskQueue {
         if was_empty {
             state.ready_producers.push_back(producer_id);
         }
+        self.tasks_in_queue.fetch_add(1, Ordering::SeqCst);
         drop(state);
 
-        self.tasks_in_queue.fetch_add(1, Ordering::SeqCst);
         self.cv.notify_one();
     }
 
@@ -96,9 +93,9 @@ impl ConcurrentTaskQueue {
         if was_empty {
             state.ready_producers.push_back(producer_id);
         }
+        self.tasks_in_queue.fetch_add(count, Ordering::SeqCst);
         drop(state);
 
-        self.tasks_in_queue.fetch_add(count, Ordering::SeqCst);
         if count == 1 {
             self.cv.notify_one();
         } else {
@@ -225,11 +222,15 @@ impl ConcurrentTaskQueue {
     ///
     /// Returns true if a task might be available, false if timed out.
     pub fn wait_for_task(&self, timeout: Duration) -> bool {
-        let mut guard = self.lock.lock();
-        if self.tasks_in_queue.load(Ordering::SeqCst) > 0 {
+        // The queue predicate and the condvar wait must use the same mutex.
+        // Otherwise enqueue can notify between the empty check and the worker
+        // actually sleeping, leaving runnable work behind until the timeout.
+        let mut state = self.state.lock();
+        if !state.ready_producers.is_empty() {
             return true;
         }
-        !self.cv.wait_for(&mut guard, timeout).timed_out()
+        let wait = self.cv.wait_for(&mut state, timeout);
+        !wait.timed_out() || !state.ready_producers.is_empty()
     }
 
     /// Signal all waiting workers.

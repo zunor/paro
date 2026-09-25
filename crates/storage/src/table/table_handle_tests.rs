@@ -1102,7 +1102,7 @@ fn tablet_reader_get_by_rowids_resolves_partial_update_columns() {
     assert_eq!(chunk.column(1).unwrap().get_i32(0), Some(20));
     assert_eq!(chunk.column(2).unwrap().get_i32(0), Some(222));
 
-    let rowid_reader = crate::tablet::TabletRowIdReader::new(
+    let mut rowid_reader = crate::tablet::TabletRowIdReader::new(
         table.tablet(),
         table
             .tablet()
@@ -1112,9 +1112,7 @@ fn tablet_reader_get_by_rowids_resolves_partial_update_columns() {
         Arc::new(paro_common::allocator::default_allocator()),
     )
     .unwrap();
-    let chunk = rowid_reader
-        .get_by_rowids(&[row_ids_after[&2]], &[0, 1, 2])
-        .unwrap();
+    let chunk = rowid_reader.get_by_rowids(&[row_ids_after[&2]]).unwrap();
     assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(2));
     assert_eq!(chunk.column(1).unwrap().get_i32(0), Some(20));
     assert_eq!(chunk.column(2).unwrap().get_i32(0), Some(222));
@@ -3171,8 +3169,7 @@ fn fulltext_tail_watermark_does_not_disable_exact_fallback() {
             1,
             "simple",
             None,
-            None,
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
             table.max_version(),
             &crate::search::SearchReadOptions::ungoverned(),
         )
@@ -3237,8 +3234,7 @@ fn fulltext_topk_mixed_artifact_tail_uses_unified_generation_stats() {
             2,
             "simple",
             None,
-            None,
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
             table.max_version(),
             &crate::search::SearchReadOptions::ungoverned(),
         )
@@ -3257,7 +3253,7 @@ fn fulltext_topk_mixed_artifact_tail_uses_unified_generation_stats() {
 }
 
 #[test]
-fn fulltext_topk_missing_generation_stats_records_degraded_metric() {
+fn fulltext_topk_uses_visible_corpus_not_generation_statistics() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
     register_fulltext_definition(&table, 1, "simple");
     table
@@ -3289,16 +3285,20 @@ fn fulltext_topk_missing_generation_stats_records_degraded_metric() {
         1,
         "simple",
         None,
-        None,
-        FullTextScoreMode::Bm25,
+        FullTextScoreMode::CorpusBm25V1,
     )
     .open(snapshot)
     .unwrap();
-    let chunks = drain_search_cursor(&table, opened, &[0], false, 1, 4).unwrap();
-    assert_eq!(collect_i32_column(&chunks, 0), vec![1]);
-
+    let chunks = drain_search_cursor(&table, opened, &[0], true, 1, 4).unwrap();
+    let rows = collect_i32_score_pairs(&chunks, 0, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, 1);
+    let expected = crate::index::fulltext::bm25::Bm25::default().score(1.0, 2.0, 1.5, 1.0, 2.0);
+    assert_eq!(rows[0].1.to_bits(), expected.to_bits());
+    // Missing generation statistics are no longer a degraded scoring mode:
+    // the visible corpus is the single authority, including for indexed rows.
     let after = fulltext_degraded_score_metric_count(table_id, reason);
-    assert_eq!(after, before + 1);
+    assert_eq!(after, before);
 }
 
 #[test]

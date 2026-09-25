@@ -12,8 +12,6 @@ use paro_common::vector::Vector;
 use paro_context::test_support::TestStatementContextBuilder;
 use paro_execution::explain::profiler::OperatorProfiler;
 use paro_execution::memory_runtime::QueryMemoryPool;
-use paro_execution::physical::properties::PipelineProperties;
-use paro_execution::physical::row_type::RowType;
 use paro_execution::pipeline::graph::PipelineId;
 use paro_execution::pipeline::handles::{BreakerHandleCatalogBuilder, BreakerHandleKind};
 use paro_execution::runtime::{
@@ -24,6 +22,8 @@ use paro_execution::runtime::{
     WakeGeneration,
 };
 use paro_execution::thread_context::ThreadContext;
+use paro_planner::physical::properties::PipelineProperties;
+use paro_planner::physical::row_type::RowType;
 
 const SOURCE_CHUNKS: usize = 16_384;
 

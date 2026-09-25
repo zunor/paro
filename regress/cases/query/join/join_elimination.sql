@@ -83,6 +83,23 @@ SELECT l.id
 FROM join_elim_left AS l
 LEFT JOIN join_elim_right_nonunique AS r ON l.id = r.id;
 
+-- The diagnostics query must observe the preceding compilation rather than
+-- replacing its session snapshot with its own empty stage profile.
+EXPLAIN
+SELECT l.id, l.payload
+FROM join_elim_left AS l
+LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
+
+SELECT name, kind, metric_unit, metric_value > 0 AS observed
+FROM paro_optimizers()
+WHERE name IN (
+    'semantic_normalization',
+    'region_optimization',
+    'physical_selection',
+    'physical_extraction'
+)
+ORDER BY kind, name;
+
 -- @teardown
 DROP TABLE IF EXISTS join_elim_left;
 -- @teardown

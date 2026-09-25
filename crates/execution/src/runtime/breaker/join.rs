@@ -13,7 +13,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::MemoryAccountingClass;
 use paro_common::memory::{MemoryAccountingContext, MemoryError, MemoryResult};
 use paro_common::types::LogicalType;
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{JoinCondition, JoinType};
 use paro_storage::buffer::{BufferPool, MemoryTag};
 use paro_storage::index::{ColumnId, PredicateTree};
 use paro_storage::row::{
@@ -160,9 +160,26 @@ impl JoinBuildHandle {
         conditions: Vec<JoinCondition>,
         build_types: Vec<LogicalType>,
         join_type: JoinType,
+        runtime_filter_enabled: bool,
         memory: MemoryAccountingContext,
     ) -> Result<Arc<JoinHashTable>> {
         let build_output_count = build_types.len();
+        let runtime_filter_key_types = runtime_filter_enabled.then(|| {
+            conditions
+                .iter()
+                .map(|condition| condition.right.return_type())
+                .collect::<Vec<_>>()
+        });
+        let runtime_filter = runtime_filter_enabled
+            .then(|| {
+                paro_planner::physical::RuntimeFilterResourceContract::for_keys(
+                    runtime_filter_key_types
+                        .as_deref()
+                        .expect("enabled runtime filter has key types"),
+                    1,
+                )
+            })
+            .transpose()?;
         self.initialize_table_with_output_count(
             buffer_pool,
             allocator,
@@ -171,6 +188,9 @@ impl JoinBuildHandle {
             build_output_count,
             join_type,
             false,
+            runtime_filter
+                .as_ref()
+                .zip(runtime_filter_key_types.as_deref()),
             memory,
         )
     }
@@ -184,23 +204,27 @@ impl JoinBuildHandle {
         build_output_count: usize,
         join_type: JoinType,
         build_keys_unique: bool,
+        runtime_filter: Option<(
+            &paro_planner::physical::RuntimeFilterResourceContract,
+            &[LogicalType],
+        )>,
         memory: MemoryAccountingContext,
     ) -> Result<Arc<JoinHashTable>> {
-        let runtime_filter_key_types = conditions
-            .iter()
-            .map(|condition| condition.right.return_type())
-            .collect::<Vec<_>>();
-        self.initialize_runtime_filter_builder(
-            &runtime_filter_key_types,
-            memory.with_class(MemoryAccountingClass::Metadata),
-        );
+        if let Some((runtime_filter, runtime_filter_key_types)) = runtime_filter {
+            self.initialize_runtime_filter_builder(
+                runtime_filter_key_types,
+                runtime_filter,
+                memory.with_class(MemoryAccountingClass::Metadata),
+            );
+        }
         let mut state = self.table.lock();
         match &*state {
             JoinHashTableState::Live(table) => return Ok(Arc::clone(table)),
             JoinHashTableState::Released => {
-                return Err(paro_error::internal(
-                    "hash join table cannot be reinitialized after its consumers finished",
-                ));
+                return Err(paro_error::internal(format!(
+                    "hash join table {} cannot be reinitialized after its consumers {:?} finished (producer {:?})",
+                    self.metadata.id.index(), self.metadata.consumers, self.metadata.producer
+                )));
             }
             JoinHashTableState::Uninitialized => {}
         }
@@ -265,12 +289,13 @@ impl JoinBuildHandle {
     pub fn initialize_runtime_filter_builder(
         &self,
         key_types: &[LogicalType],
+        contract: &paro_planner::physical::RuntimeFilterResourceContract,
         memory: MemoryAccountingContext,
     ) {
         let mut builder = self.runtime_filter_builder.lock();
         if builder.is_none() {
-            *builder = Some(JoinRuntimeFilterBuilder::empty_with_memory(
-                key_types, memory,
+            *builder = Some(JoinRuntimeFilterBuilder::empty_global_with_memory(
+                key_types, contract, memory,
             ));
         }
     }
@@ -295,10 +320,10 @@ impl JoinBuildHandle {
         if self.runtime_filter.get().is_some() {
             return Ok(());
         }
-        let filter = builder
-            .take()
-            .unwrap_or_else(|| JoinRuntimeFilterBuilder::empty(&[]))
-            .freeze();
+        let Some(builder) = builder.take() else {
+            return Ok(());
+        };
+        let filter = builder.freeze();
         // The builder lock serializes concurrent finalize/reclaim publishers,
         // so ownership can move into the immutable filter without cloning it.
         self.runtime_filter.set(filter).map_err(|_| {
@@ -319,6 +344,12 @@ impl JoinBuildHandle {
 
     pub fn runtime_filter_ready(&self) -> bool {
         self.runtime_filter.get().is_some()
+    }
+
+    pub fn runtime_filter_key_is_exact(&self, build_key_index: usize) -> bool {
+        self.runtime_filter
+            .get()
+            .is_some_and(|filter| filter.key_is_exact(build_key_index))
     }
 
     pub fn enable_build_reclaim(&self) {

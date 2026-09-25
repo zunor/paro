@@ -42,6 +42,9 @@ use super::handles::{BreakerHandleCatalog, BreakerHandleKind};
 
 #[derive(Debug, Clone)]
 pub enum StatementProgram {
+    /// Immutable physical alternatives retained until a query has entered
+    /// workload admission and owns its actual memory capacity.
+    Physical(paro_planner::physical::CompiledPhysicalPlan),
     Pipeline {
         plan: Arc<PhysicalPlan>,
         graph: Arc<PipelineGraph>,
@@ -49,9 +52,63 @@ pub enum StatementProgram {
     },
     ExplainAnalyze {
         target: Box<StatementProgram>,
-        spec: paro_planner::operator::ExplainSpec,
+        spec: paro_planner::logical::operator::ExplainSpec,
     },
     Utility(UtilityProgram),
+}
+
+/// The exact selection made by artifact admission.  This is intentionally
+/// not part of the compiled artifact: it only exists after resources and
+/// dependencies have been checked for this execution.
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionSelection {
+    pub physical_fingerprint: paro_planner::physical::Fingerprint,
+    pub resources: paro_planner::physical::ExecutionResourceContract,
+}
+
+/// A resource-selected program whose physical image has not been lowered yet.
+/// Selection is an admission fact; lowering is a separate fallible lifecycle
+/// edge so a lowering error cannot be reported as if no plan had been chosen.
+#[derive(Debug)]
+pub enum SelectedStatementProgram {
+    Physical {
+        plan: PhysicalPlan,
+        selection: AdmissionSelection,
+    },
+    ExplainAnalyze {
+        target: Box<SelectedStatementProgram>,
+        spec: paro_planner::logical::operator::ExplainSpec,
+    },
+    Ready(StatementProgram),
+}
+
+impl SelectedStatementProgram {
+    pub fn selection(&self) -> Option<AdmissionSelection> {
+        match self {
+            Self::Physical { selection, .. } => Some(*selection),
+            Self::ExplainAnalyze { target, .. } => target.selection(),
+            Self::Ready(_) => None,
+        }
+    }
+
+    pub fn execution_resources(&self) -> Option<paro_planner::physical::ExecutionResourceContract> {
+        match self {
+            Self::Physical { plan, .. } => plan.execution_resources,
+            Self::ExplainAnalyze { target, .. } => target.execution_resources(),
+            Self::Ready(program) => program.execution_resources(),
+        }
+    }
+
+    pub fn lower(self) -> Result<StatementProgram> {
+        match self {
+            Self::Physical { plan, .. } => StatementProgram::from_physical_plan(plan),
+            Self::ExplainAnalyze { target, spec } => Ok(StatementProgram::ExplainAnalyze {
+                target: Box::new(target.lower()?),
+                spec,
+            }),
+            Self::Ready(program) => Ok(program),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -180,6 +237,22 @@ impl UtilityProgram {
 }
 
 impl StatementProgram {
+    pub fn expected_grant_class(&self) -> Option<u32> {
+        match self {
+            Self::Physical(plan) => Some(plan.grant.id.0),
+            Self::ExplainAnalyze { target, .. } => target.expected_grant_class(),
+            Self::Pipeline { .. } | Self::Utility(_) => None,
+        }
+    }
+
+    pub fn execution_resources(&self) -> Option<paro_planner::physical::ExecutionResourceContract> {
+        match self {
+            Self::Pipeline { plan, .. } => plan.execution_resources,
+            Self::ExplainAnalyze { target, .. } => target.execution_resources(),
+            Self::Physical(_) | Self::Utility(_) => None,
+        }
+    }
+
     pub fn pipeline(
         plan: Arc<PhysicalPlan>,
         graph: Arc<PipelineGraph>,
@@ -193,6 +266,7 @@ impl StatementProgram {
     }
 
     pub fn from_physical_plan(plan: PhysicalPlan) -> Result<Self> {
+        paro_planner::physical::PhysicalPlanVerifier::verify(&plan)?;
         if let crate::physical::specs::PhysicalNodeKind::Utility(spec) = &plan.node(plan.root).kind
         {
             return Ok(Self::Utility(UtilityProgram { spec: spec.clone() }));
@@ -205,6 +279,126 @@ impl StatementProgram {
         };
         let programs = PipelineProgramBuilder::default().build_program_set(graph.as_ref())?;
         Ok(Self::pipeline(plan, graph, programs))
+    }
+
+    pub fn from_compiled_physical_plan<F>(
+        artifact: paro_planner::physical::CompiledPhysicalPlan,
+        available_memory_bytes: u64,
+        available_parallel_tasks: u16,
+        available_external_worker_slots: u16,
+        dependency_available: &F,
+    ) -> Result<Self>
+    where
+        F: Fn(&PhysicalPlan) -> bool,
+    {
+        artifact.verify()?;
+        let mut admitted = artifact.admit(
+            available_memory_bytes,
+            available_parallel_tasks,
+            available_external_worker_slots,
+            dependency_available,
+        )?;
+        admitted.plan.execution_resources = Some(admitted.resources);
+        // Retain the optimizer's sharing proof. The reservation selects an
+        // operating point; it does not change which points the winner was
+        // costed for. Physical verification checks root and child contracts.
+        Self::from_physical_plan(admitted.plan)
+    }
+
+    pub fn deferred_physical_plan(
+        artifact: paro_planner::physical::CompiledPhysicalPlan,
+    ) -> Result<Self> {
+        artifact.verify()?;
+        Ok(Self::Physical(artifact))
+    }
+
+    /// Resolve an immutable compiled image against execution-time resources.
+    /// Selection is deterministic and algorithms remain exactly those proved
+    /// by the optimizer; only lowering of the admitted variant happens here.
+    pub fn admit_for_execution<F>(
+        &self,
+        available_memory_bytes: u64,
+        available_parallel_tasks: u16,
+        available_external_worker_slots: u16,
+        dependency_available: &F,
+    ) -> Result<Self>
+    where
+        F: Fn(&PhysicalPlan) -> bool,
+    {
+        self.admit_for_execution_with_selection(
+            available_memory_bytes,
+            available_parallel_tasks,
+            available_external_worker_slots,
+            dependency_available,
+        )
+        .map(|(program, _)| program)
+    }
+
+    pub fn admit_for_execution_with_selection<F>(
+        &self,
+        available_memory_bytes: u64,
+        available_parallel_tasks: u16,
+        available_external_worker_slots: u16,
+        dependency_available: &F,
+    ) -> Result<(Self, Option<AdmissionSelection>)>
+    where
+        F: Fn(&PhysicalPlan) -> bool,
+    {
+        let selected = self.select_for_execution(
+            available_memory_bytes,
+            available_parallel_tasks,
+            available_external_worker_slots,
+            dependency_available,
+        )?;
+        let selection = selected.selection();
+        Ok((selected.lower()?, selection))
+    }
+
+    /// Select an executable physical alternative without lowering it.  The
+    /// executor uses this boundary to publish the actual selection before a
+    /// fallible image construction begins.
+    pub fn select_for_execution<F>(
+        &self,
+        available_memory_bytes: u64,
+        available_parallel_tasks: u16,
+        available_external_worker_slots: u16,
+        dependency_available: &F,
+    ) -> Result<SelectedStatementProgram>
+    where
+        F: Fn(&PhysicalPlan) -> bool,
+    {
+        match self {
+            Self::Physical(artifact) => {
+                artifact.verify()?;
+                let mut admitted = artifact.admit(
+                    available_memory_bytes,
+                    available_parallel_tasks,
+                    available_external_worker_slots,
+                    dependency_available,
+                )?;
+                let selection = AdmissionSelection {
+                    physical_fingerprint: admitted.physical_fingerprint,
+                    resources: admitted.resources,
+                };
+                admitted.plan.execution_resources = Some(admitted.resources);
+                Ok(SelectedStatementProgram::Physical {
+                    plan: admitted.plan,
+                    selection,
+                })
+            }
+            Self::ExplainAnalyze { target, spec } => Ok(SelectedStatementProgram::ExplainAnalyze {
+                target: Box::new(target.select_for_execution(
+                    available_memory_bytes,
+                    available_parallel_tasks,
+                    available_external_worker_slots,
+                    dependency_available,
+                )?),
+                spec: *spec,
+            }),
+            Self::Pipeline { .. } | Self::Utility(_) => {
+                Ok(SelectedStatementProgram::Ready(self.clone()))
+            }
+        }
     }
 }
 
@@ -265,9 +459,11 @@ impl PipelineProgramBuilder {
         next_operator_id: &mut usize,
     ) -> Result<PipelineProgram> {
         validate_handles(spec, handles)?;
+        let lineage = &spec.properties.operator_lineage;
         let source = self.registry.source_slot(
             &spec.source,
-            RuntimeOperatorOrigin::new(spec.id, OperatorRole::Source, RuntimeRoleOrdinal::new(0)),
+            RuntimeOperatorOrigin::new(spec.id, OperatorRole::Source, RuntimeRoleOrdinal::new(0))
+                .with_logical_plan_node(lineage.source),
             next_runtime_operator_id(next_operator_id),
         )?;
         let transforms = spec
@@ -281,7 +477,8 @@ impl PipelineProgramBuilder {
                         spec.id,
                         OperatorRole::Transform,
                         RuntimeRoleOrdinal::new(idx),
-                    ),
+                    )
+                    .with_logical_plan_node(lineage.transform(idx)),
                     next_runtime_operator_id(next_operator_id),
                 )
             })
@@ -289,7 +486,8 @@ impl PipelineProgramBuilder {
             .into_boxed_slice();
         let sink = self.registry.sink_slot(
             &spec.sink,
-            RuntimeOperatorOrigin::new(spec.id, OperatorRole::Sink, RuntimeRoleOrdinal::new(0)),
+            RuntimeOperatorOrigin::new(spec.id, OperatorRole::Sink, RuntimeRoleOrdinal::new(0))
+                .with_logical_plan_node(lineage.sink),
             next_runtime_operator_id(next_operator_id),
         )?;
         let scratch = scratch_layout_for(spec, handles)?;
@@ -385,6 +583,7 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     anti_join_mode: spec.anti_join_mode,
+                    mark_semantics: spec.mark_semantics,
                     key_conditions: spec.key_conditions.clone(),
                     build_residual_conditions: spec.build_residual_conditions.clone(),
                     probe_residual_count: spec.probe_residual_count,
@@ -392,6 +591,7 @@ impl OperatorRuntimeRegistry {
                     build_output_count: spec.build_output_count,
                     build_payload_types: spec.build_payload_types.clone(),
                     left_projection: spec.left_projection.clone(),
+                    output_permutation: spec.output_permutation.clone(),
                     output_types: spec.output_types.clone(),
                     reduction_cascade: spec.reduction_cascade.clone(),
                 })
@@ -401,6 +601,7 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     left_output_types: spec.left_output_types.clone(),
+                    output_permutation: spec.output_permutation.clone(),
                     output_types: spec.output_types.clone(),
                     reduction_cascade: spec.reduction_cascade.clone(),
                 })
@@ -479,12 +680,15 @@ impl OperatorRuntimeRegistry {
             TransformSpec::HashJoinProbe(spec) => {
                 TransformExec::HashJoinProbe(HashJoinProbeTransformExec {
                     handle: HandleRef::new(spec.handle),
+                    covering_runtime_filter_key: spec.covering_runtime_filter_key,
                     join_type: spec.join_type,
                     anti_join_mode: spec.anti_join_mode,
+                    mark_semantics: spec.mark_semantics,
                     key_conditions: spec.key_conditions.clone(),
                     build_residual_conditions: spec.build_residual_conditions.clone(),
                     probe_residual_count: spec.probe_residual_count,
                     left_projection: spec.left_projection.clone(),
+                    output_permutation: spec.output_permutation.clone(),
                     output_types: spec.output_types.clone(),
                     reduction_cascade: spec.reduction_cascade.clone(),
                 })
@@ -531,7 +735,12 @@ impl OperatorRuntimeRegistry {
                 TransformExec::StreamingWindow(StreamingWindowTransformExec { spec: spec.clone() })
             }
             TransformSpec::ExternalProject(spec) => {
-                TransformExec::ExternalProject(ExternalProjectTransformExec { spec: spec.clone() })
+                TransformExec::ExternalProject(ExternalProjectTransformExec {
+                    spec: spec.clone(),
+                    bridge: std::sync::Arc::new(
+                        crate::operators::external::runtime_bridge::ExternalRuntimeBridge::default_bridge(),
+                    ),
+                })
             }
             TransformSpec::GraphExpand(spec) => {
                 TransformExec::GraphExpand(GraphExpandTransformExec { spec: spec.clone() })
@@ -567,22 +776,25 @@ impl OperatorRuntimeRegistry {
             }
             SinkSpec::Materialize(spec) => SinkExec::Materialize(MaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
+                spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
             }),
             SinkSpec::CrossProductBuild(spec) => SinkExec::Materialize(MaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
+                spill_policy: spec.spill_policy,
             }),
             SinkSpec::HashJoinBuild(spec) => SinkExec::HashJoinBuild(HashJoinBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
                 join_type: spec.join_type,
                 build_keys_unique: spec.build_keys_unique,
                 build_time_integer_index: spec.build_time_integer_index.clone(),
+                runtime_filter: spec.runtime_filter.clone(),
                 key_conditions: spec.key_conditions.clone(),
                 residual_conditions: spec.residual_conditions.clone(),
                 build_projection: spec.build_projection.clone(),
                 build_output_count: spec.build_output_count,
                 grouped_reduction_channels: spec.grouped_reduction_channels,
                 build_payload_types: spec.build_payload_types.clone(),
-                force_external: spec.force_external,
+                spill_policy: spec.spill_policy,
             }),
             SinkSpec::HashAggregateBuild(spec) => {
                 SinkExec::HashAggregateBuild(HashAggregateBuildSinkExec {
@@ -609,7 +821,7 @@ impl OperatorRuntimeRegistry {
                 input_types: spec.input_types.clone(),
                 output_names: spec.output_names.clone(),
                 output_types: spec.output_types.clone(),
-                force_external: spec.force_external,
+                spill_policy: spec.spill_policy,
             }),
             SinkSpec::TopNBuild(spec) => SinkExec::TopNBuild(TopNBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
@@ -634,6 +846,7 @@ impl OperatorRuntimeRegistry {
             }
             SinkSpec::CteMaterialize(spec) => SinkExec::CteMaterialize(CteMaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
+                spill_policy: spec.spill_policy,
             }),
             SinkSpec::DelimCapture(spec) => SinkExec::DelimCapture(DelimCaptureSinkExec {
                 handle: HandleRef::new(spec.handle),
@@ -648,6 +861,9 @@ impl OperatorRuntimeRegistry {
             SinkSpec::ExternalTable(spec) => SinkExec::ExternalTable(ExternalTableSinkExec {
                 handle: HandleRef::new(spec.handle),
                 spec: spec.spec.clone(),
+                bridge: std::sync::Arc::new(
+                    crate::operators::external::runtime_bridge::ExternalRuntimeBridge::default_bridge(),
+                ),
             }),
             SinkSpec::Insert(spec) => SinkExec::Insert(InsertSinkExec {
                 spec: spec.spec.clone(),
@@ -853,13 +1069,13 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ConstantExpression, Expression, ReferenceExpression};
-    use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
+    use paro_planner::logical::operator::join::{AntiJoinMode, JoinCondition, JoinType};
 
     use crate::physical::properties::PipelineProperties;
     use crate::physical::row_type::RowType;
     use crate::physical::specs::{
         AggregateSpec, DeleteSpec, DummyScanSpec, FilterSpec, GraphExpandSpec, GraphScanSpec,
-        LimitSpec, ProjectSpec, ValuesSpec,
+        LimitSpec, OutputPermutation, ProjectSpec, ValuesSpec,
     };
     use crate::runtime::{OperatorRole, RuntimeRoleOrdinal};
 
@@ -918,14 +1134,15 @@ mod tests {
 
     fn join_condition() -> JoinCondition {
         JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )
     }
 
     fn empty_aggregate_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 0,
+            initial_lookup_hash_key_count: 0,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([]),
@@ -940,6 +1157,7 @@ mod tests {
             aggregate_orders: Box::new([]),
             post_reduction: None,
             having_filter: Box::new([]),
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
             perfect_hash: None,
             output_names: Box::new(["a".to_string()]),
             output_types: Box::new([LogicalType::Integer]),
@@ -948,7 +1166,9 @@ mod tests {
 
     fn order_by_first_column() -> paro_planner::binder::ir::OrderByNode {
         paro_planner::binder::ir::OrderByNode {
-            expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            expression: Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            ),
             ascending: true,
             nulls_first: false,
         }
@@ -957,6 +1177,7 @@ mod tests {
     fn topn_spec() -> crate::physical::specs::TopNSpec {
         crate::physical::specs::TopNSpec {
             orders: vec![order_by_first_column()].into_boxed_slice(),
+            projection_map: Box::new([0]),
             limit: 2,
             offset: 0,
             hnsw_options: Default::default(),
@@ -1010,7 +1231,7 @@ mod tests {
                 label: "KNOWS".to_string(),
                 property_column_ids: vec![],
             },
-            direction: paro_planner::operator::ExpandDirection::Forward,
+            direction: paro_planner::logical::operator::ExpandDirection::Forward,
             source_label: "Person".to_string(),
             edge_filter: None,
             target_filter: None,
@@ -1050,6 +1271,16 @@ mod tests {
                     table: test_table(),
                     row_id_index: 1,
                     is_full_table_delete: false,
+                    write: paro_planner::physical::WriteContract {
+                        target_relation: paro_planner::physical::BaseRelationId(0),
+                        target_object_id: 0,
+                        modified_columns: Default::default(),
+                        modified_key_columns: Default::default(),
+                        snapshot_version: 0,
+                        mutation_safety:
+                            paro_planner::physical::requirements::MutationSafetyRequirement::None,
+                        returning: paro_planner::physical::ReturningImageContract::CountOnly,
+                    },
                 },
             }),
             sink_sharing: SinkSharing::Exclusive,
@@ -1080,18 +1311,16 @@ mod tests {
                     projection_map: Box::new([0]),
                 }),
                 TransformSpec::Project(ProjectSpec {
-                    expressions: Box::new([Expression::Reference(ReferenceExpression::new(
-                        0,
-                        LogicalType::Integer,
-                    ))]),
+                    expressions: Box::new([Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::Integer).into(),
+                    )]),
                     output_names: Box::new(["a".to_string()]),
                     visible_count: 1,
                 }),
                 TransformSpec::Limit(LimitSpec {
-                    limit: Some(Expression::Constant(ConstantExpression::new(
-                        Value::Integer(10),
-                        LogicalType::Integer,
-                    ))),
+                    limit: Some(Expression::Constant(
+                        ConstantExpression::new(Value::Integer(10), LogicalType::Integer).into(),
+                    )),
                     offset: None,
                     hnsw_options: Default::default(),
                 }),
@@ -1303,6 +1532,7 @@ mod tests {
                         handle: join,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
+                        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                         key_conditions: Box::new([join_condition()]),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,
@@ -1310,18 +1540,22 @@ mod tests {
                         build_payload_types: Box::new([LogicalType::Integer]),
                         build_output_count: 1,
                         left_projection: Box::new([0]),
+                        output_permutation: OutputPermutation::identity(2),
                         output_names: Box::new(["l".to_string(), "r".to_string()]),
                         output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
                         reduction_cascade: None,
                     }),
                     transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: join,
+                        covering_runtime_filter_key: None,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
+                        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                         key_conditions: Box::new([join_condition()]),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,
                         left_projection: Box::new([0]),
+                        output_permutation: OutputPermutation::identity(2),
                         output_names: Box::new(["l".to_string(), "r".to_string()]),
                         output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
                         reduction_cascade: None,
@@ -1331,13 +1565,14 @@ mod tests {
                         join_type: JoinType::Inner,
                         build_keys_unique: false,
                         build_time_integer_index: None,
+                        runtime_filter: None,
                         key_conditions: Box::new([join_condition()]),
                         residual_conditions: Box::default(),
                         grouped_reduction_channels: None,
                         build_projection: Box::new([0]),
                         build_payload_types: Box::new([LogicalType::Integer]),
                         build_output_count: 1,
-                        force_external: false,
+                        spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),
@@ -1378,7 +1613,7 @@ mod tests {
                         input_types: Box::new([LogicalType::Integer]),
                         output_names: Box::new(["a".to_string()]),
                         output_types: Box::new([LogicalType::Integer]),
-                        force_external: false,
+                        spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),
@@ -1422,6 +1657,7 @@ mod tests {
                     transforms: Vec::new(),
                     sink: SinkSpec::CteMaterialize(super::super::graph::CteMaterializeSinkSpec {
                         handle: cte,
+                        spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),

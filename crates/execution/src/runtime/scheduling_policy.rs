@@ -123,6 +123,45 @@ impl PipelineSchedulingPolicy {
     }
 }
 
+/// Partition one admitted query-wide task budget across a wave of independent
+/// pipelines. Every pipeline receives one progress slot before any pipeline
+/// receives a second; remaining slots are then assigned round-robin up to each
+/// pipeline's useful parallelism. This prevents each ready pipeline from
+/// independently claiming the full query DOP and turning an executable
+/// admission contract into scheduler blocking.
+pub(crate) fn allocate_wave_task_slots(
+    desired: &[usize],
+    task_budget: usize,
+) -> Option<Vec<usize>> {
+    if desired.is_empty() {
+        return Some(Vec::new());
+    }
+    if task_budget < desired.len() || desired.contains(&0) {
+        return None;
+    }
+
+    let mut allocated = vec![1usize; desired.len()];
+    let mut remaining = task_budget - desired.len();
+    while remaining > 0 {
+        let mut progressed = false;
+        for (allocation, desired) in allocated.iter_mut().zip(desired) {
+            if *allocation >= *desired {
+                continue;
+            }
+            *allocation += 1;
+            remaining -= 1;
+            progressed = true;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    Some(allocated)
+}
+
 fn critical_path_distance(graph: &PipelineGraph, pipeline: PipelineId) -> u32 {
     fn longest_downstream_path(
         graph: &PipelineGraph,
@@ -239,5 +278,12 @@ mod tests {
             policy.ready_priority(release, 128 * 1024).score()
                 > policy.ready_priority(short, 128 * 1024).score()
         );
+    }
+
+    #[test]
+    fn wave_parallelism_partitions_the_query_wide_task_budget() {
+        assert_eq!(allocate_wave_task_slots(&[4, 4], 4), Some(vec![2, 2]));
+        assert_eq!(allocate_wave_task_slots(&[4, 2, 1], 5), Some(vec![2, 2, 1]));
+        assert_eq!(allocate_wave_task_slots(&[2, 2], 1), None);
     }
 }

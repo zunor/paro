@@ -17,7 +17,7 @@ use std::time::Instant;
 use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
 use paro_context::StatementContext;
-use paro_planner::operator::ExplainSpec;
+use paro_planner::logical::operator::ExplainSpec;
 
 use crate::explain::analyze_render::render_explain_analyze;
 use crate::explain::profiler::ExplainProfiler;
@@ -118,6 +118,11 @@ fn start_program_with_output(
 ) -> Result<ProgramExecution> {
     let requires_background_input = session.input.requires_background_execution();
     let output = match program {
+        StatementProgram::Physical(_) => {
+            return Err(paro_error::internal(
+                "physical artifact reached execution before resource admission",
+            ));
+        }
         StatementProgram::Pipeline { .. } if fetch_driven && requires_background_input => {
             QueryOutputPort::with_blocking_writes(&streaming_output)
         }
@@ -144,6 +149,7 @@ fn start_program_with_output(
     };
     let query = QueryRuntimeContext::new(session, params, memory, output);
     match program {
+        StatementProgram::Physical(_) => unreachable!("artifact was rejected before execution"),
         StatementProgram::Utility(utility) => run_utility(utility, &query)?,
         StatementProgram::ExplainAnalyze { target, spec } => {
             run_explain_analyze(target, *spec, &query, allocator)?
@@ -362,6 +368,11 @@ fn run_explain_analyze(
 
     let started_at = Instant::now();
     match target {
+        StatementProgram::Physical(_) => {
+            return Err(paro_error::internal(
+                "EXPLAIN ANALYZE target reached execution before admission",
+            ));
+        }
         StatementProgram::Utility(utility) => run_utility(utility, &target_query)?,
         StatementProgram::Pipeline {
             graph, programs, ..
@@ -511,6 +522,7 @@ fn run_pipeline_graph_with_control_regions(
             regions: &mut regions,
             pipeline_region: &pipeline_region,
             region_members: &region_members,
+            region_roots: &region_roots,
         }),
     )
 }
@@ -520,6 +532,7 @@ struct ControlRegionDispatch<'a> {
     regions: &'a mut ControlRegionRuntimeSet,
     pipeline_region: &'a [Option<ControlRegionId>],
     region_members: &'a [Vec<PipelineId>],
+    region_roots: &'a HashMap<PipelineId, ControlRegionId>,
 }
 
 /// Unified pipeline DAG execution loop. When `region_dispatch` is `None`, all
@@ -577,10 +590,15 @@ fn run_pipeline_dag(
                     .into_iter()
                     .filter(|pipeline| !finished[pipeline.index()])
                     .collect::<HashSet<_>>();
+                let covered = control_region_covered_pipelines(
+                    ctx.graph,
+                    region_id,
+                    &dispatch.region_members[region_id.index()],
+                    dispatch.region_roots,
+                )?;
                 newly_finished.extend(
-                    dispatch.region_members[region_id.index()]
-                        .iter()
-                        .copied()
+                    covered
+                        .into_iter()
                         .filter(|member| !finished[member.index()]),
                 );
                 let mut newly_finished = newly_finished.into_iter().collect::<Vec<_>>();
@@ -654,6 +672,58 @@ pub(super) fn control_region_pipeline_members(
         all_members.push(members);
     }
     Ok(all_members)
+}
+
+/// Add loop-invariant producers owned exclusively by a control region.
+///
+/// The controller executes these pipelines lazily when a branch is entered.
+/// If the branch is skipped (for example, an empty recursive anchor), the DAG
+/// must mark them as covered by the region instead of running an otherwise
+/// dead build after the region has already retired its consumers. A producer
+/// shared with any pipeline outside the region stays globally scheduled.
+pub(super) fn control_region_covered_pipelines(
+    graph: &PipelineGraph,
+    owner: ControlRegionId,
+    scheduled_members: &[PipelineId],
+    region_roots: &HashMap<PipelineId, ControlRegionId>,
+) -> Result<Vec<PipelineId>> {
+    let mut members = scheduled_members.to_vec();
+    loop {
+        let member_set = members.iter().copied().collect::<HashSet<_>>();
+        let mut producers = graph
+            .dependencies
+            .iter()
+            .filter(|dependency| member_set.contains(&dependency.consumer))
+            .map(|dependency| dependency.producer)
+            .filter(|producer| !member_set.contains(producer))
+            .filter(|producer| {
+                graph
+                    .dependencies
+                    .iter()
+                    .filter(|dependency| dependency.producer == *producer)
+                    .all(|dependency| member_set.contains(&dependency.consumer))
+            })
+            .collect::<Vec<_>>();
+        producers.sort_unstable();
+        producers.dedup();
+        if producers.is_empty() {
+            members.sort_unstable();
+            members.dedup();
+            return Ok(members);
+        }
+
+        let mut visiting = HashSet::new();
+        for producer in producers {
+            collect_pipeline_member(
+                graph,
+                owner,
+                producer,
+                region_roots,
+                &mut visiting,
+                &mut members,
+            )?;
+        }
+    }
 }
 
 fn collect_control_region_pipeline_members(

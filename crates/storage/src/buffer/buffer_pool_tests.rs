@@ -174,6 +174,20 @@ fn test_set_memory_limit_with_evict_and_rollback() {
 }
 
 #[test]
+fn resident_pin_treats_evicted_external_pages_as_cache_misses() {
+    let pool = BufferPool::new_arc(1024);
+    let handle = pool
+        .allocate(MemoryTag::PageCache, FileBufferType::ExternalFile, 1024)
+        .unwrap();
+    let block_id = handle.block_handle().unwrap().block_id();
+
+    drop(handle);
+    let result = pool.evict_blocks(MemoryTag::PageCache, 0, 0, None);
+    assert!(result.success);
+    assert!(pool.pin_resident(block_id).is_none());
+}
+
+#[test]
 fn test_swap_limit_enforced_by_spill_manager() {
     let pool = create_pool_with_temp_dir(4096);
     pool.set_swap_limit(Some(128)).unwrap();
@@ -848,11 +862,66 @@ fn test_concurrent_reuse_statistics() {
 
 #[test]
 fn test_buffer_allocator_integration() {
-    // Note: This test is disabled because BufferPool no longer implements
-    // paro_common::allocator::BufferManager trait directly (allocate now requires Arc<Self>).
-    // StandardBufferManager implements crate::buffer::BufferManager, which is a different trait.
-    //
-    // TODO: Create a wrapper type if BufferAllocator integration is needed.
+    use paro_common::allocator::{Allocator, BufferAllocator};
+
+    let pool = BufferPool::new_arc(2 * 1024 * 1024);
+    let manager: Arc<dyn paro_common::allocator::BufferManager> = pool.clone();
+    let allocator = BufferAllocator::new(manager, MemoryTag::Allocator);
+
+    let ptr = allocator.allocate(1024).unwrap();
+    assert!(!ptr.is_null());
+    assert_eq!(allocator.allocated_size(), 1024);
+    assert!(pool.reserved_memory() > 0);
+    assert!(pool.stats().admission_reservations.load(Ordering::Relaxed) > 0);
+
+    allocator.free(ptr, 1024);
+    assert_eq!(allocator.allocated_size(), 0);
+    // The remaining local quota is still accounted and can be released when
+    // the query-local allocator ends.
+    assert_eq!(pool.used_memory(), pool.reserved_memory());
+    drop(allocator);
+    assert_eq!(pool.reserved_memory(), 0);
+    assert_eq!(pool.used_memory(), 0);
+}
+
+#[test]
+fn test_buffer_allocator_zeroed_allocation_uses_pool_initialization() {
+    use paro_common::allocator::{Allocator, BufferAllocator};
+
+    let pool = BufferPool::new_arc(2 * 1024 * 1024);
+    let manager: Arc<dyn paro_common::allocator::BufferManager> = pool.clone();
+    let allocator = BufferAllocator::new(manager, MemoryTag::Allocator);
+
+    let ptr = allocator.allocate_zeroed(4096).unwrap();
+    assert!(!ptr.is_null());
+    // BlockHandle allocation is zeroed before the pointer reaches the common
+    // allocator. The contract is tested through the public allocator API.
+    unsafe {
+        assert!(std::slice::from_raw_parts(ptr, 4096)
+            .iter()
+            .all(|byte| *byte == 0));
+    }
+    assert_eq!(pool.stats().zeroed_bytes.load(Ordering::Relaxed), 4096);
+
+    allocator.free(ptr, 4096);
+    drop(allocator);
+    assert_eq!(pool.reserved_memory(), 0);
+    assert_eq!(pool.used_memory(), 0);
+}
+
+#[test]
+fn test_buffer_pool_reservation_failure_rolls_back_once() {
+    use paro_common::allocator::{Allocator, BufferAllocator};
+
+    // A reservation is admitted before the slow physical allocation. A tiny
+    // limit makes the reservation fail without leaving capacity behind.
+    let pool = BufferPool::new_arc(1024);
+    let manager: Arc<dyn paro_common::allocator::BufferManager> = pool.clone();
+    let allocator = BufferAllocator::new(manager, MemoryTag::Allocator);
+
+    assert!(allocator.allocate(4096).is_err());
+    assert_eq!(pool.reserved_memory(), 0);
+    assert_eq!(pool.used_memory(), 0);
 }
 
 // === Per-Tag Memory Tracking Tests ===

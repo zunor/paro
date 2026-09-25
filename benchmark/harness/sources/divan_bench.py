@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from ..evidence_schema import EVIDENCE_SCHEMA_VERSION
+
 from datetime import datetime
 import json
 import math
@@ -12,6 +14,7 @@ import os
 from pathlib import Path
 import statistics
 import subprocess
+import tempfile
 from typing import Any
 
 from ..baseline_index import QueryKey
@@ -33,39 +36,44 @@ class DivanBenchSource:
         if not source.bench:
             raise ValueError(f"source '{source.name}' is missing bench")
 
-        report_dir = context.root_dir / "report" / _safe_path_name(source.name)
-        raw_path = report_dir / "divan-raw.json"
+        report_dir = context.output_dir
+        raw_fd, raw_name = tempfile.mkstemp(prefix="paro-divan-", suffix=".json")
+        os.close(raw_fd)
+        raw_path = Path(raw_name)
         env = _divan_env(raw_path, source, context)
         command = ["cargo", "bench", "--locked", "-p", source.crate, "--bench", source.bench]
 
         try:
-            completed = subprocess.run(
-                command,
-                cwd=context.root_dir.parent,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=_timeout_seconds(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ValueError(
-                "structured Divan bench timed out "
-                f"({source.crate}/{source.bench}, timeout={_timeout_seconds()}s): "
-                f"{_tail(_timeout_output(exc))}"
-            ) from exc
-        if completed.returncode != 0:
-            raise ValueError(
-                "structured Divan bench failed "
-                f"({source.crate}/{source.bench}): {_tail(completed.stderr or completed.stdout)}"
-            )
-        if not raw_path.exists():
-            raise ValueError(f"structured Divan bench did not write result: {raw_path}")
-
-        try:
-            raw_payload = json.loads(raw_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid structured Divan JSON {raw_path}: {exc}") from exc
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=context.root_dir.parent,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=_timeout_seconds(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError(
+                    "structured Divan bench timed out "
+                    f"({source.crate}/{source.bench}, timeout={_timeout_seconds()}s): "
+                    f"{_tail(_timeout_output(exc))}"
+                ) from exc
+            if completed.returncode != 0:
+                raise ValueError(
+                    "structured Divan bench failed "
+                    f"({source.crate}/{source.bench}): {_tail(completed.stderr or completed.stdout)}"
+                )
+            if not raw_path.exists():
+                raise ValueError(f"structured Divan bench did not write result: {raw_path}")
+            raw_text = raw_path.read_text(encoding="utf-8")
+            try:
+                raw_payload = json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid structured Divan JSON {raw_path}: {exc}") from exc
+        finally:
+            raw_path.unlink(missing_ok=True)
 
         payload = normalize_divan_payload(
             source,
@@ -73,14 +81,50 @@ class DivanBenchSource:
             retry_query_keys=context.retry_query_keys,
             minimum_sample_count=context.minimum_sample_count,
         )
+        if context.run_output is not None and context.attempt is not None:
+            query_count = sum(
+                len(workload.get("queries", []))
+                for workload in payload.get("workloads", [])
+            )
+            sample_count = sum(
+                len(query.get("samples_ms", []))
+                for workload in payload.get("workloads", [])
+                for query in workload.get("queries", [])
+            )
+            context.run_output.registration.cell(
+                query_cases=query_count,
+                sample_rows=sample_count,
+                product_receipts=sample_count,
+                query_case=context.attempt.query_case,
+                arm_id=context.attempt.arm_id,
+            )
         reporter = BenchmarkReporter(context.root_dir)
-        result_path, summary_path = reporter.write_reports(payload, report_dir / "result.json")
+        if context.run_output is not None:
+            reporter.attach_run_ownership(
+                payload,
+                context.run_output,
+                source_id=context.attempt.source_id if context.attempt else None,
+                attempt_id=context.attempt.attempt_id if context.attempt else None,
+                query_case=context.attempt.query_case if context.attempt else None,
+                arm_id=context.attempt.arm_id if context.attempt else None,
+            )
+        if context.attempt is None:
+            raise ValueError("Divan source requires an owned attempt")
+        result_path, summary_path = reporter.write_reports(
+            payload, context.attempt.cell_writer()
+        )
         return SourceMeasurement(
             source=source,
             payload=payload,
             result_path=result_path,
             summary_path=summary_path,
             failed=False,
+            run_id=context.run_output.run_id if context.run_output else None,
+            source_id=context.attempt.source_id if context.attempt else None,
+            attempt_id=context.attempt.attempt_id if context.attempt else None,
+            query_case=source.name,
+            arm_id=context.attempt.arm_id if context.attempt else None,
+            attempt_status="Completed",
         )
 
 
@@ -122,6 +166,11 @@ def normalize_divan_payload(
             "stats": _compute_stats(samples),
             "divan": {
                 "items": _optional_positive_int(bench.get("items")),
+            },
+            "compile_receipt": {
+                "schema_version": EVIDENCE_SCHEMA_VERSION,
+                "status": "Uncovered",
+                "reason": "rust micro benchmark has no SQL compiled-statement receipt",
             },
         }
         audit = _optional_audit(bench.get("audit"))

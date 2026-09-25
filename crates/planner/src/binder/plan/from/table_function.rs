@@ -3,8 +3,10 @@
 
 use crate::binder::ir::{BoundExternalRoutine, BoundTableFunction};
 use crate::binder::Binder;
-use crate::operator::{LogicalExternalTable, LogicalOperator, Projection, TableFunctionGet};
-use crate::plan::LogicalPlan;
+use crate::logical::operator::{
+    LogicalExternalTable, LogicalOperator, Projection, TableFunctionGet,
+};
+use crate::logical::plan::OwnedLogicalPlan;
 use paro_common::error::Result;
 
 impl Binder {
@@ -20,7 +22,9 @@ impl Binder {
             tf_ref.bound_arguments,
         )
         .with_ordinality_flag(tf_ref.with_ordinality);
-        Ok(LogicalOperator::TableFunctionGet(table_function_get))
+        Ok(LogicalOperator::TableFunctionGet(Box::new(
+            table_function_get,
+        )))
     }
 
     pub(crate) fn plan_external_routine_ref(
@@ -28,10 +32,10 @@ impl Binder {
         routine_ref: BoundExternalRoutine,
     ) -> Result<LogicalOperator> {
         let projection_index = self.bind_context.generate_table_index();
-        let child = LogicalPlan::synthetic(LogicalOperator::Projection(
+        let child = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(
             Projection::new(
                 projection_index,
-                LogicalPlan::synthetic(LogicalOperator::DummyScan),
+                OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
                 routine_ref.bound_arguments.clone(),
             )
             .with_visible_names(
@@ -41,7 +45,7 @@ impl Binder {
             ),
         ));
 
-        Ok(LogicalOperator::ExternalTable(
+        Ok(LogicalOperator::ExternalTable(Box::new(
             LogicalExternalTable::new(
                 routine_ref.table_index,
                 routine_ref.column_names,
@@ -54,6 +58,6 @@ impl Binder {
                 routine_ref.lateral,
                 !routine_ref.correlated_columns.is_empty(),
             ),
-        ))
+        )))
     }
 }

@@ -16,6 +16,7 @@ use std::sync::Arc;
 pub mod connection_registry;
 pub mod copy_stdin;
 pub mod object_cache;
+pub mod plan_cache;
 pub mod runtime_tuning;
 pub mod session_registry;
 pub mod shutdown_reason;
@@ -23,6 +24,7 @@ pub mod shutdown_reason;
 use self::connection_registry::ConnectionRegistry;
 use self::copy_stdin::CopyStdinMetrics;
 use self::object_cache::ObjectCache;
+use self::plan_cache::InstancePlanCache;
 use self::runtime_tuning::RuntimeTuning;
 use self::session_registry::SessionExecutionRegistry;
 
@@ -40,6 +42,7 @@ pub struct InstanceRuntime {
     copy_stdin_metrics: Arc<CopyStdinMetrics>,
     session_registry: Arc<SessionExecutionRegistry>,
     object_cache: Arc<ObjectCache>,
+    plan_cache: InstancePlanCache,
     db_file_system: Arc<DatabaseFileSystem>,
     python_runtime: Arc<ExternalRuntimeHost>,
     commit_drain_wake_pool: Arc<CommitDrainWakePool>,
@@ -92,6 +95,7 @@ impl InstanceRuntime {
             copy_stdin_metrics: Arc::new(CopyStdinMetrics::default()),
             session_registry,
             object_cache,
+            plan_cache: InstancePlanCache::default(),
             db_file_system,
             python_runtime,
             commit_drain_wake_pool: Arc::new(CommitDrainWakePool::new(
@@ -143,6 +147,10 @@ impl InstanceRuntime {
 
     pub fn object_cache(&self) -> &Arc<ObjectCache> {
         &self.object_cache
+    }
+
+    pub fn plan_cache(&self) -> &InstancePlanCache {
+        &self.plan_cache
     }
 
     pub fn db_file_system(&self) -> &Arc<DatabaseFileSystem> {
@@ -245,6 +253,10 @@ impl Instance {
 
     pub fn get_object_cache(&self) -> &Arc<ObjectCache> {
         self.runtime.object_cache()
+    }
+
+    pub fn plan_cache(&self) -> &InstancePlanCache {
+        self.runtime.plan_cache()
     }
 
     pub fn get_file_system(&self) -> &Arc<DatabaseFileSystem> {

@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(stmt.vertex_tables[1].label, None);
         assert_eq!(
             stmt.edge_tables[0].label.as_ref().map(|i| i.name.as_str()),
-            Some("Knows")
+            Some("knows")
         );
     }
 
@@ -309,7 +309,7 @@ mod tests {
                 .label
                 .as_ref()
                 .map(|ident| ident.name.as_str()),
-            Some("Person")
+            Some("person")
         );
         assert!(matches!(
             stmt.vertex_tables[0].properties,

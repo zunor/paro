@@ -5,7 +5,7 @@
 //!
 //!
 
-use crate::operator::ColumnBinding;
+use crate::logical::operator::ColumnBinding;
 use paro_common::types::LogicalType;
 
 /// A reference to a column in a bound table.

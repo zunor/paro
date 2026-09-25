@@ -34,6 +34,9 @@ use crate::compression::decompress_size_prepended_exact;
 use bytes::{BufMut, Bytes, BytesMut};
 use paro_common::error::Result;
 
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod neon;
+
 /// Header size for bitshuffle pages.
 pub const BITSHUFFLE_PAGE_HEADER_SIZE: usize = 24;
 const BITSHUFFLE_PAGE_MAGIC: [u8; 4] = *b"BSH2";
@@ -251,6 +254,7 @@ pub struct BitShufflePageDecoder {
     cur_index: u32,
     /// Whether init() has been called
     parsed: bool,
+    stream_sequential: bool,
 }
 
 impl BitShufflePageDecoder {
@@ -269,6 +273,7 @@ impl BitShufflePageDecoder {
             block_elements: 0,
             cur_index: 0,
             parsed: false,
+            stream_sequential: false,
         }
     }
 
@@ -333,6 +338,7 @@ impl BitShufflePageDecoder {
             block_elements: BITSHUFFLE_BLOCK_ELEMENTS,
             cur_index: 0,
             parsed: true,
+            stream_sequential: false,
         })
     }
 
@@ -441,6 +447,10 @@ impl BitShufflePageDecoder {
         // Decompress only after the page header and the embedded LZ4 size
         // prefix agree on the exact output allocation.
         let compressed_data = &self.data[BITSHUFFLE_PAGE_HEADER_SIZE..];
+        let _cold_work = paro_common::cold_work::WorkScope::new(
+            paro_common::cold_work::Kind::BitShuffleDecompress,
+            compressed_data.len(),
+        );
         let decompressed = decompress_size_prepended_exact(compressed_data, expected_size)?;
 
         self.shuffled_data = Some(Bytes::from(decompressed));
@@ -482,6 +492,19 @@ impl BitShufflePageDecoder {
             return Ok((0, Bytes::new()));
         }
 
+        if self.stream_sequential && self.decoded_data.is_none() {
+            let mut output = vec![0; to_read * self.type_size];
+            // Reuse the existing sparse codec primitive. Source and destination
+            // bounds follow from to_read <= remaining; no full-page allocation.
+            unsafe {
+                self.gather_values_at_validated(
+                    (0..to_read).map(|i| (self.cur_index + i as u32, i)),
+                    &mut output,
+                )?;
+            }
+            self.cur_index += to_read as u32;
+            return Ok((to_read, Bytes::from(output)));
+        }
         self.ensure_materialized()?;
         let decoded = self
             .decoded_data
@@ -740,6 +763,10 @@ impl BitShufflePageDecoder {
         self.decoded_data.is_some()
     }
 
+    pub(crate) fn stream_sequential(&mut self) {
+        self.stream_sequential = true;
+    }
+
     /// Return the logical page only when an operation has already required
     /// materialization. Sparse point reads deliberately keep returning `None`.
     #[cfg(test)]
@@ -772,6 +799,10 @@ impl BitShufflePageDecoder {
                 output.len(),
             )));
         }
+        let _cold_work = paro_common::cold_work::WorkScope::new(
+            paro_common::cold_work::Kind::BitShuffleMaterialize,
+            expected_size,
+        );
         if let Some(decoded) = &self.decoded_data {
             output.copy_from_slice(decoded);
             return Ok(());
@@ -936,36 +967,59 @@ fn bitunshuffle_into(
     block_elements: usize,
     output: &mut [u8],
 ) -> Result<()> {
-    if type_size == 0 || data.len() % type_size != 0 || output.len() != data.len() {
+    if !matches!(type_size, 1 | 2 | 4 | 8 | 16)
+        || data.len() % type_size != 0
+        || output.len() != data.len()
+    {
         return Err(paro_common::error::data_corrupted(
             "BitShuffle page has an invalid decoded layout",
         ));
     }
-    let total_bits = data.len() * 8;
-    let bits_per_element = type_size * 8;
-    let num_elements = total_bits / bits_per_element;
+    let num_elements = data.len() / type_size;
 
     if num_elements == 0 {
         return Ok(());
     }
-    if !num_elements.is_multiple_of(8) || block_elements == 0 {
+    if !num_elements.is_multiple_of(8) || block_elements == 0 || !block_elements.is_multiple_of(8) {
         return Err(paro_common::error::data_corrupted(
             "BitShuffle page has an invalid block layout",
         ));
     }
-    output.fill(0);
-
+    let _cold_work = paro_common::cold_work::WorkScope::new(
+        paro_common::cold_work::Kind::BitShuffleUnshuffle,
+        data.len(),
+    );
     for block_start in (0..num_elements).step_by(block_elements) {
         let current_block_elements = (num_elements - block_start).min(block_elements);
         let plane_bytes = current_block_elements / 8;
         let block_input = block_start * type_size;
+        let input = &data[block_input..block_input + current_block_elements * type_size];
+        let output = &mut output[block_input..block_input + current_block_elements * type_size];
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        let vectorized_groups = if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: the checked block layout provides exactly eight planes
+            // per byte column and a same-sized, disjoint output allocation.
+            // The kernel writes only complete 64-row tiles; the scalar tail
+            // below covers every remaining eight-row group.
+            unsafe {
+                match type_size {
+                    4 => neon::unshuffle::<4>(input, plane_bytes, output),
+                    8 => neon::unshuffle::<8>(input, plane_bytes, output),
+                    _ => 0,
+                }
+            }
+        } else {
+            0
+        };
+        #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+        let vectorized_groups = 0;
         for byte_idx in 0..type_size {
-            let plane_base = block_input + byte_idx * 8 * plane_bytes;
-            for group in 0..plane_bytes {
+            let plane_base = byte_idx * 8 * plane_bytes;
+            for group in vectorized_groups..plane_bytes {
                 let planes =
-                    std::array::from_fn(|bit| data[plane_base + bit * plane_bytes + group]);
+                    std::array::from_fn(|bit| input[plane_base + bit * plane_bytes + group]);
                 let values = transpose_8x8(u64::from_le_bytes(planes)).to_le_bytes();
-                let output_base = (block_start + group * 8) * type_size + byte_idx;
+                let output_base = group * 8 * type_size + byte_idx;
                 for (element, value) in values.into_iter().enumerate() {
                     output[output_base + element * type_size] = value;
                 }
@@ -1052,6 +1106,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tiled_bitunshuffle_matches_scalar_oracle_with_tails_and_unaligned_buffers() {
+        let mut random = 0x8350_492f_abc7_142d_u64;
+        for width in [1, 2, 4, 8, 16] {
+            for rows in [0, 8, 24, 56, 64, 72, 128, 1016, 1024, 1032, 2056] {
+                let values = (0..rows * width)
+                    .map(|_| {
+                        random ^= random << 13;
+                        random ^= random >> 7;
+                        random ^= random << 17;
+                        random as u8
+                    })
+                    .collect::<Vec<_>>();
+                let shuffled = bitshuffle(&values, width);
+                let mut oracle = Vec::new();
+                for block in shuffled.chunks(BITSHUFFLE_BLOCK_ELEMENTS * width) {
+                    oracle.extend(bitunshuffle_reference(block, width));
+                }
+                assert_eq!(oracle, values);
+                for offset in [0, 1, 3, 7] {
+                    let mut input = vec![0xac; offset];
+                    input.extend_from_slice(&shuffled);
+                    let mut output = vec![0x5a; offset + values.len() + 11];
+                    bitunshuffle_into(
+                        &input[offset..],
+                        width,
+                        BITSHUFFLE_BLOCK_ELEMENTS,
+                        &mut output[offset..offset + values.len()],
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        &output[offset..offset + values.len()],
+                        oracle,
+                        "width={width} rows={rows} offset={offset}"
+                    );
+                    assert!(output[..offset]
+                        .iter()
+                        .chain(&output[offset + values.len()..])
+                        .all(|byte| *byte == 0x5a));
+                }
+            }
+        }
+        assert!(bitunshuffle_into(&[0; 64], 4, 9, &mut [0; 64]).is_err());
     }
 
     #[test]

@@ -103,7 +103,7 @@ fn staged_later_short_read_falls_back_to_gather_and_realigns_iterators() {
     let mut matches = Vec::new();
     let mut stats = PredicateStageReadStats::default();
 
-    let rows = evaluator
+    let (rows, reusable_batches) = evaluator
         .evaluate_staged_batch(
             0,
             8,
@@ -114,6 +114,7 @@ fn staged_later_short_read_falls_back_to_gather_and_realigns_iterators() {
         .unwrap();
 
     assert_eq!(rows, 3);
+    assert!(reusable_batches.is_empty());
     assert_eq!(matches, [0, 1, 2]);
     assert_eq!(stats.stages[0].sequential_rows, 3);
     assert_eq!(stats.stages[1].sequential_rows, 1);

@@ -7,7 +7,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 
 use crate::physical::properties::PipelineProperties;
 use crate::physical::row_type::RowType;
@@ -16,9 +16,10 @@ use crate::physical::specs::{
     ClassicIeJoinSpec, CopyToFileSpec, DeleteSpec, DummyScanSpec, EmptyResultSpec,
     ExpressionScanSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec, FullTextSearchSpec,
     GraphExpandSpec, GraphProjectSpec, GraphScanSpec, GraphShortestPathSpec,
-    HashReductionCascadeSpec, InsertSpec, LimitSpec, PartitionAggregateWindowSpec, ProjectSpec,
-    RowFetchSpec, RowsetScanSpec, SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec,
-    TableFunctionScanSpec, TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    HashJoinRuntimeFilterSpec, HashReductionCascadeSpec, InsertSpec, LimitSpec, OutputPermutation,
+    PartitionAggregateWindowSpec, ProjectSpec, RowFetchSpec, RowsetScanSpec, SetOperationInputSide,
+    SetOperationSpec, SparseVectorSearchSpec, SpillExecutionPolicy, TableFunctionScanSpec,
+    TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 use super::handles::{BreakerHandleCatalog, BreakerHandleId, BreakerHandleKind};
@@ -102,6 +103,7 @@ impl PipelineGraph {
         self.validate_control_regions()?;
         self.handles.validate()?;
         self.validate_pipeline_handles()?;
+        self.validate_runtime_filter_contracts()?;
         Ok(())
     }
 
@@ -327,6 +329,98 @@ impl PipelineGraph {
                     }
                     Ok(())
                 })?;
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_filter_contracts(&self) -> Result<()> {
+        for consumer in &self.pipelines {
+            let SourceSpec::Rowset(source) = &consumer.source else {
+                continue;
+            };
+            for filter in &source.dynamic_runtime_filters {
+                let handle = self.handles.get(filter.handle).ok_or_else(|| {
+                    paro_error::internal("runtime-filter consumer references unknown handle")
+                })?;
+                let producer_id = handle.producer.ok_or_else(|| {
+                    paro_error::internal("runtime-filter artifact has no producer pipeline")
+                })?;
+                let producer = self.pipeline(producer_id).ok_or_else(|| {
+                    paro_error::internal("runtime-filter producer pipeline is invalid")
+                })?;
+                let SinkSpec::HashJoinBuild(build) = &producer.sink else {
+                    return Err(paro_error::internal(
+                        "runtime-filter artifact producer is not a hash-join build",
+                    ));
+                };
+                let contract = build.runtime_filter.as_ref().ok_or_else(|| {
+                    paro_error::internal(
+                        "rowset consumes a runtime filter absent from the hash-join contract",
+                    )
+                })?;
+                if build.handle != filter.handle || contract.artifact != filter.artifact {
+                    return Err(paro_error::internal(
+                        "runtime-filter producer and consumer artifact identities differ",
+                    ));
+                }
+                if !self.dependencies.iter().any(|dependency| {
+                    dependency.producer == producer_id
+                        && dependency.consumer == consumer.id
+                        && dependency.kind == DependencyKind::BuildBeforeProbe
+                }) {
+                    return Err(paro_error::internal(
+                        "wait-complete runtime filter lacks a build-before-probe dependency",
+                    ));
+                }
+            }
+        }
+
+        for pipeline in &self.pipelines {
+            for transform in &pipeline.transforms {
+                let TransformSpec::HashJoinProbe(probe) = transform else {
+                    continue;
+                };
+                let Some(key_index) = probe.covering_runtime_filter_key else {
+                    continue;
+                };
+                let SourceSpec::Rowset(source) = &pipeline.source else {
+                    return Err(paro_error::internal(
+                        "hash probe replacement has no rowset filter installation",
+                    ));
+                };
+                if !source.dynamic_runtime_filters.iter().any(|filter| {
+                    filter.handle == probe.handle
+                        && filter.runtime_filter_key_index == key_index
+                        && filter.application == RuntimeFilterApplication::ProbeReplacementEligible
+                }) {
+                    return Err(paro_error::internal(
+                        "hash probe replacement is not authorized by its runtime-filter installation",
+                    ));
+                }
+            }
+        }
+
+        for producer in &self.pipelines {
+            let SinkSpec::HashJoinBuild(build) = &producer.sink else {
+                continue;
+            };
+            let Some(contract) = &build.runtime_filter else {
+                continue;
+            };
+            let has_consumer = self.pipelines.iter().any(|pipeline| {
+                matches!(
+                    &pipeline.source,
+                    SourceSpec::Rowset(source)
+                        if source.dynamic_runtime_filters.iter().any(|filter| {
+                            filter.handle == build.handle && filter.artifact == contract.artifact
+                        })
+                )
+            });
+            if !has_consumer {
+                return Err(paro_error::internal(
+                    "hash-join runtime-filter contract has no rowset consumer",
+                ));
+            }
         }
         Ok(())
     }
@@ -604,11 +698,23 @@ impl RowsetSourceSpec {
     }
 }
 
+/// Semantic authority granted to one concrete runtime-filter installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilterApplication {
+    /// The filter is a pruning hint; the hash probe remains authoritative.
+    FilteringOnly,
+    /// This installation covers the probe key and may replace the hash probe
+    /// if the materialized runtime representation is exact.
+    ProbeReplacementEligible,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowsetDynamicRuntimeFilterSpec {
     pub handle: BreakerHandleId,
-    pub build_key_index: usize,
+    pub artifact: crate::physical::Fingerprint,
+    pub runtime_filter_key_index: usize,
     pub probe_column_id: u32,
+    pub application: RuntimeFilterApplication,
 }
 
 /// Scan predicate derived from a materialized scalar join input.
@@ -659,7 +765,8 @@ pub struct NljUnmatchedSourceSpec {
 pub struct HashJoinSpillReplaySourceSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
-    pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
+    pub anti_join_mode: paro_planner::logical::operator::join::AntiJoinMode,
+    pub mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,
@@ -667,6 +774,7 @@ pub struct HashJoinSpillReplaySourceSpec {
     pub build_payload_types: Box<[LogicalType]>,
     pub build_output_count: usize,
     pub left_projection: Box<[usize]>,
+    pub output_permutation: OutputPermutation,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub reduction_cascade: Option<HashReductionCascadeSpec>,
@@ -677,6 +785,7 @@ pub struct HashJoinUnmatchedSourceSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub left_output_types: Box<[LogicalType]>,
+    pub output_permutation: OutputPermutation,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub reduction_cascade: Option<HashReductionCascadeSpec>,
@@ -858,12 +967,19 @@ impl TransformSpec {
 #[derive(Debug, Clone)]
 pub struct HashJoinProbeSpec {
     pub handle: BreakerHandleId,
+    /// Single build-key ordinal whose exact runtime predicate was attached to
+    /// this pipeline's rowset source. Execution may bypass a payload-free
+    /// unique INNER or duplicate-insensitive SEMI probe only while the frozen
+    /// filter remains exact.
+    pub covering_runtime_filter_key: Option<usize>,
     pub join_type: JoinType,
-    pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
+    pub anti_join_mode: paro_planner::logical::operator::join::AntiJoinMode,
+    pub mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,
     pub left_projection: Box<[usize]>,
+    pub output_permutation: OutputPermutation,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub reduction_cascade: Option<HashReductionCascadeSpec>,
@@ -874,7 +990,7 @@ pub struct NestedLoopJoinProbeSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_semantics: paro_planner::operator::MarkJoinSemantics,
+    pub mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
     pub arbitrary_condition: Option<Expression>,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
@@ -888,7 +1004,7 @@ pub struct SortRangeJoinProbeSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_semantics: paro_planner::operator::MarkJoinSemantics,
+    pub mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
     pub right_output_types: Box<[LogicalType]>,
@@ -1004,6 +1120,7 @@ pub struct MaterializeSinkSpec {
 #[derive(Debug, Clone)]
 pub struct CrossProductBuildSinkSpec {
     pub handle: BreakerHandleId,
+    pub spill_policy: SpillExecutionPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -1012,13 +1129,16 @@ pub struct HashJoinBuildSinkSpec {
     pub join_type: JoinType,
     pub build_keys_unique: bool,
     pub build_time_integer_index: Option<BuildTimeIntegerJoinIndexSpec>,
+    /// Selected AuxiliaryPlanRegion contract. `None` means the mandatory
+    /// baseline and forbids runtime-filter construction and publication.
+    pub runtime_filter: Option<HashJoinRuntimeFilterSpec>,
     pub key_conditions: Box<[JoinCondition]>,
     pub residual_conditions: Box<[JoinCondition]>,
     pub build_projection: Box<[usize]>,
     pub build_payload_types: Box<[LogicalType]>,
     pub build_output_count: usize,
     pub grouped_reduction_channels: Option<usize>,
-    pub force_external: bool,
+    pub spill_policy: SpillExecutionPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -1047,7 +1167,7 @@ pub struct SortBuildSinkSpec {
     pub input_types: Box<[LogicalType]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
-    pub force_external: bool,
+    pub spill_policy: SpillExecutionPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -1078,6 +1198,7 @@ pub struct SetOperationInputSinkSpec {
 #[derive(Debug, Clone)]
 pub struct CteMaterializeSinkSpec {
     pub handle: BreakerHandleId,
+    pub spill_policy: SpillExecutionPolicy,
 }
 
 #[derive(Debug, Clone)]

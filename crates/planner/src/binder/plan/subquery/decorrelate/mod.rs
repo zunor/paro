@@ -1,13 +1,13 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decorrelate [`DependentJoin`](crate::operator::DependentJoin) into regular joins.
+//! Decorrelate [`DependentJoin`](crate::logical::operator::DependentJoin) into regular joins.
 
 mod flattener;
 mod helpers;
 
 use crate::binder::Binder;
-use crate::operator::{DependentJoin, LogicalOperator};
+use crate::logical::operator::{DependentJoin, LogicalOperator};
 use paro_common::error::Result;
 use std::sync::Arc;
 

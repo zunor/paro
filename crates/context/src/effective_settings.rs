@@ -46,6 +46,13 @@ impl EffectiveSettings {
         )
     }
 
+    pub fn vector_search_objective(&self) -> &str {
+        match self.get("vector_search_objective") {
+            Some(Value::Varchar(value)) => value,
+            _ => "exact",
+        }
+    }
+
     pub fn parallel_scheduler(&self) -> bool {
         matches!(self.get("parallel_scheduler"), Some(Value::Boolean(true)))
     }
@@ -78,16 +85,27 @@ impl EffectiveSettings {
             .map(|millis| Duration::from_millis(millis as u64))
     }
 
-    pub fn fingerprint(&self) -> u64 {
-        let mut keys = self.raw.keys().cloned().collect::<Vec<_>>();
-        keys.sort();
-
+    /// Fingerprint only settings that can change binding or physical planning.
+    ///
+    /// Runtime controls and diagnostics deliberately do not participate. In
+    /// particular, enabling optimizer verification must validate the same
+    /// immutable plan image rather than manufacturing a second cache entry.
+    pub fn planning_fingerprint(&self) -> u64 {
+        const PLAN_SETTINGS: &[&str] = &[
+            "default_table_cardinality",
+            "force_external",
+            "max_temp_directory_size",
+            "memory_limit",
+            "parallel_scheduler",
+            "rowset_scan_pushdown",
+            "temp_directory",
+            "threads",
+            "vector_search_objective",
+        ];
         let mut hasher = DefaultHasher::new();
-        for key in keys {
+        for key in PLAN_SETTINGS {
             key.hash(&mut hasher);
-            self.render(&key)
-                .unwrap_or_else(|| self.raw[&key].to_string())
-                .hash(&mut hasher);
+            self.get(key).map(Value::to_string).hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -107,7 +125,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fingerprint_is_order_insensitive_but_value_sensitive() {
+    fn planning_fingerprint_is_order_insensitive_but_value_sensitive() {
         let mut first = HashMap::new();
         first.insert("threads".to_string(), Value::Integer(4));
         first.insert("memory_limit".to_string(), Value::BigInt(1024));
@@ -120,16 +138,31 @@ mod tests {
         third.insert("threads".to_string(), Value::Integer(8));
 
         assert_eq!(
-            EffectiveSettings::new(first).fingerprint(),
-            EffectiveSettings::new(second).fingerprint()
+            EffectiveSettings::new(first).planning_fingerprint(),
+            EffectiveSettings::new(second).planning_fingerprint()
         );
         assert_ne!(
-            EffectiveSettings::new(third).fingerprint(),
+            EffectiveSettings::new(third).planning_fingerprint(),
             EffectiveSettings::new(HashMap::from([
                 ("memory_limit".to_string(), Value::BigInt(1024)),
                 ("threads".to_string(), Value::Integer(4)),
             ]))
-            .fingerprint()
+            .planning_fingerprint()
+        );
+    }
+
+    #[test]
+    fn optimizer_verification_does_not_change_planning_identity() {
+        let baseline =
+            EffectiveSettings::new(HashMap::from([("threads".to_string(), Value::Integer(4))]));
+        let verified = EffectiveSettings::new(HashMap::from([
+            ("threads".to_string(), Value::Integer(4)),
+            ("optimizer_verify".to_string(), Value::Boolean(true)),
+        ]));
+
+        assert_eq!(
+            baseline.planning_fingerprint(),
+            verified.planning_fingerprint()
         );
     }
 }

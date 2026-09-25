@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use paro_planner::operator::MarkJoinSemantics;
+use paro_planner::logical::operator::MarkJoinSemantics;
 
 fn value_to_i32(value: &Value) -> Option<i32> {
     match value {
@@ -44,13 +44,14 @@ fn run_null_aware_anti_join(
                     join_type: JoinType::Anti,
                     build_keys_unique: false,
                     build_time_integer_index: None,
+                    runtime_filter: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    force_external: false,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -67,12 +68,15 @@ fn run_null_aware_anti_join(
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
+                    covering_runtime_filter_key: None,
                     join_type: JoinType::Anti,
                     anti_join_mode: AntiJoinMode::NullAware,
+                    mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(1),
                     output_names: vec!["payload".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer].into_boxed_slice(),
                     reduction_cascade: None,
@@ -131,10 +135,9 @@ fn run_null_aware_anti_join(
 #[test]
 fn null_aware_anti_join_preserves_not_in_three_valued_logic() {
     let null_int = || {
-        Expression::Constant(ConstantExpression::new(
-            Value::Null(LogicalType::Integer),
-            LogicalType::Integer,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Null(LogicalType::Integer), LogicalType::Integer).into(),
+        )
     };
     let probe_rows = || {
         vec![
@@ -200,13 +203,14 @@ fn hash_join_output_more_yields_between_output_chunks() {
                     join_type: JoinType::Inner,
                     build_keys_unique: false,
                     build_time_integer_index: None,
+                    runtime_filter: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    force_external: false,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -223,12 +227,15 @@ fn hash_join_output_more_yields_between_output_chunks() {
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
+                    covering_runtime_filter_key: None,
                     join_type: JoinType::Inner,
                     anti_join_mode: AntiJoinMode::Regular,
+                    mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(2),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -353,13 +360,14 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
             join_type: JoinType::Inner,
             build_keys_unique: false,
             build_time_integer_index: None,
+            runtime_filter: None,
             key_conditions: vec![join_condition()].into_boxed_slice(),
             residual_conditions: Box::default(),
             grouped_reduction_channels: None,
             build_projection: vec![1].into_boxed_slice(),
             build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
             build_output_count: 1,
-            force_external: false,
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
         }),
         sink_sharing: SinkSharing::Exclusive,
         properties: PipelineProperties::default(),
@@ -388,12 +396,15 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                 transforms: vec![
                     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: first_handle,
+                        covering_runtime_filter_key: None,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
+                        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                         key_conditions: vec![join_condition()].into_boxed_slice(),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,
                         left_projection: vec![0, 1].into_boxed_slice(),
+                        output_permutation: crate::physical::OutputPermutation::identity(3),
                         output_names: vec!["k".into(), "probe".into(), "first".into()]
                             .into_boxed_slice(),
                         output_types: vec![
@@ -406,12 +417,15 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                     }),
                     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: second_handle,
+                        covering_runtime_filter_key: None,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
+                        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                         key_conditions: vec![join_condition()].into_boxed_slice(),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,
                         left_projection: vec![1, 2].into_boxed_slice(),
+                        output_permutation: crate::physical::OutputPermutation::identity(3),
                         output_names: vec!["probe".into(), "first".into(), "second".into()]
                             .into_boxed_slice(),
                         output_types: vec![
@@ -551,11 +565,14 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
     let nation_rows = (0..25)
         .map(|nation| vec![int_constant(nation)])
         .collect::<Vec<_>>();
-    let predicate = Expression::Comparison(ComparisonExpression::new(
-        ComparisonType::Equal,
-        reference(0, LogicalType::Integer),
-        reference(2, LogicalType::Integer),
-    ));
+    let predicate = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::Equal,
+            reference(0, LogicalType::Integer),
+            reference(2, LogicalType::Integer),
+        )
+        .into(),
+    );
 
     let graph = PipelineGraph {
         pipelines: vec![
@@ -571,13 +588,14 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                     join_type: JoinType::Inner,
                     build_keys_unique: false,
                     build_time_integer_index: None,
+                    runtime_filter: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    force_external: false,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -592,6 +610,7 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                 transforms: Vec::new(),
                 sink: SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec {
                     handle: cross_handle,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -614,12 +633,15 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                     }),
                     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: hash_handle,
+                        covering_runtime_filter_key: None,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
+                        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                         key_conditions: vec![join_condition()].into_boxed_slice(),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,
                         left_projection: vec![1].into_boxed_slice(),
+                        output_permutation: crate::physical::OutputPermutation::identity(2),
                         output_names: vec!["nation".into(), "payload".into()].into_boxed_slice(),
                         output_types: vec![LogicalType::Integer, LogicalType::Integer]
                             .into_boxed_slice(),
@@ -932,13 +954,14 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
                     join_type: JoinType::Single,
                     build_keys_unique: false,
                     build_time_integer_index: None,
+                    runtime_filter: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    force_external: false,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -955,12 +978,15 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
+                    covering_runtime_filter_key: None,
                     join_type: JoinType::Single,
                     anti_join_mode: AntiJoinMode::Regular,
+                    mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(2),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -1030,11 +1056,11 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
 }
 
 #[test]
-fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
+fn hash_join_full_outer_applies_output_permutation_to_all_row_classes() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
     let join_row_type = RowType::new(
-        vec!["lv".to_string(), "rv".to_string()],
+        vec!["rv".to_string(), "lv".to_string()],
         vec![LogicalType::Integer, LogicalType::Integer],
     );
     let mut handles = BreakerHandleCatalogBuilder::default();
@@ -1064,16 +1090,17 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                 transforms: Vec::new(),
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
-                    join_type: JoinType::Right,
+                    join_type: JoinType::Outer,
                     build_keys_unique: false,
                     build_time_integer_index: None,
+                    runtime_filter: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    force_external: false,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -1085,18 +1112,25 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
             PipelineSpec {
                 id: probe_id,
                 source: SourceSpec::Values(values_spec(
-                    vec![vec![int_constant(1), int_constant(100)]],
+                    vec![
+                        vec![int_constant(1), int_constant(100)],
+                        vec![int_constant(3), int_constant(300)],
+                    ],
                     vec![LogicalType::Integer, LogicalType::Integer],
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
-                    join_type: JoinType::Right,
+                    covering_runtime_filter_key: None,
+                    join_type: JoinType::Outer,
                     anti_join_mode: AntiJoinMode::Regular,
+                    mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
-                    output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::from_forward([1, 0])
+                        .unwrap(),
+                    output_names: vec!["rv".to_string(), "lv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
                     reduction_cascade: None,
@@ -1110,9 +1144,11 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                 id: unmatched_id,
                 source: SourceSpec::HashJoinUnmatched(HashJoinUnmatchedSourceSpec {
                     handle,
-                    join_type: JoinType::Right,
+                    join_type: JoinType::Outer,
                     left_output_types: vec![LogicalType::Integer].into_boxed_slice(),
-                    output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::from_forward([1, 0])
+                        .unwrap(),
+                    output_names: vec!["rv".to_string(), "lv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
                     reduction_cascade: None,
@@ -1173,15 +1209,20 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
         run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
     }
 
-    let matched = output.pop_front().expect("right join matched output");
-    assert_eq!(matched.size(), 1);
-    assert_eq!(matched.column(0).unwrap().get_i32(0), Some(100));
-    assert_eq!(matched.column(1).unwrap().get_i32(0), Some(10));
-
-    let unmatched = output.pop_front().expect("right join unmatched output");
-    assert_eq!(unmatched.size(), 1);
-    assert!(unmatched.column(0).unwrap().is_null(0));
-    assert_eq!(unmatched.column(1).unwrap().get_i32(0), Some(20));
+    let mut rows = Vec::new();
+    while let Some(chunk) = output.pop_front() {
+        for row in 0..chunk.size() {
+            rows.push((
+                chunk.column(0).unwrap().get_i32(row),
+                chunk.column(1).unwrap().get_i32(row),
+            ));
+        }
+    }
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![(None, Some(300)), (Some(10), Some(100)), (Some(20), None)]
+    );
 }
 
 #[test]

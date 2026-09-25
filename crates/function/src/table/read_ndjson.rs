@@ -80,6 +80,19 @@ struct ReadNdjsonBindData {
 }
 
 impl TableFunctionBindData for ReadNdjsonBindData {
+    fn canonical_plan_payload(&self) -> Option<Vec<u8>> {
+        Some(
+            serde_json::json!([
+                "paro.read-ndjson.v1",
+                self.source.identity_value(),
+                self.names,
+                self.types
+            ])
+            .to_string()
+            .into_bytes(),
+        )
+    }
+
     fn clone_box(&self) -> Box<dyn TableFunctionBindData> {
         Box::new(self.clone())
     }

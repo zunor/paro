@@ -44,6 +44,18 @@ fn test_insert_on_conflict_stmt_display() {
 }
 
 #[test]
+fn test_timestamp_without_time_zone_type() {
+    let tokens =
+        tokenize_sql("create table events (created_at timestamp without time zone not null)")
+            .unwrap();
+    let stmt = parse_one_tokens(&tokens).unwrap();
+    assert_eq!(
+        stmt.stmt.to_string(),
+        "CREATE TABLE events (created_at TIMESTAMP NOT NULL)"
+    );
+}
+
+#[test]
 fn test_reserved_error() {
     let mut mint = Mint::new(GOLDEN_ROOT);
     let file = &mut mint.new_goldenfile("reserved-error.txt").unwrap();

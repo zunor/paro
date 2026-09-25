@@ -138,6 +138,9 @@ product-contract problems. Current registered profiles are:
 | `explain_summary_timing` | Normalize EXPLAIN summary timing text | `Planning Time: ...`, `Execution Time: ...` | Stable |
 | `explain_runtime_bytes` | Normalize volatile spill/memory byte fields | `Memory: ...`, `Disk: ...`, `Peak Memory: ...`, `Temp Storage: ...` | Stable |
 | `explain_routine_ids` | Normalize catalog ids embedded in routine labels | `Routine: name[id@generation]`, `Routines: ...` | Stable |
+| `explain_cte_ids` | Normalize allocation-dependent CTE ids while preserving repeated-id equality | `CTE Index: ...` | Stable |
+| `explain_logical_ids` | Alpha-rename allocation-dependent logical ids while preserving presence and shared-node identity | Text/JSON `logical_node_id` | Stable |
+| `explain_schema_order` | Canonicalize unordered internal relational schemas while preserving every typed field | `Output Schema: ...` | Stable |
 | `explain_external_runtime` | Normalize volatile external runtime latency fields | `Latency(us): acquire=... queue=... kernel=... encode_decode=...` | Stable |
 | `explain_runtime` | Legacy alias combining operator + summary timing normalization | `actual time=...`, `Planning Time: ...`, `Execution Time: ...` | Transitional |
 | `transaction_ids` | Normalize volatile ids in concurrency error text | `TxnId(...)`, `transaction ...`, table/db/read/commit ids | Stable |
@@ -174,6 +177,9 @@ Current actions are:
 Notes:
 
 - `restart` only works against a local Paro listener (`localhost` / `127.0.0.1`).
+- The runner preserves the listener's working directory, including relative
+  data/config paths. If it cannot establish that directory, it rejects the
+  restart before stopping the server; it never substitutes the checkout root.
 - Runtime profiles live under `[runtime_profiles.<name>]` in `regress/config.toml`.
 - Profile-managed environment keys are cleared before each restart, so switching back to `profile=default` returns to a clean runtime state.
 - `connect` preserves the current connection target unless you override fields such as `user`, `database`, `host`, `port`, or `password`.
@@ -245,6 +251,9 @@ The fixture contract is intentionally narrow:
 1. Declare staged roots with `-- @fixture python_udf/modules/basic_math`
 2. Reference the staged location with `{{fixture:python_udf/modules/basic_math}}`
 3. Keep artifact resolution and worker bootstrap on the real product path; fixture staging only copies files into the run-local report area
+4. Execute the expanded absolute path, but retain the original fixture token in
+   the transcript's SQL identity. Fixture substitution does not scrub result
+   values or errors; explicitly requested normalizers retain their own scope.
 
 Example:
 

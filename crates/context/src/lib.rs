@@ -4,20 +4,25 @@
 //! Statement-time context model shared by planning, optimization, and execution.
 
 mod attached_databases;
+pub mod compile_diagnostics;
 mod ddl;
+mod diagnostic_environment;
 mod effective_settings;
 mod execution_resources;
 mod memory_governance;
 mod query_resources;
 mod runtime_limits;
+mod session_diagnostics;
 mod session_metadata;
 mod session_random;
 mod statement_cancellation;
 mod statement_context;
 mod statement_environment;
+mod statement_graphs;
 mod statement_input;
 mod statement_options;
 mod statement_time;
+mod statement_trace;
 mod statement_view;
 mod txn_admission;
 mod write_class;
@@ -32,7 +37,16 @@ pub use attached_databases::{
     AttachedDatabaseTransactionMetricsSnapshot, AttachedDatabaseWalMetricsSnapshot,
     DatabaseSnapshotIdentity,
 };
+pub use compile_diagnostics::{
+    AdmissionFallback, AdmissionReceiptId, AdmissionResult, ArtifactIdentity, CompiledArtifactId,
+    ExecutionImageStatus, ExecutionReceipt, ExecutionReceiptId, ExecutionTerminal,
+    MemoryCompletionReceipt, PlanStructureId, ResourceReceipt, SelectionIdentity,
+    RECEIPT_SCHEMA_VERSION,
+};
 pub use ddl::{DdlApplyContext, IndexBuildHandle, PreparedIndexArtifact};
+pub use diagnostic_environment::{
+    initialize_diagnostic_environment, snapshot as diagnostic_environment,
+};
 pub use effective_settings::EffectiveSettings;
 pub use execution_resources::ExecutionResources;
 pub use memory_governance::{
@@ -50,6 +64,11 @@ pub use query_resources::{
     QueryResourceGovernance, QueryResources,
 };
 pub use runtime_limits::RuntimeLimits;
+pub use session_diagnostics::{
+    compile_work_evidence_enabled, CompileReceiptSummary, CompileWork, ExecutionReceiptHandle,
+    ExecutionReceiptStart, OptimizerDiagnostic, OptimizerMetricUnit, SessionDiagnostics,
+    StatementCacheDecision, COMPILE_RECEIPT_SCHEMA_VERSION,
+};
 pub use session_metadata::{
     CursorSummary, PreparedStatementSummary, SessionMetadataProvider, SessionMetadataRows,
     SettingRow,
@@ -59,11 +78,18 @@ pub use statement_cancellation::{
     NoopStatementTimeoutDriver, StatementCancelReason, StatementCancellation,
     StatementTimeoutDriver,
 };
-pub use statement_context::{CompileEnvironmentKey, StatementContext};
+pub use statement_context::{CompileEnvironmentKey, CompileNamespace, StatementContext};
+mod compile_resources;
+pub use compile_resources::{CompileGrant, CompileResources};
 pub use statement_environment::{StatementAuthContext, StatementEnvironment};
+pub use statement_graphs::StatementGraphSnapshots;
 pub use statement_input::StatementInput;
 pub use statement_options::{ExplainOutputType, StatementOptions, StatementSource};
 pub use statement_time::StatementTimeContext;
+pub use statement_trace::{
+    fingerprint as statement_fingerprint, StatementTrace, StatementTraceEvent,
+    StatementTraceSnapshot, STATEMENT_TRACE_SCHEMA_VERSION,
+};
 pub use statement_view::StatementView;
 pub use txn_admission::{
     catalog_object_resource, ddl_lock_requests, dml_table_lock_requests, schema_resource,

@@ -19,15 +19,15 @@ QUERY PLAN
 ORDER_BY  (rows=1)
   Sort Key: id ASC NULLS LAST
   ->  PROJECTION  (rows=1)
-    Output: id
-    ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=1)
-      Search Definition: <search-definition-id>
-      Search Generation: <search-generation-id>
-      Search Root: <search-root-id>
-      Search Capability: Queryable
-      Search Candidate: full text
-      Column: content
-      Mode: Filter
+        Output: id
+        ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=1)
+              Search Definition: <search-definition-id>
+              Search Generation: <search-generation-id>
+              Search Root: <search-root-id>
+              Search Capability: queryable
+              Search Candidate: full text
+              Column: content
+              Mode: filter
 
 -- @normalize explain_search_ids
 EXPLAIN
@@ -40,21 +40,16 @@ ORDER BY ts_rank(
 ) DESC
 LIMIT 5;
 QUERY PLAN
-PROJECTION  (rows=1)
+PROJECTION  (rows=2)
   Output: id
-  ->  TOP_N  (rows=1)
-    Sort Key: ts_rank(to_tsvector('simple', public.ft_coverage_guard.content), 'vector') DESC NULLS FIRST
-    Limit: 5
-    ->  PROJECTION  (rows=1)
-      Output: id, ts_rank(to_tsvector('simple', public.ft_coverage_guard.content), 'vector')
-      ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=1)
+  ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=2)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>
         Search Root: <search-root-id>
-        Search Capability: Queryable
+        Search Capability: queryable
         Search Candidate: full text
         Column: content
-        Mode: Filter
+        Mode: top_k:5
 
 SELECT id
 FROM ft_coverage_guard

@@ -8,14 +8,16 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[cfg(debug_assertions)]
 use super::debug_info::AllocatorDebugInfo;
 use super::Allocator;
-use crate::error::Result;
+use crate::error::{self as paro_error, Result};
 
 /// Number of memory tags (must match MemoryTag enum variants).
 pub const MEMORY_TAG_COUNT: usize = 23;
@@ -398,6 +400,46 @@ pub trait BufferManager: Send + Sync {
     /// A raw pointer to the allocated memory.
     fn allocate(&self, tag: MemoryTag, size: usize) -> Result<*mut u8>;
 
+    /// Allocate zeroed memory with a manager-owned initialization contract.
+    ///
+    /// Managers whose allocation primitive already returns zeroed storage
+    /// should override this method so the compute-side allocator does not
+    /// clear the same bytes a second time. The default remains safe for
+    /// managers that only provide an uninitialized allocation primitive.
+    fn allocate_zeroed(&self, tag: MemoryTag, size: usize) -> Result<*mut u8> {
+        let ptr = self.allocate(tag, size)?;
+        if !ptr.is_null() && size > 0 {
+            // SAFETY: the manager returned a valid allocation of `size` bytes.
+            unsafe { std::ptr::write_bytes(ptr, 0, size) };
+        }
+        Ok(ptr)
+    }
+
+    /// Reserve a bounded amount of manager capacity for several small
+    /// allocations. `None` means this manager does not support batched
+    /// admission and callers must use [`Self::allocate`] directly.
+    ///
+    /// A successful reservation is accounted as used capacity immediately;
+    /// [`Self::allocate_reserved`] consumes it and
+    /// [`Self::release_reserved`] returns any unconsumed remainder.
+    fn reserve(&self, _tag: MemoryTag, _size: usize) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
+    /// Allocate one buffer from a previously granted reservation.
+    ///
+    /// On failure the requested bytes remain reserved. The caller must keep
+    /// or release that reservation; an implementation must not consume the
+    /// quota for an allocation which it did not return.
+    fn allocate_reserved(&self, _tag: MemoryTag, _size: usize) -> Result<*mut u8> {
+        Err(paro_error::not_supported(
+            "buffer manager does not support reserved allocation",
+        ))
+    }
+
+    /// Return unused bytes from a previous [`Self::reserve`] call.
+    fn release_reserved(&self, _tag: MemoryTag, _size: usize) {}
+
     /// Free memory previously allocated via this manager.
     ///
     /// # Arguments
@@ -436,6 +478,16 @@ struct AllocationEntry {
     tag: MemoryTag,
 }
 
+/// Bytes admitted for the allocator but not yet consumed by a concrete
+/// allocation. This is deliberately bounded and local to one allocator
+/// instance; it is not a cache of data and never crosses a query allocator.
+#[derive(Debug, Default)]
+struct LocalAdmission {
+    available: usize,
+}
+
+const LOCAL_ADMISSION_REFILL_BYTES: usize = 256 * 1024;
+
 /// Allocator implementation that delegates to a `BufferManager`.
 ///
 /// This allows compute-layer components (Vectors, Chunks) to use
@@ -461,6 +513,10 @@ pub struct BufferAllocator {
     /// Track allocations for proper cleanup
     /// Maps pointer address to allocation metadata
     allocations: RwLock<HashMap<usize, AllocationEntry>>,
+    /// Small bounded admission quota used by temporary vector/scratch
+    /// allocations. The quota lock is local to this allocator; the manager's
+    /// global admission lock is held only while refilling it.
+    admission: Mutex<LocalAdmission>,
     /// Debug allocation tracking (debug builds only)
     #[cfg(debug_assertions)]
     debug_info: Arc<AllocatorDebugInfo>,
@@ -477,6 +533,7 @@ impl BufferAllocator {
             manager,
             tag,
             allocations: RwLock::new(HashMap::new()),
+            admission: Mutex::new(LocalAdmission::default()),
             #[cfg(debug_assertions)]
             debug_info: Arc::new(AllocatorDebugInfo::new("BufferAllocator")),
         }
@@ -510,15 +567,51 @@ impl BufferAllocator {
             .map(|e| e.size)
             .sum()
     }
-}
 
-impl Allocator for BufferAllocator {
-    fn allocate(&self, size: usize) -> Result<*mut u8> {
+    fn allocate_from_manager(&self, size: usize, zeroed: bool) -> Result<*mut u8> {
         if size == 0 {
             return Ok(std::ptr::null_mut());
         }
 
-        let ptr = self.manager.allocate(self.tag, size)?;
+        let mut admission = self.admission.lock().unwrap();
+        if admission.available < size {
+            let refill = size.max(LOCAL_ADMISSION_REFILL_BYTES);
+            let Some(reserved) = self.manager.reserve(self.tag, refill)? else {
+                drop(admission);
+                return if zeroed {
+                    self.manager.allocate_zeroed(self.tag, size)
+                } else {
+                    self.manager.allocate(self.tag, size)
+                };
+            };
+            if reserved < size {
+                self.manager.release_reserved(self.tag, reserved);
+                return Err(paro_error::internal(format!(
+                    "buffer manager reserved {} bytes for an allocation of {} bytes",
+                    reserved, size
+                )));
+            }
+            admission.available = admission.available.saturating_add(reserved);
+        }
+
+        admission.available -= size;
+        drop(admission);
+
+        let allocation = self.manager.allocate_reserved(self.tag, size);
+        if allocation.is_err() {
+            let mut admission = self.admission.lock().unwrap();
+            admission.available = admission.available.saturating_add(size);
+        }
+        allocation
+    }
+}
+
+impl Allocator for BufferAllocator {
+    fn allocate(&self, size: usize) -> Result<*mut u8> {
+        let ptr = self.allocate_from_manager(size, false)?;
+        if ptr.is_null() {
+            return Ok(ptr);
+        }
 
         // Track the allocation
         record_allocator_tracking_event();
@@ -538,13 +631,27 @@ impl Allocator for BufferAllocator {
     }
 
     fn allocate_zeroed(&self, size: usize) -> Result<*mut u8> {
-        let ptr = self.allocate(size)?;
-        if !ptr.is_null() && size > 0 {
-            // SAFETY: ptr is valid and size bytes are allocated
-            unsafe {
-                std::ptr::write_bytes(ptr, 0, size);
-            }
+        let ptr = self.allocate_from_manager(size, true)?;
+        if ptr.is_null() {
+            return Ok(ptr);
         }
+
+        // The manager owns initialization when it supports reserved
+        // allocations. Fallback managers already performed it in
+        // `allocate_zeroed`; neither path reaches an extra clear here.
+        record_allocator_tracking_event();
+        let mut allocations = self.allocations.write().unwrap();
+        allocations.insert(
+            ptr as usize,
+            AllocationEntry {
+                size,
+                tag: self.tag,
+            },
+        );
+
+        #[cfg(debug_assertions)]
+        self.debug_info.record_allocate(ptr, size);
+
         Ok(ptr)
     }
 
@@ -644,6 +751,11 @@ impl Drop for BufferAllocator {
             self.debug_info.record_free(ptr as *mut u8, entry.size);
             self.manager.free(ptr as *mut u8, entry.tag, entry.size);
         }
+
+        let remaining = self.admission.get_mut().unwrap().available;
+        if remaining > 0 {
+            self.manager.release_reserved(self.tag, remaining);
+        }
     }
 }
 
@@ -662,12 +774,9 @@ mod tests {
                 usage: MemoryUsage::new(),
             }
         }
-    }
 
-    impl BufferManager for TestBufferManager {
-        fn allocate(&self, tag: MemoryTag, size: usize) -> Result<*mut u8> {
-            self.usage.add(tag, size);
-            // Use standard allocation for testing
+        fn allocate_raw(&self, size: usize) -> Result<*mut u8> {
+            // Use standard allocation for testing.
             let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
             // SAFETY: layout is valid
             let ptr = unsafe { std::alloc::alloc(layout) };
@@ -678,6 +787,13 @@ mod tests {
                 )));
             }
             Ok(ptr)
+        }
+    }
+
+    impl BufferManager for TestBufferManager {
+        fn allocate(&self, tag: MemoryTag, size: usize) -> Result<*mut u8> {
+            self.usage.add(tag, size);
+            self.allocate_raw(size)
         }
 
         fn free(&self, ptr: *mut u8, tag: MemoryTag, size: usize) {
@@ -722,6 +838,68 @@ mod tests {
             self.usage.add(tag, new_size);
 
             Ok(new_ptr)
+        }
+    }
+
+    struct ReservationBufferManager {
+        base: TestBufferManager,
+        reserved: AtomicUsize,
+        fail_reserved: bool,
+    }
+
+    impl ReservationBufferManager {
+        fn new(fail_reserved: bool) -> Self {
+            Self {
+                base: TestBufferManager::new(),
+                reserved: AtomicUsize::new(0),
+                fail_reserved,
+            }
+        }
+    }
+
+    impl BufferManager for ReservationBufferManager {
+        fn allocate(&self, tag: MemoryTag, size: usize) -> Result<*mut u8> {
+            self.base.allocate(tag, size)
+        }
+
+        fn reserve(&self, tag: MemoryTag, size: usize) -> Result<Option<usize>> {
+            self.base.usage.add(tag, size);
+            self.reserved.fetch_add(size, Ordering::AcqRel);
+            Ok(Some(size))
+        }
+
+        fn allocate_reserved(&self, _tag: MemoryTag, size: usize) -> Result<*mut u8> {
+            if self.fail_reserved {
+                return Err(paro_error::out_of_memory(
+                    "injected reserved allocation failure",
+                ));
+            }
+
+            let previous = self.reserved.fetch_sub(size, Ordering::AcqRel);
+            assert!(previous >= size);
+            self.base.allocate_raw(size).inspect_err(|_| {
+                self.reserved.fetch_add(size, Ordering::AcqRel);
+            })
+        }
+
+        fn release_reserved(&self, tag: MemoryTag, size: usize) {
+            let previous = self.reserved.fetch_sub(size, Ordering::AcqRel);
+            assert!(previous >= size);
+            self.base.usage.sub(tag, size);
+        }
+
+        fn free(&self, ptr: *mut u8, tag: MemoryTag, size: usize) {
+            self.base.free(ptr, tag, size);
+        }
+
+        fn reallocate(
+            &self,
+            ptr: *mut u8,
+            tag: MemoryTag,
+            old_size: usize,
+            new_size: usize,
+        ) -> Result<*mut u8> {
+            self.base.reallocate(ptr, tag, old_size, new_size)
         }
     }
 
@@ -923,6 +1101,26 @@ mod tests {
         }
 
         allocator.free(ptr, 256);
+    }
+
+    #[test]
+    fn test_buffer_allocator_reserved_failure_keeps_and_releases_quota() {
+        let manager = Arc::new(ReservationBufferManager::new(true));
+        let allocator = BufferAllocator::new(manager.clone(), MemoryTag::HashTable);
+
+        assert!(allocator.allocate(1024).is_err());
+        assert_eq!(
+            manager.reserved.load(Ordering::Acquire),
+            LOCAL_ADMISSION_REFILL_BYTES
+        );
+        assert_eq!(
+            manager.base.usage.get(MemoryTag::HashTable),
+            LOCAL_ADMISSION_REFILL_BYTES as i64
+        );
+
+        drop(allocator);
+        assert_eq!(manager.reserved.load(Ordering::Acquire), 0);
+        assert_eq!(manager.base.usage.total(), 0);
     }
 
     #[test]

@@ -281,8 +281,7 @@ pub(crate) fn compile_state_filter(
             _ => return Ok(None),
         },
     };
-    let Some(constant) =
-        crate::physical::generator::predicate_builder::evaluate_bound_constant(constant_expr)?
+    let Some(constant) = paro_planner::expression::evaluate_constant_expression(constant_expr)?
     else {
         return Ok(None);
     };

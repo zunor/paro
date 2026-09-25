@@ -36,9 +36,17 @@ impl TableFunctionBindData for ParoOptimizersBindData {
 #[derive(Debug, Clone)]
 pub struct OptimizerData {
     pub name: String,
-    pub enabled: bool,
+    pub kind: String,
     pub last_elapsed_us: i64,
+    pub metric_value: i64,
+    pub metric_unit: String,
     pub invocation_count: i64,
+    /// Versioned machine record.  Human metric columns remain available for
+    /// optimizer counters, but receipt consumers must use this typed payload
+    /// instead of reconstructing enums from names and integers.
+    pub record_type: String,
+    pub record_id: u64,
+    pub payload_json: Option<String>,
 }
 
 pub struct ParoOptimizersGlobalState {
@@ -76,14 +84,29 @@ fn paro_optimizers_bind(
     names.push("name".to_string());
     return_types.push(LogicalType::Varchar);
 
-    names.push("enabled".to_string());
-    return_types.push(LogicalType::Boolean);
+    names.push("kind".to_string());
+    return_types.push(LogicalType::Varchar);
 
     names.push("last_elapsed_us".to_string());
     return_types.push(LogicalType::BigInt);
 
+    names.push("metric_value".to_string());
+    return_types.push(LogicalType::BigInt);
+
+    names.push("metric_unit".to_string());
+    return_types.push(LogicalType::Varchar);
+
     names.push("invocation_count".to_string());
     return_types.push(LogicalType::BigInt);
+
+    names.push("record_type".to_string());
+    return_types.push(LogicalType::Varchar);
+
+    names.push("record_id".to_string());
+    return_types.push(LogicalType::BigInt);
+
+    names.push("payload_json".to_string());
+    return_types.push(LogicalType::Varchar);
 
     Ok(Some(Box::new(ParoOptimizersBindData)))
 }
@@ -118,15 +141,25 @@ fn paro_optimizers_function(
 
     let batch_size = 2048.min(gstate.entries.len() - offset);
     let mut names = Vec::with_capacity(batch_size);
-    let mut enabled = Vec::with_capacity(batch_size);
+    let mut kinds = Vec::with_capacity(batch_size);
     let mut last_elapsed = Vec::with_capacity(batch_size);
+    let mut metric_values = Vec::with_capacity(batch_size);
+    let mut metric_units = Vec::with_capacity(batch_size);
     let mut invocations = Vec::with_capacity(batch_size);
+    let mut record_types = Vec::with_capacity(batch_size);
+    let mut record_ids = Vec::with_capacity(batch_size);
+    let mut payloads = Vec::with_capacity(batch_size);
 
     for entry in gstate.entries.iter().skip(offset).take(batch_size) {
         names.push(entry.name.clone());
-        enabled.push(entry.enabled);
+        kinds.push(entry.kind.clone());
         last_elapsed.push(entry.last_elapsed_us);
+        metric_values.push(entry.metric_value);
+        metric_units.push(entry.metric_unit.clone());
         invocations.push(entry.invocation_count);
+        record_types.push(entry.record_type.clone());
+        record_ids.push(entry.record_id);
+        payloads.push(entry.payload_json.clone().unwrap_or_default());
     }
 
     gstate.offset.fetch_add(batch_size, Ordering::Relaxed);
@@ -136,13 +169,36 @@ fn paro_optimizers_function(
         *col = Vector::try_from_strings(&name_refs, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(1) {
-        *col = Vector::try_from_bool(&enabled, output_allocator.clone())?;
+        let kind_refs: Vec<&str> = kinds.iter().map(|value| value.as_str()).collect();
+        *col = Vector::try_from_strings(&kind_refs, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(2) {
         *col = Vector::try_from_i64(&last_elapsed, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(3) {
+        *col = Vector::try_from_i64(&metric_values, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(4) {
+        let unit_refs: Vec<&str> = metric_units.iter().map(|value| value.as_str()).collect();
+        *col = Vector::try_from_strings(&unit_refs, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(5) {
         *col = Vector::try_from_i64(&invocations, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(6) {
+        let refs: Vec<&str> = record_types.iter().map(String::as_str).collect();
+        *col = Vector::try_from_strings(&refs, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(7) {
+        let ids: Vec<i64> = record_ids
+            .iter()
+            .map(|id| (*id).min(i64::MAX as u64) as i64)
+            .collect();
+        *col = Vector::try_from_i64(&ids, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(8) {
+        let refs: Vec<&str> = payloads.iter().map(String::as_str).collect();
+        *col = Vector::try_from_strings(&refs, output_allocator)?;
     }
     output.set_cardinality(batch_size);
 
@@ -202,15 +258,30 @@ mod tests {
         assert!(bind.is_some());
         assert_eq!(
             names,
-            vec!["name", "enabled", "last_elapsed_us", "invocation_count"]
+            vec![
+                "name",
+                "kind",
+                "last_elapsed_us",
+                "metric_value",
+                "metric_unit",
+                "invocation_count",
+                "record_type",
+                "record_id",
+                "payload_json"
+            ]
         );
         assert_eq!(
             return_types,
             vec![
                 LogicalType::Varchar,
-                LogicalType::Boolean,
+                LogicalType::Varchar,
                 LogicalType::BigInt,
                 LogicalType::BigInt,
+                LogicalType::Varchar,
+                LogicalType::BigInt,
+                LogicalType::Varchar,
+                LogicalType::BigInt,
+                LogicalType::Varchar,
             ]
         );
     }
@@ -228,16 +299,26 @@ mod tests {
             state,
             vec![
                 OptimizerData {
-                    name: "filter_pushdown".to_string(),
-                    enabled: true,
+                    name: "semantic_normalization".to_string(),
+                    kind: "frontend".to_string(),
                     last_elapsed_us: 42,
+                    metric_value: 7,
+                    metric_unit: "invocations".to_string(),
                     invocation_count: 7,
+                    record_type: "metric".to_string(),
+                    record_id: 0,
+                    payload_json: None,
                 },
                 OptimizerData {
-                    name: "join_order".to_string(),
-                    enabled: false,
+                    name: "memo_exploration".to_string(),
+                    kind: "search".to_string(),
                     last_elapsed_us: 0,
+                    metric_value: 0,
+                    metric_unit: "invocations".to_string(),
                     invocation_count: 0,
+                    record_type: "metric".to_string(),
+                    record_id: 0,
+                    payload_json: None,
                 },
             ],
         );
@@ -254,9 +335,14 @@ mod tests {
         let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::Varchar,
-                LogicalType::Boolean,
+                LogicalType::Varchar,
                 LogicalType::BigInt,
                 LogicalType::BigInt,
+                LogicalType::Varchar,
+                LogicalType::BigInt,
+                LogicalType::Varchar,
+                LogicalType::BigInt,
+                LogicalType::Varchar,
             ],
             2048,
         );
@@ -266,14 +352,31 @@ mod tests {
         assert_eq!(chunk.size(), 2);
         assert_eq!(
             chunk.column(0).unwrap().get_value(0),
-            Value::Varchar("filter_pushdown".to_string())
+            Value::Varchar("semantic_normalization".to_string())
         );
-        assert_eq!(chunk.column(1).unwrap().get_value(0), Value::Boolean(true));
+        assert_eq!(
+            chunk.column(1).unwrap().get_value(0),
+            Value::Varchar("frontend".to_string())
+        );
         assert_eq!(chunk.column(2).unwrap().get_value(0), Value::BigInt(42));
         assert_eq!(chunk.column(3).unwrap().get_value(0), Value::BigInt(7));
         assert_eq!(
+            chunk.column(4).unwrap().get_value(0),
+            Value::Varchar("invocations".to_string())
+        );
+        assert_eq!(chunk.column(5).unwrap().get_value(0), Value::BigInt(7));
+        assert_eq!(
+            chunk.column(6).unwrap().get_value(0),
+            Value::Varchar("metric".to_string())
+        );
+        assert_eq!(chunk.column(7).unwrap().get_value(0), Value::BigInt(0));
+        assert_eq!(
+            chunk.column(8).unwrap().get_value(0),
+            Value::Varchar("".to_string())
+        );
+        assert_eq!(
             chunk.column(0).unwrap().get_value(1),
-            Value::Varchar("join_order".to_string())
+            Value::Varchar("memo_exploration".to_string())
         );
     }
 
@@ -289,10 +392,15 @@ mod tests {
         populate_optimizer_data(
             state,
             vec![OptimizerData {
-                name: "filter_pushdown".to_string(),
-                enabled: true,
+                name: "semantic_normalization".to_string(),
+                kind: "frontend".to_string(),
                 last_elapsed_us: 1,
+                metric_value: 1,
+                metric_unit: "invocations".to_string(),
                 invocation_count: 1,
+                record_type: "metric".to_string(),
+                record_id: 0,
+                payload_json: None,
             }],
         );
 

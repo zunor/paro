@@ -61,6 +61,14 @@ impl StreamingTopNTransformExec {
                 &order_exprs,
                 ctx.query.session.as_ref(),
             ),
+            payload_chunk: Chunk::try_init_empty(
+                &self.spec.output_types,
+                ctx.query.allocator(MemoryTag::BaseTable),
+            )?,
+            payload_reset_chunk: Chunk::try_init_empty(
+                &self.spec.output_types,
+                ctx.query.allocator(MemoryTag::BaseTable),
+            )?,
             output_chunks: Default::default(),
             finalized: false,
         }))
@@ -100,7 +108,13 @@ impl StreamingTopNTransformExec {
             ctx.query,
             &mut sort_chunk,
         )?;
-        local.heap.sink_with_sort_chunk(input, &sort_chunk, None)?;
+        local
+            .payload_chunk
+            .reference_columns(input, &self.spec.projection_map);
+        local
+            .heap
+            .sink_with_sort_chunk(&local.payload_chunk, &sort_chunk, None)?;
+        local.payload_chunk.reference(&local.payload_reset_chunk);
         Ok(TransformPoll::NeedMoreInput)
     }
 

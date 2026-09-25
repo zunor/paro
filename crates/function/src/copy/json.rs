@@ -23,6 +23,12 @@ struct NdjsonCopyBindData {
 }
 
 impl CopyFunctionBindData for NdjsonCopyBindData {
+    fn canonical_plan_payload(&self) -> Vec<u8> {
+        serde_json::json!(["paro.copy.ndjson.v1", self.names])
+            .to_string()
+            .into_bytes()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

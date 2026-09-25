@@ -57,6 +57,8 @@ pub struct TopNBuildSinkLocal {
     pub order_executor: ExpressionExecutor,
     pub order_types: Box<[LogicalType]>,
     pub sort_chunk: Chunk,
+    pub payload_chunk: Chunk,
+    pub payload_reset_chunk: Chunk,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +68,8 @@ pub struct StreamingTopNTransformGlobal;
 pub struct StreamingTopNTransformLocal {
     pub heap: TopNHeap,
     pub order_executor: ExpressionExecutor,
+    pub payload_chunk: Chunk,
+    pub payload_reset_chunk: Chunk,
     pub output_chunks: VecDeque<Chunk>,
     pub finalized: bool,
 }

@@ -6,11 +6,11 @@
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_execution::query_executor::compiled::ResultColumnDesc;
-use paro_session::{encode_binary_value, FormatCode};
+use paro_session::FormatCode;
 use pgwire::messages::data::MESSAGE_TYPE_BYTE_DATA_ROW;
 use tokio_util::bytes::{BufMut, BytesMut};
 
-use super::value_format::TextVectorEncoder;
+use super::value_format::{BinaryVectorEncoder, TextVectorEncoder};
 
 const MESSAGE_HEADER_BYTES: usize = 1 + size_of::<i32>();
 const FIELD_COUNT_BYTES: usize = size_of::<i16>();
@@ -148,6 +148,7 @@ pub(crate) fn encode_chunk_rows(
     format_codes: &[FormatCode],
 ) -> Result<EncodedDataRows> {
     let mut text_columns = Vec::with_capacity(schema.len());
+    let mut binary_columns = Vec::with_capacity(schema.len());
     let mut encoded_value_hint = 0usize;
     for col_idx in 0..schema.len() {
         let format = format_codes.get(col_idx).unwrap_or(&FormatCode::Text);
@@ -159,21 +160,35 @@ pub(crate) fn encode_chunk_rows(
         } else {
             None
         };
+        let binary_column = if matches!(format, FormatCode::Binary) {
+            chunk
+                .column(col_idx)
+                .map(|vector| BinaryVectorEncoder::try_new(vector, chunk.size()))
+                .transpose()?
+        } else {
+            None
+        };
         if let Some(column) = &column {
             encoded_value_hint = encoded_value_hint
                 .checked_add(column.encoded_bytes_hint(chunk.size()))
                 .ok_or_else(|| paro_error::internal("PostgreSQL row batch size overflow"))?;
         }
+        if let Some(column) = &binary_column {
+            encoded_value_hint = encoded_value_hint
+                .checked_add(column.encoded_bytes_hint(chunk.size()))
+                .ok_or_else(|| paro_error::internal("PostgreSQL row batch size overflow"))?;
+        }
         text_columns.push(column);
+        binary_columns.push(binary_column);
     }
     let mut encoder = DataRowBatchEncoder::new(chunk.size(), schema.len(), encoded_value_hint)?;
     for row_idx in 0..chunk.size() {
         let row_start = encoder.begin_row();
-        for (col_idx, column) in schema.iter().enumerate() {
-            let Some(vector) = chunk.column(col_idx) else {
+        for col_idx in 0..schema.len() {
+            if text_columns[col_idx].is_none() && binary_columns[col_idx].is_none() {
                 encoder.append_null();
                 continue;
-            };
+            }
             match format_codes.get(col_idx).unwrap_or(&FormatCode::Text) {
                 FormatCode::Text => {
                     let column = text_columns[col_idx].as_mut().ok_or_else(|| {
@@ -188,15 +203,15 @@ pub(crate) fn encode_chunk_rows(
                     }
                 }
                 FormatCode::Binary => {
-                    if vector.is_null(row_idx) {
+                    let column = binary_columns[col_idx].as_ref().ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "PostgreSQL binary column encoder missing at index {col_idx}"
+                        ))
+                    })?;
+                    if column.is_null(row_idx) {
                         encoder.append_null();
                     } else {
-                        encoder.append_value(|buffer| {
-                            let value = vector.get_value(row_idx);
-                            let payload = encode_binary_value(&value, &column.logical_type)?;
-                            buffer.extend_from_slice(&payload);
-                            Ok(())
-                        })?;
+                        encoder.append_value(|buffer| column.append_non_null(buffer, row_idx))?;
                     }
                 }
             }

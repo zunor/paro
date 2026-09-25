@@ -30,7 +30,7 @@ fn decimal_cast(child: Expression, target_type: LogicalType) -> Expression {
     let cast_info = casts
         .get_cast_function(&source_type, &target_type)
         .expect("bind canonical DECIMAL cast");
-    Expression::Cast(CastExpression::new(child, target_type, cast_info, false))
+    Expression::Cast(CastExpression::new(child, target_type, cast_info, false).into())
 }
 
 fn projected_reference(
@@ -62,22 +62,31 @@ fn decimal_sum_rollup_spec(
         .expect("DECIMAL SUM declares its finalized-partial reducer");
     assert_eq!(reducer_function.return_type, output_type);
 
-    let source_aggregate = Expression::Aggregate(AggregateExpression::new(
-        source_function,
-        vec![reference(1, input_type.clone())],
-        output_type.clone(),
-    ));
-    let reducer = Expression::Aggregate(AggregateExpression::new(
-        reducer_function,
-        vec![reference(0, output_type.clone())],
-        output_type.clone(),
-    ));
+    let source_aggregate = Expression::Aggregate(
+        AggregateExpression::new(
+            source_function,
+            vec![reference(1, input_type.clone())],
+            output_type.clone(),
+        )
+        .into(),
+    );
+    let reducer = Expression::Aggregate(
+        AggregateExpression::new(
+            reducer_function,
+            vec![reference(0, output_type.clone())],
+            output_type.clone(),
+        )
+        .into(),
+    );
     let scalar_expression = projected_reference(0, &output_type, &projected_type);
-    let predicate = Expression::Comparison(ComparisonExpression::new(
-        comparison,
-        projected_reference(0, &output_type, &projected_type),
-        reference(1, projected_type.clone()),
-    ));
+    let predicate = Expression::Comparison(
+        ComparisonExpression::new(
+            comparison,
+            projected_reference(0, &output_type, &projected_type),
+            reference(1, projected_type.clone()),
+        )
+        .into(),
+    );
     let post_reduction = PostAggregateReductionSpec {
         aggregate_types: Box::new([output_type.clone()]),
         reducers: Box::new([reducer]),
@@ -89,6 +98,7 @@ fn decimal_sum_rollup_spec(
     };
     let spec = AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -103,10 +113,19 @@ fn decimal_sum_rollup_spec(
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: Some(post_reduction),
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([4]),
-            max_local_tables,
+            resource: paro_planner::physical::PerfectHashResourceContract {
+                slots: 4,
+                table_bytes_upper: usize::MAX,
+                memory: paro_planner::physical::ExecutionMemoryContract {
+                    fixed_non_revocable_bytes: u64::MAX,
+                    max_concurrent_tasks: u16::try_from(max_local_tables).unwrap(),
+                    ..Default::default()
+                },
+            },
         }),
         output_names: Box::new(["key".to_string(), "sum".to_string()]),
         output_types: Box::new([LogicalType::Integer, output_type]),

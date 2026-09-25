@@ -62,6 +62,17 @@ impl TransformExec {
         }
     }
 
+    /// Whether omitting task-local state on a proven-empty input preserves the
+    /// transform's data-path result.
+    ///
+    /// Global finish still runs. This capability only proves that creating a
+    /// local state and flushing it without ever presenting an input chunk
+    /// cannot emit rows or publish local state. Dynamic transforms remain
+    /// conservative because their lifecycle contract is not statically known.
+    pub(crate) fn empty_local_flush_is_identity(&self) -> bool {
+        !matches!(self, Self::Dyn(_))
+    }
+
     /// Cold lifecycle dispatch; see [`SourceExec::create_global`](super::source::SourceExec::create_global).
     #[inline(never)]
     pub fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<TransformGlobal> {

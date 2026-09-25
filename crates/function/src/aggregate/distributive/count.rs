@@ -191,7 +191,7 @@ fn count_partial_merge(_source: &AggregateFunction) -> Option<AggregateFunction>
         Some(CountPartialMergeFunction::simple_update),
         None,
     )
-    .with_empty_input(AggregateEmptyInput::NonNull)
+    .with_empty_input(AggregateEmptyInput::Exact(Value::BigInt(0)))
     .with_partial_merge(count_partial_merge)
     .with_singleton_merge(AggregateSingletonMerge::InputOr(Value::BigInt(0)));
     // SAFETY: partial COUNT state is one inline i64 with no external ownership.
@@ -211,7 +211,7 @@ pub fn get_count_star_function() -> AggregateFunction {
         Some(CountFunction::simple_update_star),
         None,
     )
-    .with_empty_input(AggregateEmptyInput::NonNull);
+    .with_empty_input(AggregateEmptyInput::Exact(Value::BigInt(0)));
     // SAFETY: COUNT state is one inline i64 with no external ownership.
     unsafe { function.with_trivially_copyable_state() }
         .with_partial_merge(count_partial_merge)
@@ -244,7 +244,7 @@ pub fn get_count_function() -> AggregateFunctionSet {
             Some(CountFunction::simple_update),
             None,
         )
-        .with_empty_input(AggregateEmptyInput::NonNull)
+        .with_empty_input(AggregateEmptyInput::Exact(Value::BigInt(0)))
         .with_non_null_input(count_non_null_input);
         // SAFETY: COUNT state is one inline i64 with no external ownership.
         let function = unsafe { function.with_trivially_copyable_state() }

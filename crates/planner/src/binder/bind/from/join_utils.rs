@@ -10,11 +10,11 @@ use std::collections::HashSet;
 use crate::binder::context::BindContext;
 use crate::binder::ir::JoinType as BinderJoinType;
 use crate::expression::*;
-use crate::operator::{
+use crate::logical::operator::{
     AnyJoin, ComparisonJoin, Filter, Join, JoinComparisonType, JoinCondition, JoinSide, JoinType,
     LogicalOperator,
 };
-use crate::plan::LogicalPlan;
+use crate::logical::plan::OwnedLogicalPlan;
 use paro_common::error::Result;
 
 pub fn convert_join_type(binder_type: BinderJoinType) -> JoinType {
@@ -32,141 +32,17 @@ pub fn convert_join_type(binder_type: BinderJoinType) -> JoinType {
 }
 
 pub fn collect_table_bindings(op: &LogicalOperator) -> HashSet<usize> {
-    let mut bindings = HashSet::new();
-    collect_table_bindings_recursive(op, &mut bindings);
-    bindings
-}
-
-fn collect_table_bindings_recursive(op: &LogicalOperator, bindings: &mut HashSet<usize>) {
-    match op {
-        LogicalOperator::Get(get) => {
-            bindings.insert(get.table_index);
-        }
-        LogicalOperator::Filter(filter) => {
-            collect_table_bindings_recursive(&filter.child.operator, bindings);
-        }
-        LogicalOperator::Projection(proj) => {
-            collect_table_bindings_recursive(&proj.child.operator, bindings);
-        }
-        LogicalOperator::RowFetch(fetch) => {
-            bindings.extend(
-                fetch
-                    .sources
-                    .iter()
-                    .map(|source| source.materialized_table_index),
-            );
-            collect_table_bindings_recursive(&fetch.child.operator, bindings);
-        }
-        LogicalOperator::ExternalProject(project) => {
-            bindings.insert(project.project_index);
-            collect_table_bindings_recursive(&project.child.operator, bindings);
-        }
-        LogicalOperator::ExternalTable(table) => {
-            bindings.insert(table.table_index);
-            if let Some(child) = &table.child {
-                collect_table_bindings_recursive(&child.operator, bindings);
-            }
-        }
-        LogicalOperator::Limit(limit) => {
-            collect_table_bindings_recursive(&limit.child.operator, bindings);
-        }
-        LogicalOperator::Order(order) => {
-            collect_table_bindings_recursive(&order.child.operator, bindings);
-        }
-        LogicalOperator::TopN(topn) => {
-            collect_table_bindings_recursive(&topn.child.operator, bindings);
-        }
-        LogicalOperator::Aggregate(agg) => {
-            collect_table_bindings_recursive(&agg.child.operator, bindings);
-        }
-        LogicalOperator::Insert(insert) => {
-            collect_table_bindings_recursive(&insert.child.operator, bindings);
-        }
-        LogicalOperator::Delete(delete) => {
-            collect_table_bindings_recursive(&delete.child.operator, bindings);
-        }
-        LogicalOperator::Update(update) => {
-            collect_table_bindings_recursive(&update.child.operator, bindings);
-        }
-        LogicalOperator::CopyTo(copy) => {
-            collect_table_bindings_recursive(&copy.child.operator, bindings);
-        }
-        LogicalOperator::Join(join) => {
-            collect_table_bindings_recursive(&join.left().operator, bindings);
-            collect_table_bindings_recursive(&join.right().operator, bindings);
-        }
-        LogicalOperator::SetOperation(setop) => {
-            collect_table_bindings_recursive(&setop.left().operator, bindings);
-            collect_table_bindings_recursive(&setop.right().operator, bindings);
-        }
-        LogicalOperator::ExpressionGet(expr_get) => {
-            bindings.insert(expr_get.table_index);
-        }
-        LogicalOperator::DelimGet(delim_get) => {
-            bindings.insert(delim_get.table_index);
-        }
-        LogicalOperator::Distinct(distinct) => {
-            collect_table_bindings_recursive(&distinct.child.operator, bindings);
-        }
-        LogicalOperator::Window(window) => {
-            collect_table_bindings_recursive(&window.child.operator, bindings);
-        }
-        LogicalOperator::Explain(explain) => {
-            collect_table_bindings_recursive(&explain.child.operator, bindings);
-        }
-        LogicalOperator::EmptyResult(empty) => {
-            collect_table_bindings_recursive(&empty.child.operator, bindings);
-        }
-        LogicalOperator::MaterializedCTE(cte) => {
-            collect_table_bindings_recursive(&cte.cte_query.operator, bindings);
-            collect_table_bindings_recursive(&cte.child.operator, bindings);
-        }
-        LogicalOperator::RecursiveCTE(cte) => {
-            collect_table_bindings_recursive(&cte.anchor.operator, bindings);
-            collect_table_bindings_recursive(&cte.recursive.operator, bindings);
-        }
-        LogicalOperator::CTERef(cte_ref) => {
-            bindings.insert(cte_ref.table_index);
-        }
-        LogicalOperator::TableFunctionGet(tf) => {
-            bindings.insert(tf.table_index);
-        }
-        LogicalOperator::SearchScan(search) => {
-            bindings.insert(search.get.table_index);
-            bindings.insert(search.projection_table_index);
-        }
-        LogicalOperator::FullTextFilterScan(scan) => {
-            bindings.insert(scan.get.table_index);
-        }
-        LogicalOperator::DependentJoin(dep) => {
-            collect_table_bindings_recursive(&dep.left.operator, bindings);
-            collect_table_bindings_recursive(&dep.right.operator, bindings);
-        }
-        LogicalOperator::Alter(_)
-        | LogicalOperator::CreateTable(_)
-        | LogicalOperator::CreateRoutine(_)
-        | LogicalOperator::CreateSequence(_)
-        | LogicalOperator::CreateSchema(_)
-        | LogicalOperator::CreateIndex(_)
-        | LogicalOperator::CreateView(_)
-        | LogicalOperator::CreatePropertyGraph(_)
-        | LogicalOperator::DropPropertyGraph(_)
-        | LogicalOperator::RefreshPropertyGraph(_)
-        | LogicalOperator::Drop(_)
-        | LogicalOperator::GraphMatch(_)
-        | LogicalOperator::GraphScan(_)
-        | LogicalOperator::DummyScan => {}
-        LogicalOperator::GraphExpand(ge) => {
-            collect_table_bindings_recursive(&ge.child.operator, bindings);
-        }
-    }
+    op.get_column_bindings()
+        .into_iter()
+        .map(|binding| binding.table_index)
+        .collect()
 }
 
 pub fn split_conjunction(expr: Expression) -> Vec<Expression> {
     match expr {
         Expression::Conjunction(conj) if conj.conjunction_type == ConjunctionType::And => {
             let mut result = Vec::new();
-            for child in conj.children {
+            for child in conj.into_inner().children {
                 result.extend(split_conjunction(child));
             }
             result
@@ -217,7 +93,27 @@ pub fn get_expression_side(
         Expression::ColumnRef(col) => {
             JoinSide::get_side(col.binding.table_index, left_bindings, right_bindings)
         }
-        Expression::Subquery(_) => JoinSide::Both,
+        Expression::Subquery(subquery) => {
+            // A subquery's internal bindings belong to its own scope. Only the
+            // comparison operands and correlated columns determine which join
+            // input the predicate depends on. Treating every subquery as Both
+            // prevents legal null-supplying-side pushdown for predicates such
+            // as `right.key IN (SELECT ...)` in a LEFT JOIN.
+            let mut side = JoinSide::None;
+            for child in &subquery.children {
+                side = JoinSide::combine(
+                    side,
+                    get_expression_side(child, left_bindings, right_bindings),
+                );
+            }
+            for column in &subquery.correlated_columns {
+                side = JoinSide::combine(
+                    side,
+                    JoinSide::get_side(column.table_index, left_bindings, right_bindings),
+                );
+            }
+            side
+        }
         _ => {
             let mut side = JoinSide::None;
             ExpressionIterator::enumerate_children(expr, |child| {
@@ -257,18 +153,21 @@ pub fn create_join_operator(
 
     if conditions.is_empty() {
         let condition = if arbitrary_expressions.is_empty() {
-            Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                return_type: LogicalType::Boolean,
-            })
+            Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(true),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            )
         } else {
             combine_expressions_with_and(arbitrary_expressions)
         };
 
         let any_join = AnyJoin::new(
             join_type,
-            LogicalPlan::new(bind_ctx, left_child),
-            LogicalPlan::new(bind_ctx, right_child),
+            OwnedLogicalPlan::new(bind_ctx, left_child),
+            OwnedLogicalPlan::new(bind_ctx, right_child),
             condition,
         );
         return Ok(LogicalOperator::Join(Join::Any(Box::new(any_join))));
@@ -277,8 +176,8 @@ pub fn create_join_operator(
     if arbitrary_expressions.is_empty() {
         let comp_join = ComparisonJoin::new(
             join_type,
-            LogicalPlan::new(bind_ctx, left_child),
-            LogicalPlan::new(bind_ctx, right_child),
+            OwnedLogicalPlan::new(bind_ctx, left_child),
+            OwnedLogicalPlan::new(bind_ctx, right_child),
             conditions,
         );
         return Ok(LogicalOperator::Join(Join::Comparison(comp_join)));
@@ -287,13 +186,16 @@ pub fn create_join_operator(
     if join_type == JoinType::Inner {
         let comp_join = ComparisonJoin::new(
             join_type,
-            LogicalPlan::new(bind_ctx, left_child),
-            LogicalPlan::new(bind_ctx, right_child),
+            OwnedLogicalPlan::new(bind_ctx, left_child),
+            OwnedLogicalPlan::new(bind_ctx, right_child),
             conditions,
         );
         let join_op = LogicalOperator::Join(Join::Comparison(comp_join));
 
-        let filter = Filter::new(LogicalPlan::new(bind_ctx, join_op), arbitrary_expressions);
+        let filter = Filter::new(
+            OwnedLogicalPlan::new(bind_ctx, join_op),
+            arbitrary_expressions,
+        );
         Ok(LogicalOperator::Filter(filter))
     } else {
         let mut all_expressions: Vec<Expression> = conditions
@@ -305,8 +207,8 @@ pub fn create_join_operator(
         let condition = combine_expressions_with_and(all_expressions);
         let any_join = AnyJoin::new(
             join_type,
-            LogicalPlan::new(bind_ctx, left_child),
-            LogicalPlan::new(bind_ctx, right_child),
+            OwnedLogicalPlan::new(bind_ctx, left_child),
+            OwnedLogicalPlan::new(bind_ctx, right_child),
             condition,
         );
         Ok(LogicalOperator::Join(Join::Any(Box::new(any_join))))
@@ -325,7 +227,7 @@ fn join_condition_to_expression(cond: JoinCondition) -> Expression {
         JoinComparisonType::DistinctFrom => ComparisonType::DistinctFrom,
     };
 
-    Expression::Comparison(ComparisonExpression::new(comp_type, cond.left, cond.right))
+    Expression::Comparison(ComparisonExpression::new(comp_type, cond.left, cond.right).into())
 }
 
 fn combine_expressions_with_and(mut expressions: Vec<Expression>) -> Expression {
@@ -333,10 +235,13 @@ fn combine_expressions_with_and(mut expressions: Vec<Expression>) -> Expression 
         return expressions.pop().unwrap();
     }
 
-    Expression::Conjunction(ConjunctionExpression {
-        conjunction_type: ConjunctionType::And,
-        children: expressions,
-    })
+    Expression::Conjunction(
+        ConjunctionExpression {
+            conjunction_type: ConjunctionType::And,
+            children: expressions,
+        }
+        .into(),
+    )
 }
 
 #[cfg(test)]
@@ -350,23 +255,24 @@ mod tests {
         ColumnRefExpression, ComparisonExpression, ComparisonType, Expression, WindowExpression,
         WindowFrame, WindowFrameBound, WindowFrameType,
     };
-    use crate::operator::{ColumnBinding, JoinComparisonType, JoinSide};
+    use crate::logical::operator::{ColumnBinding, JoinComparisonType, JoinSide};
     use paro_function::window::WindowFunction;
 
     fn col(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, column_index),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(table_index, column_index),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     #[test]
     fn extract_join_condition_keeps_left_and_right_operands_in_child_order() {
-        let expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            col(6, 0),
-            col(7, 0),
-        ));
+        let expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, col(6, 0), col(7, 0)).into(),
+        );
         let left_bindings = HashSet::from([6]);
         let right_bindings = HashSet::from([7]);
         let mut conditions = Vec::new();
@@ -395,20 +301,23 @@ mod tests {
 
     #[test]
     fn get_expression_side_visits_window_frame_offsets() {
-        let expression = Expression::Window(WindowExpression::native(
-            WindowFunction::row_number(),
-            vec![],
-            vec![],
-            vec![],
-            WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start_bound: WindowFrameBound::Offset(Box::new(col(7, 0))),
-                start_is_preceding: true,
-                end_bound: WindowFrameBound::CurrentRow,
-                end_is_preceding: false,
-            },
-            false,
-        ));
+        let expression = Expression::Window(
+            WindowExpression::native(
+                WindowFunction::row_number(),
+                vec![],
+                vec![],
+                vec![],
+                WindowFrame {
+                    frame_type: WindowFrameType::Rows,
+                    start_bound: WindowFrameBound::Offset(Box::new(col(7, 0))),
+                    start_is_preceding: true,
+                    end_bound: WindowFrameBound::CurrentRow,
+                    end_is_preceding: false,
+                },
+                false,
+            )
+            .into(),
+        );
 
         assert_eq!(
             get_expression_side(&expression, &HashSet::from([6]), &HashSet::from([7])),

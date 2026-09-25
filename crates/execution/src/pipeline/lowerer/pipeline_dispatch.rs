@@ -14,9 +14,17 @@ impl<'a> PipelineLowerer<'a> {
         pipelines: &mut Vec<PipelineSpec>,
     ) -> Result<PipelineId> {
         let output = self.plan.node(root).output.clone();
-        let (source, transforms) = self.collect_linear_roles(root)?;
+        let (source, transforms, operator_lineage) = self.collect_linear_roles(root)?;
         Ok(self
-            .push_pipeline(source, transforms, sink, sink_sharing, output, pipelines)?
+            .push_pipeline_with_lineage(
+                source,
+                transforms,
+                sink,
+                sink_sharing,
+                output,
+                operator_lineage,
+                pipelines,
+            )?
             .tail)
     }
 
@@ -29,10 +37,17 @@ impl<'a> PipelineLowerer<'a> {
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<PipelineId> {
-        let (source, transforms) = self.collect_linear_roles(root)?;
+        let (source, transforms, operator_lineage) = self.collect_linear_roles(root)?;
         let source_handles = source.clone();
-        let pushed =
-            self.push_pipeline(source, transforms, sink, sink_sharing, output, pipelines)?;
+        let pushed = self.push_pipeline_with_lineage(
+            source,
+            transforms,
+            sink,
+            sink_sharing,
+            output,
+            operator_lineage,
+            pipelines,
+        )?;
         self.add_source_handle_dependencies(&source_handles, pushed.entry, dependencies)?;
         Ok(pushed.tail)
     }

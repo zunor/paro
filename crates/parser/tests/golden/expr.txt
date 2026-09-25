@@ -3101,7 +3101,7 @@ InList {
 ---------- Input ----------
 G.E.B IS NOT NULL AND col1 not between col2 and (1 + col3) DIV sum(col4)
 ---------- Output ---------
-G.E.B IS NOT NULL AND col1 NOT BETWEEN col2 AND (1 + col3) DIV sum(col4)
+g.e.b IS NOT NULL AND col1 NOT BETWEEN col2 AND (1 + col3) DIV sum(col4)
 ---------- AST ------------
 BinaryOp {
     span: Some(
@@ -3122,7 +3122,7 @@ BinaryOp {
                         span: Some(
                             0..1,
                         ),
-                        name: "G",
+                        name: "g",
                         quote: None,
                         ident_type: None,
                     },
@@ -3132,7 +3132,7 @@ BinaryOp {
                         span: Some(
                             2..3,
                         ),
-                        name: "E",
+                        name: "e",
                         quote: None,
                         ident_type: None,
                     },
@@ -3142,7 +3142,7 @@ BinaryOp {
                         span: Some(
                             4..5,
                         ),
-                        name: "B",
+                        name: "b",
                         quote: None,
                         ident_type: None,
                     },
@@ -4885,7 +4885,7 @@ Map {
 ---------- Input ----------
 LISTAGG(salary, '|') WITHIN GROUP (ORDER BY salary DESC NULLS LAST)
 ---------- Output ---------
-LISTAGG(salary, '|') WITHIN GROUP ( ORDER BY salary DESC NULLS LAST )
+listagg(salary, '|') WITHIN GROUP ( ORDER BY salary DESC NULLS LAST )
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -4898,7 +4898,7 @@ FunctionCall {
             span: Some(
                 0..7,
             ),
-            name: "LISTAGG",
+            name: "listagg",
             quote: None,
             ident_type: None,
         },
@@ -4971,7 +4971,7 @@ FunctionCall {
 ---------- Input ----------
 ROW_NUMBER() OVER (ORDER BY salary DESC)
 ---------- Output ---------
-ROW_NUMBER() OVER (ORDER BY salary DESC)
+row_number() OVER (ORDER BY salary DESC)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -4984,7 +4984,7 @@ FunctionCall {
             span: Some(
                 0..10,
             ),
-            name: "ROW_NUMBER",
+            name: "row_number",
             quote: None,
             ident_type: None,
         },
@@ -5039,7 +5039,7 @@ FunctionCall {
 ---------- Input ----------
 SUM(salary) OVER ()
 ---------- Output ---------
-SUM(salary) OVER ()
+sum(salary) OVER ()
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5052,7 +5052,7 @@ FunctionCall {
             span: Some(
                 0..3,
             ),
-            name: "SUM",
+            name: "sum",
             quote: None,
             ident_type: None,
         },
@@ -5101,7 +5101,7 @@ FunctionCall {
 ---------- Input ----------
 AVG(salary) OVER (PARTITION BY department)
 ---------- Output ---------
-AVG(salary) OVER (PARTITION BY department)
+avg(salary) OVER (PARTITION BY department)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5114,7 +5114,7 @@ FunctionCall {
             span: Some(
                 0..3,
             ),
-            name: "AVG",
+            name: "avg",
             quote: None,
             ident_type: None,
         },
@@ -5183,7 +5183,7 @@ FunctionCall {
 ---------- Input ----------
 SUM(salary) OVER (PARTITION BY department ORDER BY salary DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
 ---------- Output ---------
-SUM(salary) OVER (PARTITION BY department ORDER BY salary DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+sum(salary) OVER (PARTITION BY department ORDER BY salary DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5196,7 +5196,7 @@ FunctionCall {
             span: Some(
                 0..3,
             ),
-            name: "SUM",
+            name: "sum",
             quote: None,
             ident_type: None,
         },
@@ -5299,7 +5299,7 @@ FunctionCall {
 ---------- Input ----------
 AVG(salary) OVER (PARTITION BY department ORDER BY hire_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
 ---------- Output ---------
-AVG(salary) OVER (PARTITION BY department ORDER BY hire_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+avg(salary) OVER (PARTITION BY department ORDER BY hire_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5312,7 +5312,7 @@ FunctionCall {
             span: Some(
                 0..3,
             ),
-            name: "AVG",
+            name: "avg",
             quote: None,
             ident_type: None,
         },
@@ -5422,7 +5422,7 @@ FunctionCall {
 ---------- Input ----------
 COUNT() OVER (ORDER BY hire_date RANGE BETWEEN INTERVAL '7' DAY PRECEDING AND CURRENT ROW)
 ---------- Output ---------
-COUNT() OVER (ORDER BY hire_date RANGE BETWEEN INTERVAL '7' DAY PRECEDING AND CURRENT ROW)
+count() OVER (ORDER BY hire_date RANGE BETWEEN INTERVAL '7' DAY PRECEDING AND CURRENT ROW)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5435,7 +5435,7 @@ FunctionCall {
             span: Some(
                 0..5,
             ),
-            name: "COUNT",
+            name: "count",
             quote: None,
             ident_type: None,
         },
@@ -5511,7 +5511,7 @@ FunctionCall {
 ---------- Input ----------
 COUNT() OVER (ORDER BY hire_date ROWS UNBOUNDED PRECEDING)
 ---------- Output ---------
-COUNT() OVER (ORDER BY hire_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+count() OVER (ORDER BY hire_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5524,7 +5524,7 @@ FunctionCall {
             span: Some(
                 0..5,
             ),
-            name: "COUNT",
+            name: "count",
             quote: None,
             ident_type: None,
         },
@@ -5585,7 +5585,7 @@ FunctionCall {
 ---------- Input ----------
 COUNT() OVER (ORDER BY hire_date ROWS CURRENT ROW)
 ---------- Output ---------
-COUNT() OVER (ORDER BY hire_date ROWS BETWEEN CURRENT ROW AND CURRENT ROW)
+count() OVER (ORDER BY hire_date ROWS BETWEEN CURRENT ROW AND CURRENT ROW)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5598,7 +5598,7 @@ FunctionCall {
             span: Some(
                 0..5,
             ),
-            name: "COUNT",
+            name: "count",
             quote: None,
             ident_type: None,
         },
@@ -5657,7 +5657,7 @@ FunctionCall {
 ---------- Input ----------
 COUNT() OVER (ORDER BY hire_date ROWS 3 PRECEDING)
 ---------- Output ---------
-COUNT() OVER (ORDER BY hire_date ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
+count() OVER (ORDER BY hire_date ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5670,7 +5670,7 @@ FunctionCall {
             span: Some(
                 0..5,
             ),
-            name: "COUNT",
+            name: "count",
             quote: None,
             ident_type: None,
         },
@@ -5740,7 +5740,7 @@ FunctionCall {
 ---------- Input ----------
 QUANTILE_CONT(0.5)(salary) OVER (PARTITION BY department ORDER BY hire_date)
 ---------- Output ---------
-QUANTILE_CONT(0.5)(salary) OVER (PARTITION BY department ORDER BY hire_date)
+quantile_cont(0.5)(salary) OVER (PARTITION BY department ORDER BY hire_date)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5753,7 +5753,7 @@ FunctionCall {
             span: Some(
                 0..13,
             ),
-            name: "QUANTILE_CONT",
+            name: "quantile_cont",
             quote: None,
             ident_type: None,
         },
@@ -5857,7 +5857,7 @@ FunctionCall {
 ---------- Input ----------
 ARRAY_APPLY([1,2,3], x -> x + 1)
 ---------- Output ---------
-ARRAY_APPLY([1, 2, 3], x -> x + 1)
+array_apply([1, 2, 3], x -> x + 1)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5870,7 +5870,7 @@ FunctionCall {
             span: Some(
                 0..11,
             ),
-            name: "ARRAY_APPLY",
+            name: "array_apply",
             quote: None,
             ident_type: None,
         },
@@ -5965,7 +5965,7 @@ FunctionCall {
 ---------- Input ----------
 ARRAY_FILTER(col, y -> y % 2 = 0)
 ---------- Output ---------
-ARRAY_FILTER(col, y -> y % 2 = 0)
+array_filter(col, y -> y % 2 = 0)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -5978,7 +5978,7 @@ FunctionCall {
             span: Some(
                 0..12,
             ),
-            name: "ARRAY_FILTER",
+            name: "array_filter",
             quote: None,
             ident_type: None,
         },
@@ -6158,7 +6158,7 @@ Tuple {
 ---------- Input ----------
 ARRAY_REDUCE([1,2,3], (acc,t) -> acc + t)
 ---------- Output ---------
-ARRAY_REDUCE([1, 2, 3], (acc, t) -> acc + t)
+array_reduce([1, 2, 3], (acc, t) -> acc + t)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -6171,7 +6171,7 @@ FunctionCall {
             span: Some(
                 0..12,
             ),
-            name: "ARRAY_REDUCE",
+            name: "array_reduce",
             quote: None,
             ident_type: None,
         },
@@ -6285,7 +6285,7 @@ FunctionCall {
 ---------- Input ----------
 MAP_FILTER({1:1,2:2,3:4}, (k, v) -> k > v)
 ---------- Output ---------
-MAP_FILTER({1:1,2:2,3:4}, (k, v) -> k > v)
+map_filter({1:1,2:2,3:4}, (k, v) -> k > v)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -6298,7 +6298,7 @@ FunctionCall {
             span: Some(
                 0..10,
             ),
-            name: "MAP_FILTER",
+            name: "map_filter",
             quote: None,
             ident_type: None,
         },
@@ -6427,7 +6427,7 @@ FunctionCall {
 ---------- Input ----------
 MAP_TRANSFORM_KEYS({1:10,2:20,3:30}, (k, v) -> k + 1)
 ---------- Output ---------
-MAP_TRANSFORM_KEYS({1:10,2:20,3:30}, (k, v) -> k + 1)
+map_transform_keys({1:10,2:20,3:30}, (k, v) -> k + 1)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -6440,7 +6440,7 @@ FunctionCall {
             span: Some(
                 0..18,
             ),
-            name: "MAP_TRANSFORM_KEYS",
+            name: "map_transform_keys",
             quote: None,
             ident_type: None,
         },
@@ -6558,7 +6558,7 @@ FunctionCall {
 ---------- Input ----------
 MAP_TRANSFORM_VALUES({1:10,2:20,3:30}, (k, v) -> v + 1)
 ---------- Output ---------
-MAP_TRANSFORM_VALUES({1:10,2:20,3:30}, (k, v) -> v + 1)
+map_transform_values({1:10,2:20,3:30}, (k, v) -> v + 1)
 ---------- AST ------------
 FunctionCall {
     span: Some(
@@ -6571,7 +6571,7 @@ FunctionCall {
             span: Some(
                 0..20,
             ),
-            name: "MAP_TRANSFORM_VALUES",
+            name: "map_transform_values",
             quote: None,
             ident_type: None,
         },

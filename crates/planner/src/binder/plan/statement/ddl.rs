@@ -15,7 +15,7 @@ use crate::binder::bind::statement::drop::BoundDropInfo;
 use crate::binder::bind::statement::drop_property_graph::BoundDropPropertyGraphInfo;
 use crate::binder::bind::statement::refresh_property_graph::BoundRefreshPropertyGraphInfo;
 use crate::binder::Binder;
-use crate::operator::{
+use crate::logical::operator::{
     Alter, CreateIndex, CreatePropertyGraph, CreateRoutine, CreateSchema, CreateSequence,
     CreateTable, CreateView, Drop, DropPropertyGraph, LogicalOperator, RefreshPropertyGraph,
 };
@@ -35,7 +35,7 @@ impl Binder {
         info: BoundCreateRoutineInfo,
     ) -> Result<LogicalOperator> {
         let op = CreateRoutine::new(info);
-        Ok(LogicalOperator::CreateRoutine(op))
+        Ok(LogicalOperator::CreateRoutine(Box::new(op)))
     }
 
     pub(crate) fn plan_create_sequence(
@@ -59,7 +59,7 @@ impl Binder {
         info: BoundCreateIndexInfo,
     ) -> Result<LogicalOperator> {
         let op = CreateIndex::new(info);
-        Ok(LogicalOperator::CreateIndex(op))
+        Ok(LogicalOperator::CreateIndex(Box::new(op)))
     }
 
     pub(crate) fn plan_create_view(
@@ -67,7 +67,7 @@ impl Binder {
         info: BoundCreateViewInfo,
     ) -> Result<LogicalOperator> {
         let op = CreateView::new(info);
-        Ok(LogicalOperator::CreateView(op))
+        Ok(LogicalOperator::CreateView(Box::new(op)))
     }
 
     pub(crate) fn plan_drop(&mut self, info: BoundDropInfo) -> Result<LogicalOperator> {
@@ -80,7 +80,7 @@ impl Binder {
         info: BoundAlterEntryInfo,
     ) -> Result<LogicalOperator> {
         let op = Alter::new(info);
-        Ok(LogicalOperator::Alter(op))
+        Ok(LogicalOperator::Alter(Box::new(op)))
     }
 
     pub(crate) fn plan_create_property_graph(

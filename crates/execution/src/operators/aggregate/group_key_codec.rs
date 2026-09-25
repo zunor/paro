@@ -153,12 +153,25 @@ pub(crate) fn physical_group_types(spec: &AggregateSpec) -> Result<Vec<LogicalTy
         .collect()
 }
 
-pub(crate) fn decode_group_columns(
+/// Restore SQL output directly from physical keys and finalized states.
+/// Encoding is indexed in the retained key domain, projection in the SQL
+/// output domain. Combining them here avoids an intermediate decoded chunk
+/// and keeps in-memory and spilled emission on exactly the same contract.
+pub(crate) fn project_aggregate_output(
     spec: &AggregateSpec,
     source: &Chunk,
     target: &mut Chunk,
 ) -> Result<()> {
     let logical_types = logical_group_types(spec);
+    if spec.group_key_encodings.len() != logical_types.len()
+        || spec.grouping_key_count != logical_types.len()
+        || (!spec.state_output_projection.is_empty()
+            && spec.state_output_projection.len() != spec.output_types.len())
+    {
+        return Err(paro_error::internal(
+            "aggregate output mapping width mismatch",
+        ));
+    }
     if source.size() > target.capacity() {
         return Err(paro_error::internal(format!(
             "aggregate group decode output is too small: rows={}, capacity={}",
@@ -166,7 +179,13 @@ pub(crate) fn decode_group_columns(
             target.capacity()
         )));
     }
-    if source.column_count() < logical_types.len() || target.column_count() < logical_types.len() {
+    let state_width = logical_types.len() + spec.aggregates.len();
+    let output_width = if spec.state_output_projection.is_empty() {
+        state_width
+    } else {
+        spec.state_output_projection.len()
+    };
+    if source.column_count() < state_width || target.column_count() < output_width {
         return Err(paro_error::internal(format!(
             "aggregate group decode width mismatch: groups={}, source={}, target={}",
             logical_types.len(),
@@ -174,34 +193,44 @@ pub(crate) fn decode_group_columns(
             target.column_count()
         )));
     }
-    target.try_set_cardinality(source.size())?;
-    for (group_idx, ((encoding, logical_type), source_column)) in spec
-        .group_key_encodings
-        .iter()
-        .zip(logical_types.iter())
-        .zip(source.data.iter())
-        .enumerate()
-    {
-        let target_column = target.column(group_idx).ok_or_else(|| {
-            paro_error::internal(format!(
-                "aggregate decoded group output column not found: index={group_idx}"
-            ))
-        })?;
+    for output_idx in 0..output_width {
+        let source_idx = spec
+            .state_output_projection
+            .get(output_idx)
+            .copied()
+            .unwrap_or(output_idx);
+        if source_idx >= state_width {
+            return Err(paro_error::internal(
+                "aggregate output mapping exceeds state domain",
+            ));
+        }
+        let source_column = &source.data[source_idx];
+        let logical_type = logical_types
+            .get(source_idx)
+            .unwrap_or_else(|| source_column.logical_type());
+        let target_column = &target.data[output_idx];
         if target_column.logical_type() != logical_type {
             return Err(paro_error::internal(format!(
-                "aggregate decoded group type mismatch at index {group_idx}: expected={logical_type:?}, actual={:?}",
+                "aggregate decoded output type mismatch at index {output_idx}: expected={logical_type:?}, actual={:?}",
                 target_column.logical_type()
             )));
         }
+        let encoding = spec
+            .group_key_encodings
+            .get(source_idx)
+            .unwrap_or(&GroupKeyEncoding::Identity);
         match encoding {
             GroupKeyEncoding::Identity => {
-                target.data[group_idx] = Arc::clone(source_column);
+                if source_column.logical_type() != logical_type {
+                    return Err(paro_error::internal("aggregate identity key type mismatch"));
+                }
+                target.data[output_idx] = Arc::clone(source_column);
             }
             GroupKeyEncoding::PackedString {
                 physical_type,
                 max_length,
             } => {
-                let target_column = Vector::try_make_arc_mut(&mut target.data[group_idx])?;
+                let target_column = Vector::try_make_arc_mut(&mut target.data[output_idx])?;
                 decode_packed_strings(
                     source_column,
                     physical_type,
@@ -214,7 +243,7 @@ pub(crate) fn decode_group_columns(
                 physical_type,
                 minimum,
             } => {
-                let target_column = Vector::try_make_arc_mut(&mut target.data[group_idx])?;
+                let target_column = Vector::try_make_arc_mut(&mut target.data[output_idx])?;
                 decode_offset_integers(
                     source_column,
                     logical_type,
@@ -226,7 +255,7 @@ pub(crate) fn decode_group_columns(
             }
         }
     }
-    Ok(())
+    target.try_set_cardinality(source.size())
 }
 
 fn physical_type(encoding: &GroupKeyEncoding, logical_type: &LogicalType) -> Result<LogicalType> {
@@ -792,6 +821,114 @@ mod tests {
         decode_offset_integers, decode_packed_strings, encode_offset_integers,
         encode_packed_strings,
     };
+
+    #[test]
+    fn compact_keys_project_with_dependent_states_and_nulls() {
+        use crate::physical::specs::{AggregateSpec, GroupKeyEncoding, SpillExecutionPolicy};
+        use paro_common::runtime_value::Value;
+        use paro_planner::expression::{Expression, ReferenceExpression};
+        let reference =
+            |index, ty| Expression::Reference(ReferenceExpression::new(index, ty).into());
+        let spec = AggregateSpec {
+            grouping_key_count: 2,
+            initial_lookup_hash_key_count: 2,
+            state_output_projection: Box::new([1, 2, 0]),
+            estimated_input_rows: None,
+            projection_exprs: Box::new([]),
+            payload_types: Box::new([LogicalType::Varchar, LogicalType::Integer]),
+            groups: Box::new([
+                reference(0, LogicalType::Varchar),
+                reference(1, LogicalType::Integer),
+            ]),
+            group_key_encodings: Box::new([
+                GroupKeyEncoding::PackedString {
+                    physical_type: LogicalType::UInteger,
+                    max_length: 3,
+                },
+                GroupKeyEncoding::OffsetInteger {
+                    physical_type: LogicalType::UTinyInt,
+                    minimum: -5,
+                },
+            ]),
+            grouping_sets: Box::new([]),
+            aggregates: Box::new([Expression::Aggregate(
+                paro_planner::expression::AggregateExpression::new(
+                    paro_function::aggregate::distributive::count::get_count_star_function(),
+                    vec![],
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )]),
+            grouping_functions: Box::new([]),
+            aggregate_inputs: Box::new([Box::new([])]),
+            aggregate_filters: Box::new([None]),
+            aggregate_orders: Box::new([Box::new([])]),
+            post_reduction: None,
+            having_filter: Box::new([]),
+            spill_policy: SpillExecutionPolicy::InMemory,
+            perfect_hash: None,
+            output_names: Box::new([]),
+            output_types: Box::new([
+                LogicalType::Integer,
+                LogicalType::BigInt,
+                LogicalType::Varchar,
+            ]),
+        };
+        let allocator = test_allocator();
+        let mut payload = Chunk::try_initialize(&spec.payload_types, 4, allocator.clone()).unwrap();
+        payload.data[0] = Arc::new(test_string_vector_with_allocator(
+            &["", "a\0", "é", "x"],
+            allocator.clone(),
+        ));
+        payload.data[1] = Arc::new(test_i32_vector_with_allocator(
+            &[-5, 250, 0, 42],
+            allocator.clone(),
+        ));
+        payload.column_mut(0).unwrap().set_null(3, true);
+        payload.column_mut(1).unwrap().set_null(2, true);
+        payload.set_cardinality(4);
+        let mut encoder = super::GroupKeyEncoder::try_new(&spec, 4, allocator.clone()).unwrap();
+        let keys = encoder.encode_payload(&payload, &[0, 1]).unwrap();
+        let mut source = Chunk::try_initialize(
+            &[
+                LogicalType::UInteger,
+                LogicalType::UTinyInt,
+                LogicalType::BigInt,
+            ],
+            4,
+            allocator.clone(),
+        )
+        .unwrap();
+        source.data[0] = keys.data[0].clone();
+        source.data[1] = keys.data[1].clone();
+        for row in 0..4 {
+            source
+                .column_mut(2)
+                .unwrap()
+                .set_value(row, &Value::BigInt(row as i64));
+        }
+        source.set_cardinality(4);
+        let mut output = Chunk::try_initialize(&spec.output_types, 4, allocator).unwrap();
+        super::project_aggregate_output(&spec, &source, &mut output).unwrap();
+        for row in 0..4 {
+            assert_eq!(
+                output.column(0).unwrap().get_value(row),
+                payload.column(1).unwrap().get_value(row)
+            );
+            assert_eq!(
+                output.column(2).unwrap().get_value(row),
+                payload.column(0).unwrap().get_value(row)
+            );
+        }
+        // Finalized states are shared, not decoded/copied through a second chunk.
+        assert!(Arc::ptr_eq(&output.data[1], &source.data[2]));
+        let mut invalid = spec.clone();
+        invalid.state_output_projection[1] = 3;
+        assert!(super::project_aggregate_output(&invalid, &source, &mut output).is_err());
+        invalid = spec.clone();
+        invalid.group_key_encodings = Box::new([]);
+        assert!(super::project_aggregate_output(&invalid, &source, &mut output).is_err());
+    }
 
     #[test]
     fn packed_string_roundtrips_prefixes_and_embedded_zeroes() {

@@ -720,6 +720,7 @@ impl HashBuildStore {
             PreparedRowScatter::try_new(self.layout.base().as_ref(), &base_columns, chunk.size())?;
         self.append_prepared_rows(
             &source,
+            0,
             chunk.size(),
             |output_idx| output_idx,
             |output_idx, _| {
@@ -745,6 +746,7 @@ impl HashBuildStore {
         selected_count: usize,
         hashes: Option<&[u64]>,
         found: bool,
+        known_valid_key_prefix: usize,
         mut on_row: impl FnMut(usize, usize, usize) -> Result<()>,
     ) -> Result<usize> {
         if selected_count == 0 {
@@ -769,6 +771,11 @@ impl HashBuildStore {
                 self.layout.payload_count(),
                 payload.column_count()
             )));
+        }
+        if known_valid_key_prefix > self.layout.key_count() {
+            return Err(paro_error::internal(
+                "HashBuildStore valid key prefix exceeds its key width",
+            ));
         }
         let expected_keys = &self.layout.base().types()[..self.layout.key_count()];
         if keys.types() != expected_keys {
@@ -807,6 +814,7 @@ impl HashBuildStore {
             PreparedRowScatter::try_new(self.layout.base().as_ref(), &base_columns, keys.size())?;
         self.append_prepared_rows(
             &source,
+            known_valid_key_prefix,
             selected_count,
             |output_idx| selection.get(output_idx),
             |output_idx, _| Ok(hashes.map_or(0, |hashes| hashes[output_idx])),
@@ -834,6 +842,7 @@ impl HashBuildStore {
     fn append_prepared_rows<S, H, F, V>(
         &mut self,
         source: &PreparedRowScatter<'_>,
+        known_valid_key_prefix: usize,
         output_count: usize,
         source_row_at: S,
         hash_at: H,
@@ -879,7 +888,8 @@ impl HashBuildStore {
         };
         let mut batch_values = StableValueHeap::default();
         let layout = self.layout.clone();
-        let fixed_source = source.fixed_all_valid(layout.base());
+        let fixed_source =
+            source.fixed_with_known_valid_prefix(layout.base(), known_valid_key_prefix);
 
         let write_result = {
             let mut heap = BatchRowHeap::new(byte_buffer.as_ref(), &mut batch_values);

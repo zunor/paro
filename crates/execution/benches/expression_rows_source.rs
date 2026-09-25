@@ -13,8 +13,6 @@ use paro_common::types::LogicalType;
 use paro_context::test_support::TestStatementContextBuilder;
 use paro_execution::explain::profiler::OperatorProfiler;
 use paro_execution::memory_runtime::QueryMemoryPool;
-use paro_execution::physical::properties::PipelineProperties;
-use paro_execution::physical::specs::ValuesSpec;
 use paro_execution::pipeline::graph::PipelineId;
 use paro_execution::pipeline::handles::BreakerHandleCatalog;
 use paro_execution::runtime::{
@@ -25,6 +23,8 @@ use paro_execution::runtime::{
 };
 use paro_execution::thread_context::ThreadContext;
 use paro_planner::expression::{ConstantExpression, Expression};
+use paro_planner::physical::properties::PipelineProperties;
+use paro_planner::physical::specs::ValuesSpec;
 
 const ROWS: usize = 2_048;
 const COLUMNS: usize = 4;
@@ -69,10 +69,13 @@ impl ExpressionRowsBench {
             .map(|row| {
                 (0..COLUMNS)
                     .map(|column| {
-                        Expression::Constant(ConstantExpression::new(
-                            Value::BigInt((row * COLUMNS + column) as i64),
-                            LogicalType::BigInt,
-                        ))
+                        Expression::Constant(
+                            ConstantExpression::new(
+                                Value::BigInt((row * COLUMNS + column) as i64),
+                                LogicalType::BigInt,
+                            )
+                            .into(),
+                        )
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice()

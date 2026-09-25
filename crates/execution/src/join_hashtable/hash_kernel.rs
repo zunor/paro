@@ -19,7 +19,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::{
     DataRef, DecodedVectorRef, SelectionVector, VarlenView, Vector, VectorType,
 };
-use paro_planner::operator::join::JoinComparisonType;
+use paro_planner::logical::operator::join::JoinComparisonType;
 use paro_storage::row::codec::unsafe_api;
 use paro_storage::row::RowLayout;
 

@@ -22,7 +22,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{Vector, VECTOR_SIZE};
-use paro_planner::operator::join::{
+use paro_planner::logical::operator::join::{
     JoinComparisonType, JoinCondition, JoinType, MarkJoinSemantics,
 };
 
@@ -2887,8 +2887,8 @@ mod tests {
         comparison: JoinComparisonType,
     ) -> JoinCondition {
         JoinCondition::new(
-            Expression::Reference(ReferenceExpression::new(left_idx, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(right_idx, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(left_idx, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(right_idx, LogicalType::Integer).into()),
             comparison,
         )
     }
