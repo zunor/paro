@@ -49,3 +49,19 @@ cross-cohort medians. Broader 121-query screening, if run, is a separately
 registered coverage cohort, not additional independent samples of this pilot.
 Bound archived structured evidence to 32MiB; exclude server logs and raw event
 floods. Validate receipts/campaigns with maintained validators.
+
+## Amendment v2: reconstruction regression (before replacement samples)
+
+The first probe passed all eight pipeline cells, but quality Q72 exhausted its
+2GB quota. A fresh untimed SQL check reproduced that failure in the probe and
+returned 100 rows in the retained control binary. Keep the failed cell; it is
+not an environment exclusion or a successful performance comparison.
+
+Native Memo join reconstruction attaches unconsumed relation-local predicates
+at the region root even though the shared graph prices them at leaves. Close
+this contract before further performance collection: attach filters at first
+complete support, consume each once, and derive staging facts from actual
+operators rather than marking a DP point estimate as an exact row bound.
+Rerun Q72 quality before completing the same eight-query policy comparison.
+Replacement cells use new run IDs and the original sampling envelope; they
+are not retries accepted in place of the failed initial arm.

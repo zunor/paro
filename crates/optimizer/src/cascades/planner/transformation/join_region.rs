@@ -13,11 +13,11 @@ use paro_planner::operator::{
     ComparisonJoin, CrossProduct, Join, JoinBuildSideConstraint, JoinComparisonType, JoinCondition,
     JoinType, LogicalOperator, LogicalOutputLayout, MarkJoinSemantics, ProjectionMap,
 };
-use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, NodeStats};
+use paro_planner::plan::{CardinalityProvenance, NodeStats};
 use paro_storage::statistics::ColumnStatistics;
 
 use crate::join_order::optimizer::JoinOrderOptimizer;
-use crate::join_order::query_graph::{JoinEdgeOrientation, JoinPredicateSet};
+use crate::join_order::query_graph::{FilterInfo, JoinEdgeOrientation, JoinPredicateSet};
 use crate::join_order::relation_manager::{
     DistinctCount, ExtractedFilter, RelationManager, RelationStats,
 };
@@ -352,8 +352,14 @@ pub(super) fn try_native_enumeration_with_cache_key(
     for plan in &graph.final_plans {
         let mut nodes = shell.nodes.to_vec();
         let mut used_filters = HashSet::new();
-        let root_child =
-            rebuild_native_join(plan, &input.atoms, &mut used_filters, &mut nodes, state)?;
+        let root_child = rebuild_native_join(
+            plan,
+            &input.atoms,
+            &graph.filter_infos,
+            &mut used_filters,
+            &mut nodes,
+            state,
+        )?;
         let mut root = match root_child {
             NativeChild::Node(index) => index,
             NativeChild::MemoGroup { .. } | NativeChild::Group { .. } => {
@@ -713,21 +719,31 @@ fn native_relation_stats(
 fn rebuild_native_join(
     node: &crate::join_order::cost_model::DPJoinNode,
     atoms: &[NativeJoinAtom],
+    filters: &[Arc<FilterInfo>],
     used_filters: &mut HashSet<usize>,
     nodes: &mut Vec<NativeNode>,
     state: &PlannerTransformState,
 ) -> Result<NativeChild> {
     if node.is_leaf {
-        return atoms
+        let child = atoms
             .get(node.set.relations()[0])
             .map(|atom| atom.child.clone())
-            .ok_or_else(|| paro_error::internal("native join leaf is out of range"));
+            .ok_or_else(|| paro_error::internal("native join leaf is out of range"))?;
+        return Ok(attach_native_filters(
+            child,
+            &node.set,
+            filters,
+            used_filters,
+            nodes,
+            state,
+        ));
     }
     let left = rebuild_native_join(
         node.left_plan
             .as_deref()
             .ok_or_else(|| paro_error::internal("native join lost left frontier child"))?,
         atoms,
+        filters,
         used_filters,
         nodes,
         state,
@@ -737,6 +753,7 @@ fn rebuild_native_join(
             .as_deref()
             .ok_or_else(|| paro_error::internal("native join lost right frontier child"))?,
         atoms,
+        filters,
         used_filters,
         nodes,
         state,
@@ -848,29 +865,67 @@ fn rebuild_native_join(
             right_projection_map: ProjectionMap::all(),
         }))
     };
-    let mut stats = NodeStats::default();
-    stats.set_cardinality(
-        CardinalityEstimate::exact(quantize_native_cardinality(node.cardinality)),
-        node.cardinality_provenance,
-        Some(quantize_native_cardinality(
-            node.materialization_cardinality,
-        )),
-    );
     let index = nodes.len();
     nodes.push(NativeNode {
         id: state.bind_context.next_plan_id(),
-        stats,
+        // DP estimates include every applicable predicate, including filters
+        // attached below. They are not exact facts for the bare join. Native
+        // staging derives facts from the constructed operator and its children.
+        stats: NodeStats::default(),
         operator,
         source_proofs: Box::new([]),
     });
-    Ok(NativeChild::Node(index))
+    Ok(attach_native_filters(
+        NativeChild::Node(index),
+        &node.set,
+        filters,
+        used_filters,
+        nodes,
+        state,
+    ))
 }
 
-fn quantize_native_cardinality(cardinality: f64) -> u64 {
-    if !cardinality.is_finite() || cardinality >= u64::MAX as f64 {
-        u64::MAX
+/// Mirror the graph's predicate consumption at the earliest complete support.
+/// In particular, DP prices relation-local filters at leaves. Reattaching them
+/// only at the region root would execute unfiltered builds using filtered
+/// cardinalities, and can turn a selective join into a quota-exhausting plan.
+fn attach_native_filters(
+    child: NativeChild,
+    relations: &crate::join_order::relation::JoinRelationSet,
+    filters: &[Arc<FilterInfo>],
+    used: &mut HashSet<usize>,
+    nodes: &mut Vec<NativeNode>,
+    state: &PlannerTransformState,
+) -> NativeChild {
+    let expressions = filters
+        .iter()
+        .filter_map(|filter| {
+            if filter.join_type() == JoinType::Inner
+                && filter.set.count() != 0
+                && relations.contains_all(&filter.set)
+                && used.insert(filter.filter_index)
+            {
+                Some(filter.filter.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if expressions.is_empty() {
+        child
     } else {
-        cardinality.max(1.0) as u64
+        let index = nodes.len();
+        nodes.push(NativeNode {
+            id: state.bind_context.next_plan_id(),
+            stats: NodeStats::default(),
+            operator: LogicalOperator::Filter(paro_planner::operator::Filter {
+                expressions,
+                child,
+                projection_map: ProjectionMap::all(),
+            }),
+            source_proofs: Box::new([]),
+        });
+        NativeChild::Node(index)
     }
 }
 
@@ -880,6 +935,109 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::expression::ColumnRefExpression;
     use paro_planner::operator::{ComparisonJoin, Get, JoinCondition};
+    use paro_planner::plan::CardinalityEstimate;
+
+    #[test]
+    fn reconstruction_consumes_local_and_multirelation_filters_at_first_support() {
+        use crate::join_order::relation::JoinRelationSet;
+        use paro_planner::expression::{
+            ConjunctionExpression, ConjunctionType, ConstantExpression,
+        };
+        let input =
+            MemoBuilder::build(scan(0), BindContext::new(), SearchBudget::default()).unwrap();
+        let state = input.planner_state.read().unwrap();
+        let column = |table| {
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table, 0), LogicalType::BigInt).into(),
+            )
+        };
+        let local = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                column(0),
+                Expression::Constant(
+                    ConstantExpression::new(
+                        paro_common::runtime_value::Value::BigInt(1),
+                        LogicalType::BigInt,
+                    )
+                    .into(),
+                ),
+            )
+            .into(),
+        );
+        let residual = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::Or,
+                vec![
+                    Expression::Comparison(
+                        ComparisonExpression::new(ComparisonType::Equal, column(0), column(2))
+                            .into(),
+                    ),
+                    local.clone(),
+                ],
+            )
+            .into(),
+        );
+        let set = |relations: Vec<usize>| Arc::new(JoinRelationSet::new(relations));
+        let filters = vec![
+            Arc::new(FilterInfo::new_inner(local.clone(), set(vec![0]), 0)),
+            Arc::new(FilterInfo::new_inner(residual.clone(), set(vec![0, 2]), 1)),
+        ];
+        // Leaf placeholders are sufficient here: this routine is forbidden
+        // to inspect/expand a child's Memo group to discover predicate support.
+        let mut nodes = Vec::new();
+        let mut used = HashSet::new();
+        let leaf = attach_native_filters(
+            NativeChild::Node(99),
+            &set(vec![0]),
+            &filters,
+            &mut used,
+            &mut nodes,
+            &state,
+        );
+        assert!(matches!(leaf, NativeChild::Node(0)));
+        assert_eq!(used, HashSet::from([0]));
+        let LogicalOperator::Filter(filter) = &nodes[0].operator else {
+            panic!("leaf filter lost")
+        };
+        assert_eq!(filter.expressions.len(), 1);
+        assert!(filter.expressions[0].equals(&local));
+        assert!(nodes[0].stats.estimated_cardinality.is_none());
+        let partial = attach_native_filters(
+            NativeChild::Node(98),
+            &set(vec![0, 1]),
+            &filters,
+            &mut used,
+            &mut nodes,
+            &state,
+        );
+        assert!(matches!(partial, NativeChild::Node(98)));
+        assert_eq!(nodes.len(), 1, "incomplete support must not consume OR");
+        let root = attach_native_filters(
+            NativeChild::Node(97),
+            &set(vec![0, 1, 2]),
+            &filters,
+            &mut used,
+            &mut nodes,
+            &state,
+        );
+        assert!(matches!(root, NativeChild::Node(1)));
+        let LogicalOperator::Filter(filter) = &nodes[1].operator else {
+            panic!("residual lost")
+        };
+        assert_eq!(filter.expressions.len(), 1);
+        assert!(filter.expressions[0].equals(&residual));
+        assert_eq!(used, HashSet::from([0, 1]));
+        attach_native_filters(
+            root,
+            &set(vec![0, 1, 2]),
+            &filters,
+            &mut used,
+            &mut nodes,
+            &state,
+        );
+        assert_eq!(nodes.len(), 2, "each predicate is consumed once");
+    }
 
     fn scan(table: usize) -> OwnedLogicalPlan {
         let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
