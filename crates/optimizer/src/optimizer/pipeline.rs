@@ -211,14 +211,20 @@ impl Optimizer {
             child_combination_cost_synthesis_count: selection.alternatives,
             ..Default::default()
         };
+        let budget_limited = region_work.budget_fallbacks != 0 || join_work.budget_fallbacks != 0;
+        let search_stop = if budget_limited {
+            SearchStop::BudgetLimited
+        } else {
+            SearchStop::Incomplete
+        };
         self.compile_receipt = Some(CompileReceiptSummary {
             schema_version: paro_context::COMPILE_RECEIPT_SCHEMA_VERSION,
             artifact_identity: None,
             // A completed finite program is not a proof over all SQL plans.
-            search_stop: Observed(SearchStop::Incomplete),
+            search_stop: Observed(search_stop),
             search_complete: Observed(false),
             quality_policy_satisfied: Observed(false),
-            budget_limited: Observed(false),
+            budget_limited: Observed(budget_limited),
             obligations: Observed(1),
             groups: Observed(0),
             logical_expressions: Observed(0),
@@ -236,8 +242,8 @@ impl Optimizer {
                 record.obligations = Observed(1);
                 record.search_complete = Observed(false);
                 record.quality_policy_satisfied = Observed(false);
-                record.budget_limited = Observed(false);
-                record.search_stop = Observed(SearchStop::Incomplete);
+                record.budget_limited = Observed(budget_limited);
+                record.search_stop = Observed(search_stop);
                 record.safety_verified = Observed(true);
             });
             capture.search_counters(std::collections::BTreeMap::from([
@@ -253,6 +259,14 @@ impl Optimizer {
                 ("pipeline_selected_partial", region_work.selected_partial),
                 ("pipeline_response_join_regions", join_work.regions),
                 ("pipeline_response_join_transitions", join_work.transitions),
+                (
+                    "pipeline_borrowed_cuts",
+                    region_work.borrowed_cuts + join_work.borrowed_cuts,
+                ),
+                (
+                    "pipeline_completed_region_outputs",
+                    region_work.completed_outputs + join_work.completed_outputs,
+                ),
                 (
                     "pipeline_response_join_fallbacks",
                     join_work.budget_fallbacks,

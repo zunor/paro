@@ -41,3 +41,37 @@ fn pipeline_real_entry_has_one_resource_contract_and_no_memo() {
         assert_eq!(receipt.search_complete, Observed(false));
     }
 }
+
+#[test]
+fn bounded_region_fallback_keeps_an_executable_plan_and_reports_its_limit() {
+    let mut session = crate::subquery::partition_aggregate_tests::setup_session();
+    Arc::get_mut(&mut session)
+        .unwrap()
+        .limits
+        .use_temporary_directory = true;
+    let mut planner = Planner::new(session.clone());
+    planner
+        .create_plan(
+            paro_parser::parse_one(
+                "SELECT s_acctbal,n_name FROM supplier JOIN nation ON s_nationkey=n_nationkey",
+            )
+            .unwrap()
+            .stmt,
+        )
+        .unwrap();
+    let mut optimizer = Optimizer::new(planner.binder.clone(), session).with_budget(SearchBudget {
+        search_policy: Some(paro_context::OptimizerSearchPolicy::Pipeline),
+        max_join_connected_pairs: 0,
+        ..Default::default()
+    });
+    let OptimizedStatement::Physical(portfolio) =
+        optimizer.optimize(planner.take_plan().unwrap()).unwrap()
+    else {
+        panic!("pipeline must retain the legal original when its region budget is exhausted")
+    };
+    portfolio.verify().unwrap();
+    let receipt = optimizer.compile_receipt().unwrap();
+    assert_eq!(receipt.search_stop, Observed(SearchStop::BudgetLimited));
+    assert_eq!(receipt.budget_limited, Observed(true));
+    assert_eq!(receipt.search_complete, Observed(false));
+}

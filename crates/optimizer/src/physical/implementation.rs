@@ -18,9 +18,7 @@ use paro_planner::operator::join::AntiJoinMode;
 use paro_planner::operator::{ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator};
 use paro_planner::plan::CardinalityEstimate;
 use paro_planner::plan::{NodeStats, OwnedLogicalPlan};
-use paro_storage::statistics::ColumnStatistics;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
 pub(crate) fn operator_result_guarantee<Child>(
     operator: &LogicalOperator<Child>,
@@ -385,7 +383,6 @@ pub(crate) fn selected_cost_facts(
     child_rows_hard_upper: Box<[Option<u64>]>,
 ) -> Result<super::local_cost::ResolvedPlannerCostFacts> {
     use super::cost::CompactRange;
-    use super::local_cost::{ResolvedPlannerCostFacts, ResolvedRuntimeFilterSource};
     let rows = |plan: &OwnedLogicalPlan| {
         let r =
             plan.stats
@@ -408,6 +405,25 @@ pub(crate) fn selected_cost_facts(
         &plan.operator,
         &child_rows_hard_upper,
     );
+    resolve_cost_facts(
+        template,
+        output_rows,
+        child_rows,
+        output_rows_hard_upper,
+        child_rows_hard_upper,
+    )
+}
+
+/// Resolve one operator's scalar cardinality inputs without a planner tree.
+/// Keep this conversion shared with committed physical selection.
+pub(crate) fn resolve_cost_facts(
+    template: &PlannerCostFacts,
+    output_rows: CompactRange,
+    child_rows: Box<[CompactRange]>,
+    output_rows_hard_upper: Option<u64>,
+    child_rows_hard_upper: Box<[Option<u64>]>,
+) -> Result<super::local_cost::ResolvedPlannerCostFacts> {
+    use super::local_cost::{ResolvedPlannerCostFacts, ResolvedRuntimeFilterSource};
     Ok(ResolvedPlannerCostFacts {
         output_rows,
         child_rows,
@@ -1359,7 +1375,7 @@ impl PlannerImplementationSet {
 }
 pub(crate) fn planner_cost_facts(
     plan: &OwnedLogicalPlan,
-    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
     binding_ids: &BindingCatalog,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 ) -> Result<PlannerCostFacts> {
@@ -1518,7 +1534,7 @@ pub(crate) fn planner_native_cost_facts<Child>(
     output_row_width: u64,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
     inputs: &[RuntimeFilterInput<'_>],
-    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
     binding_ids: &BindingCatalog,
 ) -> Result<PlannerCostFacts> {
     let (child_materialization_risk_rows, child_row_widths) = child_sizes;
@@ -1632,7 +1648,7 @@ fn fill_runtime_filter_cost_facts<Child>(
     join: &paro_planner::operator::join::ComparisonJoin<Child>,
     left: RuntimeFilterInput<'_>,
     right: RuntimeFilterInput<'_>,
-    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
     binding_ids: &BindingCatalog,
 ) {
     let left_keys = join
@@ -1745,7 +1761,7 @@ pub(crate) enum JoinKeySide {
 
 fn join_key_distinct_expected<Child>(
     join: &paro_planner::operator::join::ComparisonJoin<Child>,
-    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
     side: JoinKeySide,
     bindings: &[ColumnBinding],
 ) -> Option<u64> {

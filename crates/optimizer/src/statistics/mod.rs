@@ -11,6 +11,38 @@ pub mod propagator;
 pub(crate) mod relation_proofs;
 pub(crate) mod unique_keys;
 
+/// Read-only statistics access. Regional costing borrows completed inputs;
+/// it must not merge their column maps just to evaluate one cut.
+pub trait ColumnStatisticsLookup {
+    fn get(
+        &self,
+        binding: &paro_planner::operator::ColumnBinding,
+    ) -> Option<&std::sync::Arc<paro_storage::statistics::ColumnStatistics>>;
+}
+
+impl ColumnStatisticsLookup
+    for std::collections::HashMap<
+        paro_planner::operator::ColumnBinding,
+        std::sync::Arc<paro_storage::statistics::ColumnStatistics>,
+    >
+{
+    fn get(
+        &self,
+        binding: &paro_planner::operator::ColumnBinding,
+    ) -> Option<&std::sync::Arc<paro_storage::statistics::ColumnStatistics>> {
+        self.get(binding)
+    }
+}
+
+impl<T: ColumnStatisticsLookup + ?Sized> ColumnStatisticsLookup for std::sync::Arc<T> {
+    fn get(
+        &self,
+        binding: &paro_planner::operator::ColumnBinding,
+    ) -> Option<&std::sync::Arc<paro_storage::statistics::ColumnStatistics>> {
+        self.as_ref().get(binding)
+    }
+}
+
 /// The query construction boundary owns column-domain propagation followed by
 /// relation properties. Propagation reads storage/bound-reference evidence,
 /// not provisional NodeStats; gathering then sees the completed domains and

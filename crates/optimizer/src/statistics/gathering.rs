@@ -125,7 +125,7 @@ struct GatheredNodeProperties {
 /// different, singleton output NDV. Keeping the view separate prevents local
 /// settlement from feeding the output proof back into input selectivity.
 struct CardinalityInputs<'a> {
-    column_stats: &'a SharedColumnStatistics,
+    column_stats: &'a dyn super::ColumnStatisticsLookup,
     cost_model: &'a crate::cost_model::CostModel,
     session: &'a paro_context::StatementContext,
     graph_stats: &'a mut GraphStatsCache,
@@ -230,6 +230,29 @@ impl LogicalPlanPostOrderFolder<GatheredNodeProperties> for StatisticsGatherFold
 impl StatisticsGathering {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Read-only relation estimate over completed inputs. Unlike settlement,
+    /// this does not propagate expressions, derive proofs or publish column
+    /// statistics. Callers own the eligibility of delaying those operations.
+    pub(crate) fn estimate_native_cardinality(
+        &mut self,
+        operator: &LogicalOperator<BoundReference>,
+        child_layouts: &[LogicalOutputLayout],
+        columns: &dyn super::ColumnStatisticsLookup,
+        context: &mut OptimizationContext,
+    ) -> Option<CardinalityEstimate> {
+        self.estimate_plan_cardinality(
+            operator,
+            &NodeStats::default(),
+            child_layouts,
+            &mut CardinalityInputs {
+                column_stats: columns,
+                cost_model: &context.cost_model,
+                session: &context.session,
+                graph_stats: &mut context.graph_stats,
+            },
+        )
     }
 
     /// Derive one operator from completed input facts. This entry point never

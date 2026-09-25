@@ -225,12 +225,12 @@ impl Default for SelectivityDefaults {
 }
 
 struct StatisticsResolver<'a> {
-    column_stats: &'a HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    column_stats: &'a dyn crate::statistics::ColumnStatisticsLookup,
     positional_bindings: Option<&'a [ColumnBinding]>,
 }
 
 impl<'a> StatisticsResolver<'a> {
-    fn logical(column_stats: &'a HashMap<ColumnBinding, Arc<ColumnStatistics>>) -> Self {
+    fn logical(column_stats: &'a dyn crate::statistics::ColumnStatisticsLookup) -> Self {
         Self {
             column_stats,
             positional_bindings: None,
@@ -238,7 +238,7 @@ impl<'a> StatisticsResolver<'a> {
     }
 
     fn with_positions(
-        column_stats: &'a HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        column_stats: &'a dyn crate::statistics::ColumnStatisticsLookup,
         positional_bindings: &'a [ColumnBinding],
     ) -> Self {
         Self {
@@ -295,7 +295,7 @@ impl CostModel {
     pub fn estimate_selectivity(
         &self,
         expr: &Expression,
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
     ) -> f64 {
         let resolver = StatisticsResolver::logical(column_stats);
         self.estimate_selectivity_with_provenance(expr, &resolver)
@@ -544,7 +544,7 @@ impl CostModel {
         &self,
         base_cardinality: u64,
         expressions: &[Expression],
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
     ) -> CardinalityEstimate {
         self.estimate_filter_cardinality_with_resolver(
             base_cardinality,
@@ -557,7 +557,7 @@ impl CostModel {
         &self,
         base_cardinality: u64,
         expressions: &[Expression],
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        column_stats: &dyn crate::statistics::ColumnStatisticsLookup,
         positional_bindings: &[ColumnBinding],
     ) -> CardinalityEstimate {
         self.estimate_filter_cardinality_with_resolver(

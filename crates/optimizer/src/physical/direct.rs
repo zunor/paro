@@ -13,6 +13,7 @@ use paro_planner::operator::ColumnBinding;
 use paro_planner::plan::{OwnedLogicalPlan, PlanNodeId};
 use paro_storage::statistics::ColumnStatistics;
 
+use super::cost::CompactRange;
 use super::implementation::*;
 use super::local_cost::*;
 use super::*;
@@ -35,12 +36,98 @@ pub(crate) struct Completed {
     pub cost: SearchCost,
     pub hard_rows: Option<u64>,
     pub result: requirements::ResultGuarantee,
+    sources: Box<[SourceResponse]>,
+}
+
+/// Only output materialization is movable across an RF boundary. Compressed
+/// page access, decoding, independent operators and memory floors are not.
+/// Multiple demands conservatively retain the strongest response; multiplying
+/// correlated membership estimates would invent independence.
+#[derive(Clone)]
+struct SourceResponse {
+    source: crate::cascades::rules::WorkSourceId,
+    base: SearchCost,
+    charged: SearchCost,
+    retained_ppm: u32,
+}
+
+fn source_materialization(
+    facts: &ResolvedPlannerCostFacts,
+    calibration: &MachineCalibrationBundle,
+) -> Result<Option<SourceResponse>> {
+    let Some(source) = facts
+        .scan_work_source
+        .filter(|_| facts.scan_access_width.is_some())
+    else {
+        return Ok(None);
+    };
+    let mut work = crate::cascades::calibration::LocalOperatorWork::default();
+    work.add(
+        crate::cascades::calibration::OP_TUPLE_BYTE_BLOCK,
+        scaled_work(facts.output_rows, facts.output_row_width as f64 / 32.0)?,
+    )?;
+    let base = calibration.fold(&work)?.work_only();
+    Ok(Some(SourceResponse {
+        source,
+        base,
+        charged: base,
+        retained_ppm: 1_000_000,
+    }))
+}
+
+fn source_retention(
+    source: &SourceResponse,
+    facts: &ResolvedPlannerCostFacts,
+    flavor: PhysicalImplementationFlavor,
+    tasks: u16,
+) -> Result<u32> {
+    use PhysicalImplementationFlavor as F;
+    let (sources, build_index, distinct) = match flavor {
+        F::HashJoinRuntimeFilter => (
+            &facts.runtime_filter_probe_sources,
+            1,
+            facts.runtime_filter_build_distinct_expected,
+        ),
+        F::HashJoinBuildLeftRuntimeFilter => (
+            &facts.runtime_filter_build_left_probe_sources,
+            0,
+            facts.runtime_filter_build_left_distinct_expected,
+        ),
+        _ => return Ok(source.retained_ppm),
+    };
+    let Some(input) = sources.iter().find(|s| s.source == source.source) else {
+        return Ok(source.retained_ppm);
+    };
+    let build = facts.child_rows[build_index];
+    let domain = runtime_filter_build_domain(distinct, build)?;
+    let resource = RuntimeFilterResourceContract::for_keys(&facts.runtime_filter_key_types, tasks)?;
+    let exactness = runtime_filter_exactness(
+        &resource,
+        facts.child_rows_hard_upper[build_index],
+        domain.expected,
+    );
+    let retained = runtime_filtered_probe_work(input.rows, domain, input.multiplicity, exactness)?;
+    let ppm = if input.rows.expected > 0.0 {
+        (retained.expected / input.rows.expected * 1_000_000.0)
+            .ceil()
+            .clamp(0.0, 1_000_000.0) as u32
+    } else {
+        1_000_000
+    };
+    Ok(source.retained_ppm.min(ppm))
 }
 
 pub(crate) struct LocalSelection {
     pub implementation: PhysicalImplementationFlavor,
     pub response: Completed,
     pub alternatives: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SelectionEnvironment<'a> {
+    pub grant: ResourceGrantClass,
+    pub calibration: &'a MachineCalibrationBundle,
+    pub session: &'a paro_context::StatementContext,
 }
 
 /// Memory floors are conservatively simultaneous. Elastic state shares one
@@ -240,9 +327,7 @@ pub(crate) fn select_local(
     calibration: &MachineCalibrationBundle,
     session: &paro_context::StatementContext,
 ) -> Result<Option<LocalSelection>> {
-    use PhysicalImplementationFlavor as F;
     let bindings = BindingCatalog::default();
-    let mut alternatives = 0;
     let bounds = children
         .iter()
         .map(|c| c.hard_rows)
@@ -267,7 +352,40 @@ pub(crate) fn select_local(
         perfect_hash: facts.perfect_hash,
         runtime_filter_key_types: &facts.runtime_filter_key_types,
     };
+    select_costed(
+        &model,
+        &facts,
+        implementations,
+        operator_result_guarantee(&plan.operator),
+        children,
+        SelectionEnvironment {
+            grant,
+            calibration,
+            session,
+        },
+    )
+}
+
+/// Pure physical response evaluation. Input preparation is owned by the
+/// relation representation; this kernel neither builds plans nor traverses
+/// descendants. Both committed selection and regional transitions use it.
+fn select_costed(
+    model: &LocalCostModel<'_>,
+    facts: &ResolvedPlannerCostFacts,
+    implementations: PlannerImplementationSet,
+    result: requirements::ResultGuarantee,
+    children: &[&Completed],
+    environment: SelectionEnvironment<'_>,
+) -> Result<Option<LocalSelection>> {
+    use PhysicalImplementationFlavor as F;
+    let SelectionEnvironment {
+        grant,
+        calibration,
+        session,
+    } = environment;
+    let mut alternatives = 0;
     let mut best: Option<(F, SearchCost)> = None;
+    let own_source = source_materialization(facts, calibration)?;
     for flavor in std::iter::once(implementations.baseline).chain(
         [
             F::PerfectHashAggregate,
@@ -284,16 +402,16 @@ pub(crate) fn select_local(
         .filter(|f| implementations.supports(*f)),
     ) {
         alternatives += 1;
-        let local = implementation_cost(
-            &model,
-            &facts,
-            flavor,
-            calibration,
-            grant.max_parallel_tasks,
-        )?;
+        let mut local =
+            implementation_cost(model, facts, flavor, calibration, grant.max_parallel_tasks)?;
+        if let Some(source) = &own_source {
+            // Source access stays fully charged; only this output-vector
+            // component may be replaced by a legal parent RF response.
+            local = local.sequential(source.base)?;
+        }
         let Some(mut local) = fit_local_cost(
             local,
-            flavor_spillable(&model, flavor),
+            flavor_spillable(model, flavor),
             grant,
             session.limits.force_external,
         )?
@@ -301,10 +419,19 @@ pub(crate) fn select_local(
             continue;
         };
         local.max_parallel_tasks = grant.max_parallel_tasks;
-        local.output_pipeline_tasks = useful_output_tasks(&facts, grant.max_parallel_tasks);
-        let Some(cost) = compose(local, children, grant)? else {
+        local.output_pipeline_tasks = useful_output_tasks(facts, grant.max_parallel_tasks);
+        let Some(mut cost) = compose(local, children, grant)? else {
             continue;
         };
+        for source in children.iter().flat_map(|child| child.sources.iter()) {
+            let retained = source_retention(source, facts, flavor, grant.max_parallel_tasks)?;
+            if retained != source.retained_ppm {
+                cost = cost.replace_work(
+                    source.charged,
+                    source.base.retain_work(retained, 1_000_000)?,
+                )?;
+            }
+        }
         if best
             .as_ref()
             .is_none_or(|(_, previous)| ObjectiveProfile::Latency.compare(&cost, previous).is_lt())
@@ -315,10 +442,32 @@ pub(crate) fn select_local(
     let Some((implementation, cost)) = best else {
         return Ok(None);
     };
+    let mut sources = Vec::new();
+    // A breaker closes source response ownership. A future RF cannot travel
+    // through it merely because its column names happen to be preserved.
+    if matches!(
+        model.operator_type,
+        paro_planner::operator::LogicalOperatorType::Filter
+            | paro_planner::operator::LogicalOperatorType::Projection
+            | paro_planner::operator::LogicalOperatorType::ComparisonJoin
+            | paro_planner::operator::LogicalOperatorType::CrossProduct
+    ) {
+        for source in children.iter().flat_map(|child| child.sources.iter()) {
+            let retained_ppm =
+                source_retention(source, facts, implementation, grant.max_parallel_tasks)?;
+            sources.push(SourceResponse {
+                source: source.source,
+                base: source.base,
+                charged: source.base.retain_work(retained_ppm, 1_000_000)?,
+                retained_ppm,
+            });
+        }
+    }
+    sources.extend(own_source);
     let result = children
         .iter()
         .map(|child| child.result)
-        .chain(std::iter::once(operator_result_guarantee(&plan.operator)))
+        .chain(std::iter::once(result))
         .find(|result| matches!(result, requirements::ResultGuarantee::ApproximateAllowed(_)))
         .unwrap_or(requirements::ResultGuarantee::Exact);
     Ok(Some(LocalSelection {
@@ -328,13 +477,214 @@ pub(crate) fn select_local(
             cost,
             hard_rows: facts.output_rows_hard_upper,
             result,
+            sources: sources.into_boxed_slice(),
         },
     }))
+}
+
+/// Price a regional operator over completed relation summaries. Executable
+/// nodes, binding arenas and physical payloads are constructed only after
+/// regional selection; no owned child tree is needed to resolve these facts.
+pub(crate) fn select_native(
+    operator: &paro_planner::operator::LogicalOperator<paro_planner::operator::BoundReference>,
+    stats: &paro_planner::plan::NodeStats,
+    layout: &paro_planner::operator::LogicalOutputLayout,
+    child_layouts: &[paro_planner::operator::LogicalOutputLayout],
+    statistics: &dyn crate::statistics::ColumnStatisticsLookup,
+    children: &[&Completed],
+    environment: SelectionEnvironment<'_>,
+) -> Result<Option<LocalSelection>> {
+    let session = environment.session;
+    let mut references = smallvec::SmallVec::<[_; 2]>::new();
+    operator.visit_child_links(&mut |child| references.push(child));
+    if references.len() != children.len() || references.len() != child_layouts.len() {
+        return Err(paro_error::internal(
+            "regional response child arity mismatch",
+        ));
+    }
+    let inputs = references
+        .iter()
+        .zip(child_layouts)
+        .map(|(reference, layout)| RuntimeFilterInput::Boundary {
+            layout,
+            facts: &reference.facts,
+        })
+        .collect::<smallvec::SmallVec<[_; 2]>>();
+    let range = |estimate: Option<paro_planner::plan::CardinalityEstimate>| {
+        let r = estimate.unwrap_or(paro_planner::plan::CardinalityEstimate {
+            min: 0,
+            expected: 1,
+            max: 4,
+        });
+        CompactRange::new(r.min as f64, r.expected as f64, r.max as f64)
+    };
+    let rows = references
+        .iter()
+        .map(|c| range(c.facts.cardinality))
+        .collect::<Result<Box<[_]>>>()?;
+    let bounds = children.iter().map(|c| c.hard_rows).collect::<Box<[_]>>();
+    let widths = child_layouts
+        .iter()
+        .map(|l| planner_row_width_from_layout(l, Default::default()))
+        .collect::<smallvec::SmallVec<[_; 2]>>();
+    let risks = references
+        .iter()
+        .map(|c| c.facts.cardinality.map_or(1, |r| r.max))
+        .collect::<smallvec::SmallVec<[_; 2]>>();
+    let width = planner_row_width_from_layout(layout, Default::default());
+    let maximum =
+        crate::statistics::cardinality_bound::derive_maximum_cardinality(operator, &bounds);
+    let template = planner_native_cost_facts(
+        operator,
+        (&risks, &widths),
+        width,
+        Default::default(),
+        &inputs,
+        statistics,
+        &BindingCatalog::default(),
+    )?;
+    let facts = resolve_cost_facts(
+        &template,
+        range(stats.estimated_cardinality)?,
+        rows,
+        maximum,
+        bounds,
+    )?;
+    let implementations =
+        planner_native_implementation_set(operator, session.limits.rowset_scan_pushdown, &inputs);
+    let expected = facts
+        .child_rows
+        .iter()
+        .map(|r| r.expected)
+        .collect::<smallvec::SmallVec<[_; 2]>>();
+    let model = LocalCostModel {
+        operator_type: operator.op_type(),
+        local_cost: planner_native_operator_cost(
+            operator,
+            stats,
+            children.len(),
+            maximum,
+            (&facts.child_rows_hard_upper, &expected, &widths),
+            width,
+        )?,
+        baseline: implementations.baseline,
+        resource_sensitive: planner_grant_dependency(operator)
+            == GrantDependencyDescriptor::Sensitive,
+        spillable: planner_operator_spillable(operator),
+        perfect_hash: facts.perfect_hash,
+        runtime_filter_key_types: &facts.runtime_filter_key_types,
+    };
+    select_costed(
+        &model,
+        &facts,
+        implementations,
+        operator_result_guarantee(operator),
+        children,
+        environment,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rf_facts() -> ResolvedPlannerCostFacts {
+        let plan = OwnedLogicalPlan::synthetic(paro_planner::operator::LogicalOperator::DummyScan);
+        let template = planner_cost_facts(
+            &plan,
+            &HashMap::new(),
+            &BindingCatalog::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut facts = resolve_cost_facts(
+            &template,
+            CompactRange::point(10.0).unwrap(),
+            Box::new([
+                CompactRange::point(100.0).unwrap(),
+                CompactRange::point(10.0).unwrap(),
+            ]),
+            Some(1000),
+            Box::new([Some(100), Some(10)]),
+        )
+        .unwrap();
+        facts.runtime_filter_key_types = Box::new([paro_common::types::LogicalType::Integer]);
+        facts.runtime_filter_build_distinct_expected = Some(10);
+        facts.runtime_filter_probe_sources = Box::new([ResolvedRuntimeFilterSource {
+            source: crate::cascades::rules::WorkSourceId(7),
+            rows: CompactRange::point(100.0).unwrap(),
+            multiplicity: RuntimeFilterProbeMultiplicity::DeclaredUnique,
+        }]);
+        facts
+    }
+
+    #[test]
+    fn rf_response_is_source_scoped_and_repeated_demands_are_idempotent() {
+        let mut facts = rf_facts();
+        let base = base_table_scan_cost(CompactRange::point(100.0).unwrap(), 32)
+            .unwrap()
+            .work_only();
+        let mut source = SourceResponse {
+            source: crate::cascades::rules::WorkSourceId(7),
+            base,
+            charged: base,
+            retained_ppm: 1_000_000,
+        };
+        let flavor = PhysicalImplementationFlavor::HashJoinRuntimeFilter;
+        let first = source_retention(&source, &facts, flavor, 4).unwrap();
+        assert_eq!(first, 100_000);
+        source.retained_ppm = first;
+        assert_eq!(source_retention(&source, &facts, flavor, 4).unwrap(), first);
+        facts.runtime_filter_probe_sources[0].source = crate::cascades::rules::WorkSourceId(8);
+        source.retained_ppm = 1_000_000;
+        assert_eq!(
+            source_retention(&source, &facts, flavor, 4).unwrap(),
+            1_000_000
+        );
+        facts.runtime_filter_probe_sources[0].source = source.source;
+        facts.runtime_filter_probe_sources[0].multiplicity =
+            RuntimeFilterProbeMultiplicity::Unknown;
+        assert_eq!(
+            source_retention(&source, &facts, flavor, 4).unwrap(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn replacing_materialization_does_not_discount_decode_or_memory() {
+        let facts = rf_facts();
+        let decode = base_table_scan_cost(CompactRange::point(100.0).unwrap(), 128).unwrap();
+        let materialize = base_table_scan_cost(CompactRange::point(100.0).unwrap(), 32).unwrap();
+        let source = SourceResponse {
+            source: facts.runtime_filter_probe_sources[0].source,
+            base: materialize,
+            charged: materialize,
+            retained_ppm: 1_000_000,
+        };
+        let retained = source_retention(
+            &source,
+            &facts,
+            PhysicalImplementationFlavor::HashJoinRuntimeFilter,
+            4,
+        )
+        .unwrap();
+        let mut total = decode.sequential(materialize).unwrap();
+        total.minimum_memory_bytes = 20;
+        total.peak_memory_upper = 100;
+        let changed = total
+            .replace_work(
+                materialize,
+                materialize.retain_work(retained, 1_000_000).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            changed.score.range.expected,
+            decode.score.range.expected + materialize.score.range.expected * 0.1
+        );
+        assert_eq!(changed.score.range.upper, total.score.range.upper);
+        assert_eq!(changed.minimum_memory_bytes, 20);
+        assert_eq!(changed.peak_memory_upper, 100);
+    }
 
     fn grant(spill_policy: SpillPolicy) -> ResourceGrantClass {
         ResourceGrantClass {
@@ -360,6 +710,7 @@ mod tests {
             cost,
             hard_rows: None,
             result: requirements::ResultGuarantee::Exact,
+            sources: Box::new([]),
         }
     }
 

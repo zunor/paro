@@ -56,6 +56,29 @@ pub(crate) struct PlanEnumerator<'a> {
     frontier_truncated: bool,
 }
 
+impl super::connected::ConnectedRegion for PlanEnumerator<'_> {
+    fn relations(&self) -> usize {
+        self.num_relations
+    }
+    fn graph(&self) -> &QueryGraphEdges {
+        self.query_graph
+    }
+    fn sets(&mut self) -> &mut JoinRelationSetManager {
+        self.set_manager
+    }
+    fn contains(&self, set: &Arc<JoinRelationSet>) -> bool {
+        self.plans.contains_key(set)
+    }
+    fn emit(
+        &mut self,
+        left: &Arc<JoinRelationSet>,
+        right: &Arc<JoinRelationSet>,
+        connections: &[NeighborInfo],
+    ) -> EnumerationOutcome {
+        self.try_emit_pair(left, right, connections)
+    }
+}
+
 impl<'a> PlanEnumerator<'a> {
     /// Create a new PlanEnumerator.
     #[cfg(test)]
@@ -209,27 +232,9 @@ impl<'a> PlanEnumerator<'a> {
 
     /// Solve join order exactly using dynamic programming.
     fn solve_join_order_exactly(&mut self) -> EnumerationOutcome {
-        // Enumerate over all possible pairs in the neighborhood
-        for i in (1..=self.num_relations).rev() {
-            let start_node = self.set_manager.get_relation(i - 1);
-
-            // Emit the start node
-            let outcome = self.emit_csg(&start_node);
-            if outcome != EnumerationOutcome::Complete {
-                return outcome;
-            }
-
-            // Initialize exclusion set as all nodes with number below this
-            let mut exclusion_set = HashSet::new();
-            for j in 0..i {
-                exclusion_set.insert(j);
-            }
-
-            // Recursively search for neighbors not in exclusion set
-            let outcome = self.enumerate_csg_recursive(&start_node, &mut exclusion_set);
-            if outcome != EnumerationOutcome::Complete {
-                return outcome;
-            }
+        let outcome = super::connected::enumerate(self);
+        if outcome != EnumerationOutcome::Complete {
+            return outcome;
         }
 
         // DPccp intentionally enumerates connected cuts.  A two-relation
@@ -248,153 +253,6 @@ impl<'a> PlanEnumerator<'a> {
                 }
             }
         }
-        EnumerationOutcome::Complete
-    }
-
-    /// Emit a connected subgraph (CSG).
-    fn emit_csg(&mut self, node: &Arc<JoinRelationSet>) -> EnumerationOutcome {
-        if node.count() == self.num_relations {
-            return EnumerationOutcome::Complete;
-        }
-
-        // Create exclusion set as everything inside the subgraph and anything below it
-        let mut exclusion_set = HashSet::new();
-        for i in 0..node.relations()[0] {
-            exclusion_set.insert(i);
-        }
-        for &rel in node.relations() {
-            exclusion_set.insert(rel);
-        }
-
-        // Find neighbors given this exclusion set
-        let neighbors = self.query_graph.get_neighbors(node, &exclusion_set);
-        if neighbors.is_empty() {
-            return EnumerationOutcome::Complete;
-        }
-
-        // Neighbors should be in reverse order
-        let mut neighbors = neighbors;
-        neighbors.sort_by(|a, b| b.cmp(a));
-
-        // Add neighbors to exclusion set for recursive calls
-        let mut new_exclusion_set = exclusion_set.clone();
-        for &neighbor in &neighbors {
-            new_exclusion_set.insert(neighbor);
-        }
-
-        for neighbor_idx in neighbors {
-            let neighbor_relation = self.set_manager.get_relation(neighbor_idx);
-
-            // Check if connected
-            let connections = self.query_graph.get_connections(node, &neighbor_relation);
-            if !connections.is_empty() {
-                let outcome = self.try_emit_pair(node, &neighbor_relation, &connections);
-                if outcome != EnumerationOutcome::Complete {
-                    return outcome;
-                }
-            }
-
-            let outcome =
-                self.enumerate_cmp_recursive(node, &neighbor_relation, &mut new_exclusion_set);
-            if outcome != EnumerationOutcome::Complete {
-                return outcome;
-            }
-
-            new_exclusion_set.remove(&neighbor_idx);
-        }
-
-        EnumerationOutcome::Complete
-    }
-
-    /// Enumerate connected subgraphs recursively.
-    fn enumerate_csg_recursive(
-        &mut self,
-        node: &Arc<JoinRelationSet>,
-        exclusion_set: &mut HashSet<usize>,
-    ) -> EnumerationOutcome {
-        // Find neighbors of S under the exclusion set
-        let neighbors = self.query_graph.get_neighbors(node, exclusion_set);
-        if neighbors.is_empty() {
-            return EnumerationOutcome::Complete;
-        }
-
-        let all_subsets = get_all_neighbor_sets(neighbors.clone());
-        let mut union_sets = Vec::new();
-
-        for rel_set in &all_subsets {
-            let neighbor = self.set_manager.get_relation_from_vec(rel_set.clone());
-            let new_set = self.set_manager.union(node, &neighbor);
-
-            if new_set.count() > node.count() && self.plans.contains_key(&new_set) {
-                let outcome = self.emit_csg(&new_set);
-                if outcome != EnumerationOutcome::Complete {
-                    return outcome;
-                }
-            }
-            union_sets.push(new_set);
-        }
-
-        let mut new_exclusion_set = exclusion_set.clone();
-        for &neighbor in &neighbors {
-            new_exclusion_set.insert(neighbor);
-        }
-
-        for union_set in union_sets {
-            let outcome = self.enumerate_csg_recursive(&union_set, &mut new_exclusion_set);
-            if outcome != EnumerationOutcome::Complete {
-                return outcome;
-            }
-        }
-
-        EnumerationOutcome::Complete
-    }
-
-    /// Enumerate complement pairs recursively.
-    fn enumerate_cmp_recursive(
-        &mut self,
-        left: &Arc<JoinRelationSet>,
-        right: &Arc<JoinRelationSet>,
-        exclusion_set: &mut HashSet<usize>,
-    ) -> EnumerationOutcome {
-        // Get neighbors of the second relation under the exclusion set
-        let neighbors = self.query_graph.get_neighbors(right, exclusion_set);
-        if neighbors.is_empty() {
-            return EnumerationOutcome::Complete;
-        }
-
-        let all_subsets = get_all_neighbor_sets(neighbors.clone());
-        let mut union_sets = Vec::new();
-
-        for rel_set in &all_subsets {
-            let neighbor = self.set_manager.get_relation_from_vec(rel_set.clone());
-            let combined_set = self.set_manager.union(right, &neighbor);
-
-            debug_assert!(combined_set.count() > right.count());
-
-            if self.plans.contains_key(&combined_set) {
-                let connections = self.query_graph.get_connections(left, &combined_set);
-                if !connections.is_empty() {
-                    let outcome = self.try_emit_pair(left, &combined_set, &connections);
-                    if outcome != EnumerationOutcome::Complete {
-                        return outcome;
-                    }
-                }
-            }
-            union_sets.push(combined_set);
-        }
-
-        let mut new_exclusion_set = exclusion_set.clone();
-        for &neighbor in &neighbors {
-            new_exclusion_set.insert(neighbor);
-        }
-
-        for union_set in union_sets {
-            let outcome = self.enumerate_cmp_recursive(left, &union_set, &mut new_exclusion_set);
-            if outcome != EnumerationOutcome::Complete {
-                return outcome;
-            }
-        }
-
         EnumerationOutcome::Complete
     }
 
@@ -638,7 +496,7 @@ impl<'a> PlanEnumerator<'a> {
 /// Get all non-empty subsets of a set of neighbors.
 ///
 /// This generates all 2^n - 1 subsets of the input set.
-fn get_all_neighbor_sets(mut neighbors: Vec<usize>) -> Vec<Vec<usize>> {
+pub(crate) fn get_all_neighbor_sets(mut neighbors: Vec<usize>) -> Vec<Vec<usize>> {
     neighbors.sort();
 
     // Keep the historical cardinality/lexicographic order, but represent a

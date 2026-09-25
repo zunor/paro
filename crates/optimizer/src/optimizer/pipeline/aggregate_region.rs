@@ -22,7 +22,7 @@ use paro_planner::plan::{arena::LogicalPlanNode, OwnedLogicalPlan};
 use crate::aggregate::dimension_deferral::{
     inline_projections, join_region::is_plain_inner_equi_join, partial_merge,
 };
-use crate::context::{OptimizationContext, SharedColumnStatistics};
+use crate::context::OptimizationContext;
 use crate::expression::traversal::visit_expression;
 use crate::physical::{direct, ObjectiveProfile, PhysicalImplementationFlavor, ResourceGrantClass};
 use crate::statistics::gathering::StatisticsGathering;
@@ -43,7 +43,12 @@ struct Node {
     children: Vec<Arc<Node>>,
     leaf: Option<usize>,
     layout: LogicalOutputLayout,
-    columns: SharedColumnStatistics,
+    columns: Box<
+        [(
+            ColumnBinding,
+            Arc<paro_storage::statistics::ColumnStatistics>,
+        )],
+    >,
     response: direct::Completed,
     implementation: PhysicalImplementationFlavor,
     /// Original SQL bindings carried by the current partial grain.
@@ -53,14 +58,10 @@ struct Node {
 }
 
 impl Node {
-    fn boundary(&self, ordinal: usize) -> Result<Box<OwnedLogicalPlan>> {
+    fn boundary(&self, ordinal: usize) -> Result<BoundReference> {
         let mut reference = self.boundary.clone();
         reference.reference_id = BoundReferenceId::input_ordinal(ordinal);
-        Ok(Box::new(OwnedLogicalPlan {
-            id: self.shell.id,
-            stats: self.shell.stats.clone(),
-            operator: LogicalOperator::BoundReference(reference),
-        }))
+        Ok(reference)
     }
 }
 
@@ -96,12 +97,15 @@ pub(super) struct Work {
     pub partial_states: u64,
     pub budget_fallbacks: u64,
     pub selected_partial: u64,
+    pub borrowed_cuts: u64,
+    pub completed_outputs: u64,
 }
 
 struct Region<'a> {
     aggregate: Option<Aggregate<()>>,
     leaves: Vec<&'a OwnedLogicalPlan>,
     conditions: Vec<JoinCondition>,
+    condition_support: Box<[(Mask, Mask)]>,
     owners: BTreeMap<ColumnBinding, Mask>,
     types: BTreeMap<ColumnBinding, paro_common::types::LogicalType>,
     arguments: Mask,
@@ -124,6 +128,34 @@ fn columns(expression: &Expression) -> Option<BTreeSet<ColumnBinding>> {
 fn movable(expression: &Expression) -> bool {
     let properties = expression.evaluation_properties();
     properties.can_share_evaluation() && !properties.is_reorder_fence()
+}
+
+fn movable_inner<Child>(join: &ComparisonJoin<Child>) -> bool {
+    join.join_type == JoinType::Inner
+        && join.build_side_constraint == JoinBuildSideConstraint::Either
+        && !join.conditions.is_empty()
+        && join.mark_index.is_none()
+        && join.duplicate_eliminated_columns.is_empty()
+        && !join.delim_flipped
+        && join
+            .conditions
+            .iter()
+            .all(|c| movable(&c.left) && movable(&c.right))
+}
+
+fn condition_supports(
+    conditions: &[JoinCondition],
+    owners: &BTreeMap<ColumnBinding, Mask>,
+) -> Option<Box<[(Mask, Mask)]>> {
+    let support = |expression: &Expression| {
+        columns(expression)?
+            .iter()
+            .try_fold(0, |mask, b| Some(mask | owners.get(b)?))
+    };
+    conditions
+        .iter()
+        .map(|c| Some((support(&c.left)?, support(&c.right)?)))
+        .collect()
 }
 
 fn flatten<'a>(
@@ -235,10 +267,12 @@ impl<'a> Region<'a> {
             post_reduction: None,
             returned_types: aggregate.returned_types.clone(),
         };
+        let condition_support = condition_supports(&conditions, &owners)?;
         Some(Self {
             aggregate: Some(aggregate),
             leaves,
             conditions,
+            condition_support,
             owners,
             types,
             arguments,
@@ -259,7 +293,7 @@ impl<'a> Region<'a> {
                     residuals.extend(f.expressions.iter().cloned());
                     collect(&f.child, leaves, conditions, residuals);
                 }
-                LogicalOperator::Join(Join::Comparison(j)) if is_plain_inner_equi_join(j) => {
+                LogicalOperator::Join(Join::Comparison(j)) if movable_inner(j) => {
                     collect(&j.left, leaves, conditions, residuals);
                     collect(&j.right, leaves, conditions, residuals);
                     conditions.extend(j.conditions.iter().cloned());
@@ -280,7 +314,7 @@ impl<'a> Region<'a> {
         let mut conditions = vec![];
         let mut predicates = vec![];
         collect(plan, &mut leaves, &mut conditions, &mut predicates);
-        if !(2..=8).contains(&leaves.len()) {
+        if !(2..=12).contains(&leaves.len()) {
             return None;
         }
         let mut owners = BTreeMap::new();
@@ -293,8 +327,22 @@ impl<'a> Region<'a> {
                 types.insert(binding, ty);
             }
         }
-        if conditions.iter().any(|c| !matches!((&c.left, &c.right), (Expression::ColumnRef(l), Expression::ColumnRef(r))
-            if l.depth == 0 && r.depth == 0 && owners.contains_key(&l.binding) && owners.contains_key(&r.binding))) { return None; }
+        for c in &conditions {
+            let mut sides = Vec::new();
+            for expression in [&c.left, &c.right] {
+                let used = columns(expression)?;
+                if used.is_empty() || used.iter().any(|b| !owners.contains_key(b)) {
+                    return None;
+                }
+                sides.push(used.iter().fold(0_u16, |mask, b| mask | owners[b]));
+            }
+            // A computed scalar on one relation is still a binary edge.
+            // General overlapping operands need residual-hyperedge routing;
+            // do not flatten and silently drop them at a non-oriented cut.
+            if sides.iter().any(|s| !s.is_power_of_two()) || sides[0] == sides[1] {
+                return None;
+            }
+        }
         let residuals = predicates
             .into_iter()
             .map(|expression| {
@@ -308,10 +356,12 @@ impl<'a> Region<'a> {
                 Some((support, expression))
             })
             .collect::<Option<Vec<_>>>()?;
+        let condition_support = condition_supports(&conditions, &owners)?;
         Some(Self {
             aggregate: None,
             leaves,
             conditions,
+            condition_support,
             owners,
             types,
             arguments: 0,
@@ -323,18 +373,14 @@ impl<'a> Region<'a> {
     fn cut(&self, left: Mask, right: Mask) -> Vec<JoinCondition> {
         self.conditions
             .iter()
-            .filter_map(|c| {
-                let (Expression::ColumnRef(l), Expression::ColumnRef(r)) = (&c.left, &c.right)
-                else {
-                    return None;
-                };
-                let l = self.owners[&l.binding];
-                let r = self.owners[&r.binding];
-                if l & left != 0 && r & right != 0 {
+            .zip(self.condition_support.iter().copied())
+            .filter_map(|(c, (l, r))| {
+                if l & left == l && r & right == r {
                     Some(c.clone())
-                } else if r & left != 0 && l & right != 0 {
+                } else if r & left == r && l & right == l {
                     let mut c = c.clone();
                     std::mem::swap(&mut c.left, &mut c.right);
+                    c.comparison = c.comparison.flip();
                     Some(c)
                 } else {
                     None
@@ -354,26 +400,160 @@ struct Planner<'a> {
     exhausted: bool,
 }
 
-impl Planner<'_> {
-    fn emit(
-        &mut self,
-        operator: LogicalOperator,
+/// A borrowed lookup over disjoint, already completed relation outputs. No
+/// per-cut hash table or statistics clone is needed for response evaluation.
+struct InputColumns<'a>(&'a [Arc<Node>]);
+
+impl crate::statistics::ColumnStatisticsLookup for InputColumns<'_> {
+    fn get(
+        &self,
+        binding: &ColumnBinding,
+    ) -> Option<&Arc<paro_storage::statistics::ColumnStatistics>> {
+        self.0.iter().find_map(|node| {
+            node.columns
+                .iter()
+                .find(|(key, _)| key == binding)
+                .map(|(_, value)| value)
+        })
+    }
+}
+
+// A cut is stack-local scratch, never a resident candidate archive. Boxing
+// its large arm would add an allocation to every immediately rejected cut.
+#[allow(clippy::large_enum_variant)]
+enum CutCandidate {
+    Ready(Arc<Node>),
+    Priced {
+        operator: LogicalOperator<BoundReference>,
         children: Vec<Arc<Node>>,
-    ) -> Result<Option<Arc<Node>>> {
+        selection: direct::LocalSelection,
+    },
+}
+
+impl CutCandidate {
+    fn cost(&self) -> &crate::physical::SearchCost {
+        match self {
+            Self::Ready(node) => &node.response.cost,
+            Self::Priced { selection, .. } => &selection.response.cost,
+        }
+    }
+}
+
+impl Planner<'_> {
+    fn reserve_transition(&mut self) -> Result<bool> {
         self.context.session.cancellation.check()?;
         if self.remaining == 0 {
             self.exhausted = true;
-            return Ok(None);
+            return Ok(false);
         }
         self.remaining -= 1;
         self.work.transitions += 1;
-        let mut columns = HashMap::new();
+        Ok(true)
+    }
+
+    fn price_cut(
+        &mut self,
+        operator: LogicalOperator<BoundReference>,
+        children: Vec<Arc<Node>>,
+    ) -> Result<Option<CutCandidate>> {
+        use crate::statistics::ColumnStatisticsLookup;
+        // Equality narrowing changes value bounds, not known marginal NDVs.
+        // Delay output propagation only in this explicit estimator domain.
+        // Unknown domains and residual comparisons retain full settlement.
+        let columns = InputColumns(&children);
+        let eligible = matches!(&operator, LogicalOperator::Join(Join::Comparison(join))
+            if join.conditions.iter().all(|c| c.comparison == paro_planner::operator::JoinComparisonType::Equal
+                && [&c.left, &c.right].iter().all(|e| matches!(e, Expression::ColumnRef(column)
+                    if columns.get(&column.binding).is_some_and(|s| s.distinct_evidence().point > 0)))));
+        if !eligible {
+            return self
+                .emit(operator, children)
+                .map(|node| node.map(CutCandidate::Ready));
+        }
+        if !self.reserve_transition()? {
+            return Ok(None);
+        }
+        self.work.borrowed_cuts += 1;
+        let layouts = children
+            .iter()
+            .map(|c| c.layout.clone())
+            .collect::<Vec<_>>();
+        let stats = paro_planner::plan::NodeStats {
+            estimated_cardinality: self.gathering.estimate_native_cardinality(
+                &operator,
+                &layouts,
+                &columns,
+                &mut self.context,
+            ),
+            ..Default::default()
+        };
+        let layout = operator.output_layout_from_children(&layouts);
+        let responses = children.iter().map(|c| &c.response).collect::<Vec<_>>();
+        Ok(direct::select_native(
+            &operator,
+            &stats,
+            &layout,
+            &layouts,
+            &columns,
+            &responses,
+            direct::SelectionEnvironment {
+                grant: self.grant,
+                calibration: self.calibration,
+                session: &self.context.session,
+            },
+        )?
+        .map(|selection| CutCandidate::Priced {
+            operator,
+            children,
+            selection,
+        }))
+    }
+
+    fn complete_cut(&mut self, candidate: CutCandidate) -> Result<Option<Arc<Node>>> {
+        match candidate {
+            CutCandidate::Ready(node) => Ok(Some(node)),
+            CutCandidate::Priced {
+                operator,
+                children,
+                selection,
+            } => {
+                let node = self.complete(operator, children)?;
+                if let Some(node) = &node {
+                    debug_assert_eq!(node.implementation, selection.implementation);
+                    debug_assert_eq!(node.response.cost, selection.response.cost);
+                }
+                Ok(node)
+            }
+        }
+    }
+
+    fn emit(
+        &mut self,
+        operator: LogicalOperator<BoundReference>,
+        children: Vec<Arc<Node>>,
+    ) -> Result<Option<Arc<Node>>> {
+        if !self.reserve_transition()? {
+            return Ok(None);
+        }
+        self.complete(operator, children)
+    }
+
+    fn complete(
+        &mut self,
+        operator: LogicalOperator<BoundReference>,
+        children: Vec<Arc<Node>>,
+    ) -> Result<Option<Arc<Node>>> {
+        self.work.completed_outputs += 1;
+        // One region-owned scratch table. Candidate outputs retain aligned
+        // immutable column handles, not one hash table per candidate.
+        let mut columns = std::mem::take(self.context.column_stats_mut());
+        columns.clear();
         for child in &children {
             columns.extend(child.columns.iter().map(|(k, v)| (*k, v.clone())));
         }
         let mut propagator =
             crate::statistics::propagator::StatisticsPropagator::with_statistics_map(columns);
-        let operator = propagator.propagate_operator(&self.context.session, operator);
+        let operator = propagator.propagate_native_operator(&self.context.session, operator);
         self.context.column_stats = Arc::new(propagator.take_statistics_map());
         let layouts = children
             .iter()
@@ -383,40 +563,85 @@ impl Planner<'_> {
             .iter()
             .map(|c| c.response.hard_rows)
             .collect::<Vec<_>>();
-        let plan = OwnedLogicalPlan::new(&self.context.bind_context, operator);
-        let (plan, layout, _) = self.gathering.gather_local(
-            plan,
+        let (stats, operator, layout, _) = self.gathering.gather_native_local(
+            operator,
+            Default::default(),
             &layouts,
             &bounds,
             self.context.column_stats.clone(),
             &mut self.context,
         );
         let responses = children.iter().map(|c| &c.response).collect::<Vec<_>>();
-        let Some(selected) = direct::select_local(
-            &plan,
+        let Some(selected) = direct::select_native(
+            &operator,
+            &stats,
+            &layout,
+            &layouts,
             &self.context.column_stats,
             &responses,
-            self.grant,
-            self.calibration,
-            &self.context.session,
+            direct::SelectionEnvironment {
+                grant: self.grant,
+                calibration: self.calibration,
+                session: &self.context.session,
+            },
         )?
         else {
             return Ok(None);
         };
-        let columns = Arc::new(
-            layout
+        let columns = layout
+            .bindings()
+            .iter()
+            .filter_map(|binding| {
+                self.context
+                    .column_stats
+                    .get(binding)
+                    .map(|s| (*binding, s.clone()))
+            })
+            .collect();
+        let source_lineage = match &operator {
+            LogicalOperator::Filter(_) | LogicalOperator::Join(Join::Comparison(_)) => layout
                 .bindings()
                 .iter()
-                .filter_map(|binding| {
-                    self.context
-                        .column_stats
-                        .get(binding)
-                        .map(|s| (*binding, s.clone()))
+                .map(|binding| {
+                    children
+                        .iter()
+                        .find_map(|child| {
+                            child
+                                .layout
+                                .bindings()
+                                .iter()
+                                .position(|b| b == binding)
+                                .and_then(|i| child.boundary.facts.source_lineage.get(i).cloned())
+                        })
+                        .flatten()
                 })
                 .collect(),
-        );
-        let boundary = boundary(&plan, &layout, &selected.response)?;
-        let (shell, _) = LogicalPlanNode::detach(plan);
+            _ => vec![None; layout.len()],
+        };
+        let boundary = BoundReference::new(
+            BoundReferenceId::input_ordinal(0),
+            layout.bindings().to_vec(),
+            layout.types().to_vec(),
+        )
+        .with_facts(Arc::new(BoundRelationFacts::new(
+            BoundRelationFactValues {
+                cardinality: stats.estimated_cardinality,
+                maximum_cardinality: selected.response.hard_rows,
+                unique_keys: stats.unique_keys.clone(),
+                finite_domains: stats.finite_domains.clone(),
+                source_lineage,
+                contains_control_region: children
+                    .iter()
+                    .any(|c| c.boundary.facts.contains_control_region),
+                ..Default::default()
+            },
+            layout.types().to_vec(),
+        )))?;
+        let shell = LogicalPlanNode {
+            id: self.context.bind_context.next_plan_id(),
+            stats,
+            operator: operator.try_map_child_links(&mut |_| -> Result<_> { Ok(()) })?,
+        };
         let mut rebind = BTreeMap::new();
         let mut partial_aggregate_index = None;
         for child in &children {
@@ -473,7 +698,7 @@ impl Planner<'_> {
         let group_index = self.context.bind_context.generate_table_index();
         let aggregate_index = self.context.bind_context.generate_table_index();
         let groupings_index = self.context.bind_context.generate_table_index();
-        let groups = keys
+        let groups: Vec<_> = keys
             .iter()
             .map(|binding| {
                 Expression::ColumnRef(
@@ -481,16 +706,22 @@ impl Planner<'_> {
                 )
             })
             .collect();
-        let aggregate = Aggregate::new(
+        let mut aggregate = Aggregate {
             group_index,
             aggregate_index,
             groupings_index,
-            *input.boundary(0)?,
+            child: input.boundary(0)?,
+            group_stats: vec![None; groups.len()],
             groups,
-            vec![],
-            aggregate.aggregates.clone(),
-            vec![],
-        );
+            grouping_sets: vec![],
+            aggregates: aggregate.aggregates.clone(),
+            grouping_functions: vec![],
+            group_dependencies: vec![],
+            group_input_multiplicity: Default::default(),
+            post_reduction: None,
+            returned_types: vec![],
+        };
+        aggregate.recompute_returned_types();
         let Some(mut output) =
             self.emit(LogicalOperator::Aggregate(Box::new(aggregate)), vec![input])?
         else {
@@ -521,7 +752,7 @@ impl Planner<'_> {
                 .ok_or_else(|| {
                     paro_common::error::internal("region lost a promised output binding")
                 })?;
-            let mut filter = paro_planner::operator::Filter::new(*input.boundary(0)?, vec![]);
+            let mut filter = filter(input.boundary(0)?, vec![]);
             filter.projection_map = paro_planner::operator::ProjectionMap::new(indices);
             return self.emit(LogicalOperator::Filter(filter), vec![input]);
         };
@@ -572,6 +803,17 @@ fn rebind(expression: Expression, bindings: &BTreeMap<ColumnBinding, ColumnBindi
             Expression::ColumnRef(ColumnRefExpression::new(*binding, c.return_type.clone()).into())
         })
     })
+}
+
+fn filter(
+    child: BoundReference,
+    expressions: Vec<Expression>,
+) -> paro_planner::operator::Filter<BoundReference> {
+    paro_planner::operator::Filter {
+        child,
+        expressions,
+        projection_map: paro_planner::operator::ProjectionMap::all(),
+    }
 }
 
 fn retain(states: &mut [BTreeMap<Option<Mask>, Arc<Node>>], key: StateKey, node: Arc<Node>) {
@@ -627,6 +869,8 @@ fn reconstruct(
 pub(super) struct Selection {
     pub plan: OwnedLogicalPlan,
     pub columns: HashMap<ColumnBinding, Arc<paro_storage::statistics::ColumnStatistics>>,
+    #[cfg(test)]
+    cost: crate::physical::SearchCost,
 }
 
 pub(super) fn optimize(
@@ -645,7 +889,7 @@ pub(super) fn optimize(
 
 pub(super) fn join_root(plan: &OwnedLogicalPlan) -> bool {
     match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(j)) => is_plain_inner_equi_join(j),
+        LogicalOperator::Join(Join::Comparison(j)) => movable_inner(j),
         LogicalOperator::Join(Join::Cross(j)) => {
             j.build_side_constraint == JoinBuildSideConstraint::Either
         }
@@ -668,6 +912,183 @@ pub(super) fn optimize_joins(
     optimize_region(region, context, grant, calibration, max_transitions, work)
 }
 
+/// Grain-aware receiver for the same connected-subgraph traversal used by
+/// ordinary join planning. Traversal owns connectivity; this receiver owns
+/// estimates, exact child choices and the explicit one-winner grain policy.
+struct RegionEnumeration<'a, 'b> {
+    region: Region<'a>,
+    planner: Planner<'b>,
+    states: Vec<BTreeMap<Option<Mask>, Arc<Node>>>,
+    graph: crate::join_order::query_graph::QueryGraphEdges,
+    sets: crate::join_order::relation::JoinRelationSetManager,
+    allow_partial: bool,
+    error: Option<paro_common::error::ParoError>,
+}
+
+fn relation_mask(set: &crate::join_order::relation::JoinRelationSet) -> Mask {
+    set.relations()
+        .iter()
+        .fold(0, |mask, index| mask | (1 << index))
+}
+
+impl RegionEnumeration<'_, '_> {
+    fn add_partial(&mut self, mask: Mask) -> Result<()> {
+        let full = self.states.len() as Mask - 1;
+        if self.allow_partial
+            && self.region.aggregate.is_some()
+            && mask != full
+            && self.region.arguments & mask == self.region.arguments
+        {
+            if let Some(raw) = self.states[mask as usize].get(&None).cloned() {
+                if let Some(partial) = self.planner.partial(&self.region, mask, raw)? {
+                    retain(
+                        &mut self.states,
+                        StateKey {
+                            relations: mask,
+                            partial: Some(mask),
+                        },
+                        partial,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn price_pair(&mut self, left: Mask, right: Mask) -> Result<()> {
+        let mask = left | right;
+        let full = self.states.len() as Mask - 1;
+        let conditions = self.region.cut(left, right);
+        if conditions.is_empty() {
+            return Ok(());
+        }
+        let left_states = self.states[left as usize]
+            .iter()
+            .map(|(k, n)| (*k, n.clone()))
+            .collect::<Vec<_>>();
+        let right_states = self.states[right as usize]
+            .iter()
+            .map(|(k, n)| (*k, n.clone()))
+            .collect::<Vec<_>>();
+        let residuals = self
+            .region
+            .residuals
+            .iter()
+            .filter(|(support, _)| {
+                if *support == 0 {
+                    mask == full
+                } else {
+                    *support & mask == *support
+                        && *support & left != *support
+                        && *support & right != *support
+                }
+            })
+            .map(|(_, e)| e.clone())
+            .collect::<Vec<_>>();
+        let mut changed_raw = false;
+        for (lk, l) in &left_states {
+            for (rk, r) in &right_states {
+                if lk.is_some() && rk.is_some() {
+                    continue;
+                }
+                let grain = lk.or(*rk);
+                let conditions = conditions
+                    .iter()
+                    .cloned()
+                    .map(|mut c| {
+                        c.left = rebind(c.left, &l.rebind);
+                        c.right = rebind(c.right, &r.rebind);
+                        c
+                    })
+                    .collect();
+                let join = ComparisonJoin {
+                    join_type: JoinType::Inner,
+                    anti_join_mode: Default::default(),
+                    left: l.boundary(0)?,
+                    right: r.boundary(1)?,
+                    conditions,
+                    mark_index: None,
+                    mark_semantics: paro_planner::operator::join::MarkJoinSemantics::NotMark,
+                    duplicate_eliminated_columns: vec![],
+                    delim_flipped: false,
+                    build_side_constraint: JoinBuildSideConstraint::Either,
+                    left_projection_map: paro_planner::operator::ProjectionMap::all(),
+                    right_projection_map: paro_planner::operator::ProjectionMap::all(),
+                };
+                let operator = LogicalOperator::Join(Join::Comparison(join));
+                let children = vec![l.clone(), r.clone()];
+                let candidate = if residuals.is_empty() {
+                    self.planner.price_cut(operator, children)?
+                } else if let Some(node) = self.planner.emit(operator, children)? {
+                    let filter = filter(node.boundary(0)?, residuals.clone());
+                    self.planner
+                        .emit(LogicalOperator::Filter(filter), vec![node])?
+                        .map(CutCandidate::Ready)
+                } else {
+                    None
+                };
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                if self.states[mask as usize].get(&grain).is_some_and(|old| {
+                    !ObjectiveProfile::Latency
+                        .compare(candidate.cost(), &old.response.cost)
+                        .is_lt()
+                }) {
+                    continue;
+                }
+                if let Some(node) = self.planner.complete_cut(candidate)? {
+                    retain(
+                        &mut self.states,
+                        StateKey {
+                            relations: mask,
+                            partial: grain,
+                        },
+                        node,
+                    );
+                    changed_raw |= grain.is_none();
+                }
+            }
+        }
+        if changed_raw {
+            self.add_partial(mask)?;
+        }
+        Ok(())
+    }
+}
+
+impl crate::join_order::connected::ConnectedRegion for RegionEnumeration<'_, '_> {
+    fn relations(&self) -> usize {
+        self.region.leaves.len()
+    }
+    fn graph(&self) -> &crate::join_order::query_graph::QueryGraphEdges {
+        &self.graph
+    }
+    fn sets(&mut self) -> &mut crate::join_order::relation::JoinRelationSetManager {
+        &mut self.sets
+    }
+    fn contains(&self, set: &Arc<crate::join_order::relation::JoinRelationSet>) -> bool {
+        !self.states[relation_mask(set) as usize].is_empty()
+    }
+    fn emit(
+        &mut self,
+        left: &Arc<crate::join_order::relation::JoinRelationSet>,
+        right: &Arc<crate::join_order::relation::JoinRelationSet>,
+        _connections: &[crate::join_order::query_graph::NeighborInfo],
+    ) -> crate::join_order::enumerator::EnumerationOutcome {
+        use crate::join_order::enumerator::EnumerationOutcome as Outcome;
+        if let Err(error) = self.price_pair(relation_mask(left), relation_mask(right)) {
+            self.error = Some(error);
+            return Outcome::Ineligible;
+        }
+        if self.planner.exhausted {
+            Outcome::PairBudgetExhausted
+        } else {
+            Outcome::Complete
+        }
+    }
+}
+
 fn optimize_region(
     region: Region<'_>,
     context: &OptimizationContext,
@@ -675,6 +1096,28 @@ fn optimize_region(
     calibration: &crate::cascades::calibration::MachineCalibrationBundle,
     max_transitions: usize,
     work: &mut Work,
+) -> Result<Option<Selection>> {
+    optimize_region_with(
+        region,
+        context,
+        grant,
+        calibration,
+        max_transitions,
+        work,
+        |region| crate::join_order::connected::enumerate(region),
+    )
+}
+
+fn optimize_region_with(
+    region: Region<'_>,
+    context: &OptimizationContext,
+    grant: ResourceGrantClass,
+    calibration: &crate::cascades::calibration::MachineCalibrationBundle,
+    max_transitions: usize,
+    work: &mut Work,
+    enumerate: impl FnOnce(
+        &mut RegionEnumeration<'_, '_>,
+    ) -> crate::join_order::enumerator::EnumerationOutcome,
 ) -> Result<Option<Selection>> {
     let allow_partial = context.session.settings.optimizer_aggregate_strategy()?
         == paro_context::OptimizerAggregateStrategy::Joint;
@@ -687,7 +1130,6 @@ fn optimize_region(
         remaining: max_transitions,
         exhausted: false,
     };
-    let start = planner.work.transitions;
     let mut states = vec![BTreeMap::new(); 1 << region.leaves.len()];
     for (index, leaf) in region.leaves.iter().enumerate() {
         let Some(response) = direct::estimate_response(
@@ -702,13 +1144,11 @@ fn optimize_region(
         };
         let layout = leaf.output_layout();
         let boundary = boundary(leaf, &layout, &response)?;
-        let columns = Arc::new(
-            layout
-                .bindings()
-                .iter()
-                .filter_map(|b| context.column_stats.get(b).map(|s| (*b, s.clone())))
-                .collect(),
-        );
+        let columns = layout
+            .bindings()
+            .iter()
+            .filter_map(|b| context.column_stats.get(b).map(|s| (*b, s.clone())))
+            .collect();
         let shell = LogicalPlanNode {
             id: leaf.id,
             stats: leaf.stats.clone(),
@@ -733,7 +1173,7 @@ fn optimize_region(
             .map(|(_, e)| e.clone())
             .collect::<Vec<_>>();
         if !residuals.is_empty() {
-            let filter = paro_planner::operator::Filter::new(*node.boundary(0)?, residuals);
+            let filter = filter(node.boundary(0)?, residuals);
             let Some(filtered) = planner.emit(LogicalOperator::Filter(filter), vec![node])? else {
                 planner.work.budget_fallbacks += u64::from(planner.exhausted);
                 return Ok(None);
@@ -743,110 +1183,43 @@ fn optimize_region(
         states[1 << index].insert(None, node);
     }
     let full: Mask = (1 << region.leaves.len()) - 1;
-    for size in 1..=region.leaves.len() {
-        for mask in 1..=full {
-            if mask.count_ones() as usize != size {
-                continue;
-            }
-            if size > 1 {
-                let mut left = (mask - 1) & mask;
-                while left != 0 {
-                    let right = mask ^ left;
-                    if left < right {
-                        let conditions = region.cut(left, right);
-                        if !conditions.is_empty() {
-                            let left_states = states[left as usize]
-                                .iter()
-                                .map(|(k, n)| (*k, n.clone()))
-                                .collect::<Vec<_>>();
-                            let right_states = states[right as usize]
-                                .iter()
-                                .map(|(k, n)| (*k, n.clone()))
-                                .collect::<Vec<_>>();
-                            for (lk, l) in &left_states {
-                                for (rk, r) in &right_states {
-                                    if lk.is_some() && rk.is_some() {
-                                        continue;
-                                    }
-                                    if planner.work.transitions - start >= max_transitions as u64 {
-                                        planner.work.budget_fallbacks += 1;
-                                        return Ok(None);
-                                    }
-                                    let conditions = conditions
-                                        .iter()
-                                        .cloned()
-                                        .map(|mut c| {
-                                            c.left = rebind(c.left, &l.rebind);
-                                            c.right = rebind(c.right, &r.rebind);
-                                            c
-                                        })
-                                        .collect();
-                                    let join = ComparisonJoin::new(
-                                        JoinType::Inner,
-                                        *l.boundary(0)?,
-                                        *r.boundary(1)?,
-                                        conditions,
-                                    );
-                                    if let Some(mut node) = planner.emit(
-                                        LogicalOperator::Join(Join::Comparison(join)),
-                                        vec![l.clone(), r.clone()],
-                                    )? {
-                                        let residuals = region
-                                            .residuals
-                                            .iter()
-                                            .filter(|(support, _)| {
-                                                if *support == 0 {
-                                                    mask == full
-                                                } else {
-                                                    *support & mask == *support
-                                                        && *support & left != *support
-                                                        && *support & right != *support
-                                                }
-                                            })
-                                            .map(|(_, e)| e.clone())
-                                            .collect::<Vec<_>>();
-                                        if !residuals.is_empty() {
-                                            let filter = paro_planner::operator::Filter::new(
-                                                *node.boundary(0)?,
-                                                residuals,
-                                            );
-                                            let Some(filtered) = planner.emit(
-                                                LogicalOperator::Filter(filter),
-                                                vec![node],
-                                            )?
-                                            else {
-                                                continue;
-                                            };
-                                            node = filtered;
-                                        }
-                                        retain(
-                                            &mut states,
-                                            StateKey {
-                                                relations: mask,
-                                                partial: lk.or(*rk),
-                                            },
-                                            node,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    left = (left - 1) & mask;
-                }
-            }
-            if allow_partial
-                && region.aggregate.is_some()
-                && mask != full
-                && region.arguments & mask == region.arguments
-            {
-                if let Some(raw) = states[mask as usize].get(&None).cloned() {
-                    if let Some(partial) = planner.partial(&region, mask, raw)? {
-                        states[mask as usize].insert(Some(mask), partial);
-                    }
-                }
-            }
-        }
+    let mut sets = crate::join_order::relation::JoinRelationSetManager::new();
+    let mut graph = crate::join_order::query_graph::QueryGraphEdges::new();
+    let mut make_set = |mask: Mask| {
+        sets.get_relation_from_vec(
+            (0..region.leaves.len())
+                .filter(|i| mask & (1 << i) != 0)
+                .collect(),
+        )
+    };
+    for (left, right) in region.condition_support.iter().copied() {
+        let left = make_set(left);
+        let right = make_set(right);
+        graph.create_edge(&left, right.clone(), None);
+        graph.create_edge(&right, left, None);
+    }
+    let mut enumeration = RegionEnumeration {
+        region,
+        planner,
+        states,
+        graph,
+        sets,
+        allow_partial,
+        error: None,
+    };
+    for i in 0..enumeration.region.leaves.len() {
+        enumeration.add_partial(1 << i)?;
+    }
+    let _outcome = enumerate(&mut enumeration);
+    let RegionEnumeration {
+        region,
+        mut planner,
+        states,
+        error,
+        ..
+    } = enumeration;
+    if let Some(error) = error {
+        return Err(error);
     }
     let mut best: Option<Arc<Node>> = None;
     for input in states[full as usize].values() {
@@ -876,6 +1249,8 @@ fn optimize_region(
     Ok(Some(Selection {
         plan: reconstruct(&best, &region, context)?,
         columns,
+        #[cfg(test)]
+        cost: best.response.cost,
     }))
 }
 
@@ -890,6 +1265,10 @@ mod tests {
     }
 
     fn exercise_domain(sql: &str, budget: usize, ordinary: bool) -> Work {
+        exercise_with_statistics(sql, budget, ordinary, false)
+    }
+
+    fn exercise_with_statistics(sql: &str, budget: usize, ordinary: bool, known: bool) -> Work {
         let session = crate::subquery::partition_aggregate_tests::setup_session();
         let mut planner = Planner::new(session.clone());
         planner
@@ -900,6 +1279,15 @@ mod tests {
         let query = optimizer.canonicalize_query(query).unwrap();
         let candidate = optimizer.settle_relational_baseline(query).unwrap();
         optimizer.ctx.column_stats = candidate.column_stats;
+        if known {
+            for statistic in optimizer.ctx.column_stats_mut().values_mut() {
+                let value = paro_storage::statistics::ColumnStatistics::with_estimated_distinct(
+                    statistic.statistics().clone(),
+                    Some(10),
+                );
+                *statistic = Arc::new(value);
+            }
+        }
         let grant = ResourceGrantClass {
             id: crate::physical::ResourceGrantClassId(0),
             hard_memory_bytes: 2 * 1024 * 1024 * 1024,
@@ -919,6 +1307,31 @@ mod tests {
                     budget,
                     &mut work,
                 )? {
+                    if known {
+                        let oracle_region = if ordinary { Region::recognize_joins(plan) } else { Region::recognize(plan) };
+                        if let Some(region) = oracle_region.filter(|r| r.leaves.len() <= 4) {
+                            let oracle = optimize_region_with(region, &optimizer.ctx, grant, &optimizer.calibration,
+                                budget, &mut Work::default(), |enumeration| {
+                                    let full = enumeration.states.len() as Mask - 1;
+                                    for size in 2..=enumeration.region.leaves.len() {
+                                        for mask in 1..=full {
+                                            if mask.count_ones() as usize != size { continue; }
+                                            let mut left = (mask - 1) & mask;
+                                            while left != 0 {
+                                                let right = mask ^ left;
+                                                if left < right { enumeration.price_pair(left, right).unwrap(); }
+                                                left = (left - 1) & mask;
+                                            }
+                                        }
+                                    }
+                                    crate::join_order::enumerator::EnumerationOutcome::Complete
+                                })?.expect("independent subset oracle has a plan");
+                            let actual = selected.cost.score.range.expected;
+                            let expected = oracle.cost.score.range.expected;
+                            assert!((actual - expected).abs() <= expected.abs().max(1.0) * 1e-10,
+                                "connected traversal {actual} != exhaustive subset oracle {expected}");
+                        }
+                    }
                     assert_eq!(
                         selected.plan.get_column_bindings(),
                         plan.get_column_bindings()
@@ -962,11 +1375,56 @@ mod tests {
     const QUERY: &str = "SELECT n_name, r_name, sum(s_acctbal) FROM supplier JOIN nation ON s_nationkey=n_nationkey JOIN region ON n_regionkey=r_regionkey GROUP BY n_name,r_name";
 
     #[test]
+    fn borrowed_cut_response_equals_full_settlement_and_discards_losing_outputs() {
+        // Complete every retained response with the independent full native
+        // settlement path. complete_cut asserts exact cost/implementation
+        // agreement, not just matching the final SQL layout.
+        let work = exercise_with_statistics(
+            "SELECT a.s_acctbal FROM supplier a JOIN supplier b ON a.s_nationkey=b.s_nationkey JOIN supplier c ON b.s_nationkey=c.s_nationkey JOIN supplier d ON c.s_nationkey=d.s_nationkey",
+            10000, true, true,
+        );
+        assert!(work.borrowed_cuts > 0);
+        assert!(work.completed_outputs < work.transitions);
+    }
+
+    #[test]
+    fn borrowed_join_pricing_retains_aggregate_grain_contract() {
+        let work = exercise_with_statistics(QUERY, 10000, false, true);
+        assert!(work.borrowed_cuts > 0);
+        assert!(work.partial_states > 0);
+        assert_eq!(work.budget_fallbacks, 0);
+    }
+
+    #[test]
     fn ordinary_regions_use_physical_response_and_preserve_output_bindings() {
         let work = exercise_domain("SELECT r_name,n_name,s_acctbal FROM supplier JOIN nation ON s_nationkey=n_nationkey JOIN region ON n_regionkey=r_regionkey WHERE s_acctbal > n_nationkey", 10000, true);
         assert!(work.regions > 0);
         assert!(work.transitions > 0);
         assert_eq!(work.partial_states, 0);
+        assert_eq!(work.budget_fallbacks, 0);
+    }
+
+    #[test]
+    fn mixed_equality_and_range_conditions_share_the_connected_traversal() {
+        let work = exercise_domain(
+            "SELECT a.s_acctbal FROM supplier a JOIN supplier b ON a.s_nationkey=b.s_nationkey AND a.s_acctbal < b.s_acctbal JOIN nation ON b.s_nationkey=n_nationkey",
+            10000, true,
+        );
+        assert!(work.regions > 0);
+        assert_eq!(work.budget_fallbacks, 0);
+    }
+
+    #[test]
+    fn ordinary_region_is_not_limited_to_eight_relations() {
+        let mut query = "SELECT a0.s_acctbal FROM supplier a0".to_string();
+        for i in 1..9 {
+            query.push_str(&format!(
+                " JOIN supplier a{i} ON a{}.s_nationkey=a{i}.s_nationkey",
+                i - 1
+            ));
+        }
+        let work = exercise_with_statistics(&query, 65536, true, true);
+        assert!(work.regions > 0);
         assert_eq!(work.budget_fallbacks, 0);
     }
 
