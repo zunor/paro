@@ -583,11 +583,26 @@ fn write_aggregate_results(
         return Ok(());
     }
 
-    // The generic sorted-window fallback deliberately favors one bound
-    // aggregate ABI over function-name-specific kernels. It recomputes each
-    // frame today; incremental state is a separate aggregate capability, not
-    // something the planner may infer from a display name.
     let frames = frame::WindowFrameIndex::build(chunks, sorted_keys, partition, expr)?;
+    if frames.is_append_only() {
+        return frame::visit_append_only_aggregate_frames(
+            chunks,
+            sorted_keys,
+            (partition.start..partition.end).map(|row| {
+                let range = frames.relative_range(row);
+                partition.start + range.start..partition.start + range.end
+            }),
+            expr,
+            output.allocator.clone(),
+            |row, value| {
+                output.set_window_value(expr_idx, partition.start + row, &value);
+                Ok(())
+            },
+        );
+    }
+    // Moving/shrinking frames require removal or a range-query aggregate
+    // capability. Recompute them with the same bound kernel, not guessed
+    // inverses or function-name-specific arithmetic.
     for absolute_idx in partition.start..partition.end {
         let relative = frames.relative_range(absolute_idx);
         let value = frame::aggregate_window_value(

@@ -101,3 +101,27 @@ Replacement collection uses new run IDs: pipeline Q66–Q99 and quality Q01–Q9
 with the same Rust binary and sampling settings. The pipeline coverage union
 has different harness identities and is a screening inventory, not a pooled
 confirmatory campaign. Capacity failure and interruption remain recorded.
+
+## Corpus-driven execution slice: append-only aggregate windows
+
+Both completed query inventories expose Q51 at roughly eight seconds. The
+sorted-window fallback recomputes every cumulative frame. The bound aggregate
+ABI already requires observational finalization; reuse one state when actual
+frame ranges have a fixed lower bound and monotonically increasing upper bound.
+Update only the newly included rows, retain exact FILTER/NULL/frame semantics,
+and destroy state on success and error. Moving/shrinking frames keep independent
+recomputation; this introduces no guessed inverse or function-name dispatch.
+
+Before new samples, retain binary 5d84650150b3bcd9069696ee66249e90e9b7ee693ab45292ee54ca3a0f7e1d9d
+at /private/tmp/paro-join-contract.Cayz7A/pre-window-parod. Test against independent
+frame reconstruction, repeated peers, empty/NULL prefixes, chunk boundaries,
+FILTER and failed output cleanup. Count update rows in a test kernel to prove
+linear input consumption, not just a wall-clock microbenchmark.
+
+After tests pass, collect Q51 with three fresh blocks and otherwise the pilot
+envelope, then rerun the pipeline Q01–Q99 coverage cohort with the registered
+two-block envelope. Preserve all failures. Compare exact results, typed receipts
+and selected physical structure; the shared host and sequential builds still
+make the latency contrast exploratory, not a certified speedup. Keep the same
+64MiB structured archive cap. No default-policy, result-oracle, aggregate
+algebra or compile-timer changes are part of this slice.
