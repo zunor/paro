@@ -8,12 +8,12 @@
 //!
 //! ## Algorithm
 //!
-//! 1. Extract the first vertex from the pattern chain → `GraphScan` (start node)
-//! 2. For each subsequent (edge, vertex) pair → `GraphExpand`
+//! 1. Scan the first canonical vertex binding.
+//! 2. Expand a connected edge frontier; close already-bound endpoints with
+//!    identity constraints while retaining edge multiplicity.
 //! 3. Wrap with `Projection` for the COLUMNS expressions
 
 use paro_parser::ast::EdgeDirection;
-use paro_planner::binder::bind::graph::BoundPatternElement;
 use paro_planner::logical::operator::{
     ExpandDirection, GraphExpand, GraphMatch, GraphScan, LogicalOperator, Projection,
 };
@@ -67,7 +67,6 @@ impl GraphMatchDecompose {
     ///           └─ GraphScan (a)
     /// ```
     fn decompose(&self, gm: GraphMatch) -> LogicalOperator {
-        let elements = gm.bound_pattern.elements;
         let columns = gm.columns;
         let table_index = gm.table_index;
         let relation_alias = gm.relation_alias;
@@ -75,17 +74,22 @@ impl GraphMatchDecompose {
         let schema_name = gm.graph_entry.info.schema.clone();
         let path_mode = gm.path_mode.clone();
 
-        // The pattern chain alternates: Vertex, Edge, Vertex, Edge, Vertex,...
-        // First vertex becomes the root `GraphScan`.
-        let mut iter = elements.into_iter().peekable();
-        let first = iter.next().expect("pattern chain must not be empty");
-        let first_vertex = match first {
-            BoundPatternElement::Vertex(v) => v,
-            BoundPatternElement::Edge(_) => {
-                panic!("pattern chain must start with a vertex")
-            }
-        };
-
+        // Bindings identify vertices, while edges identify topology. Path syntax
+        // order does not imply that the next expansion starts at the previous
+        // destination (branches and cycles share already-bound vertices).
+        let first_name = gm.bound_pattern.vertices[0].variable_name.clone();
+        let vertices = gm
+            .bound_pattern
+            .vertices
+            .into_iter()
+            .map(|vertex| (vertex.variable_name.clone(), vertex))
+            .collect::<HashMap<_, _>>();
+        let mut edges = gm.bound_pattern.edges;
+        let preserve_path_order = gm.has_path_functions
+            || path_mode.is_some()
+            || edges.iter().any(|edge| edge.quantifier.is_some());
+        let mut path_vertex = first_name.clone();
+        let first_vertex = &vertices[&first_name];
         let mut current =
             OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(Box::new(GraphScan::new(
                 first_vertex.vertex_table_info.clone(),
@@ -96,51 +100,57 @@ impl GraphMatchDecompose {
                 graph_name,
                 schema_name,
             ))));
-        let mut bound_vertices = HashMap::new();
-        bound_vertices.insert(first_vertex.variable_name.clone(), first_vertex.clone());
+        let mut bound_vertices = std::collections::HashSet::new();
+        bound_vertices.insert(first_vertex.variable_name.clone());
 
-        // Each remaining (edge, vertex) extends the chain with `GraphExpand`.
-        while let Some(edge_elem) = iter.next() {
-            let edge = match edge_elem {
-                BoundPatternElement::Edge(e) => e,
-                BoundPatternElement::Vertex(_) => {
-                    panic!("expected edge after vertex in pattern chain")
-                }
+        while !edges.is_empty() {
+            // A closing edge constrains both bound endpoints and must preserve
+            // each matching edge's multiplicity. Otherwise extend the frontier.
+            let index = if preserve_path_order {
+                0
+            } else {
+                edges
+                    .iter()
+                    .position(|edge| {
+                        bound_vertices.contains(&edge.source_variable)
+                            && bound_vertices.contains(&edge.destination_variable)
+                    })
+                    .or_else(|| {
+                        edges.iter().position(|edge| {
+                            bound_vertices.contains(&edge.source_variable)
+                                || bound_vertices.contains(&edge.destination_variable)
+                        })
+                    })
+                    .expect("binder verified connected graph pattern")
             };
-
-            let target_elem = iter
-                .next()
-                .expect("pattern chain must have a vertex after each edge");
-            let target_vertex = match target_elem {
-                BoundPatternElement::Vertex(v) => v,
-                BoundPatternElement::Edge(_) => {
-                    panic!("expected vertex after edge in pattern chain")
-                }
+            let edge = edges.remove(index);
+            let from_source = if preserve_path_order {
+                path_vertex == edge.source_variable
+            } else {
+                bound_vertices.contains(&edge.source_variable)
             };
-
+            let (source_name, target_name) = if from_source {
+                (&edge.source_variable, &edge.destination_variable)
+            } else {
+                (&edge.destination_variable, &edge.source_variable)
+            };
+            let source_vertex = &vertices[source_name];
+            let target_vertex = &vertices[target_name];
             let direction = match edge.direction {
-                EdgeDirection::Right => ExpandDirection::Forward,
-                EdgeDirection::Left => ExpandDirection::Backward,
-                EdgeDirection::Undirected | EdgeDirection::LeftRight => ExpandDirection::Both,
+                EdgeDirection::Undirected | EdgeDirection::LeftRight
+                    if source_vertex.vertex_table_info.label
+                        == target_vertex.vertex_table_info.label =>
+                {
+                    ExpandDirection::Both
+                }
+                _ if from_source => ExpandDirection::Forward,
+                _ => ExpandDirection::Backward,
             };
-
-            let source_vertex = bound_vertices
-                .get(&edge.source_variable)
-                .or_else(|| bound_vertices.get(&edge.destination_variable))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "one endpoint of edge '{}' must already be bound before expand (source='{}', destination='{}')",
-                        edge.variable_name, edge.source_variable, edge.destination_variable
-                    )
-                });
-            let source_table_index = source_vertex.table_index;
-
-            let is_terminal_expand = iter.peek().is_none();
             let mut expand = GraphExpand::new(
                 edge.edge_table_info.clone(),
                 direction,
                 source_vertex.vertex_table_info.label.clone(),
-                source_table_index,
+                source_vertex.table_index,
                 edge.table_index,
                 target_vertex.table_index,
                 table_index,
@@ -150,14 +160,36 @@ impl GraphMatchDecompose {
                 target_vertex.vertex_table_info.table_name.clone(),
                 current,
             );
+            expand.target_is_bound = bound_vertices.contains(target_name);
             expand.edge_filter = edge.filter.clone();
-            expand.target_filter = target_vertex.filter.clone();
+            expand.target_filter = if expand.target_is_bound {
+                None
+            } else {
+                target_vertex.filter.clone()
+            };
             expand.quantifier = edge.quantifier.clone();
             expand.path_mode = path_mode.clone();
-            expand.has_path_functions = gm.has_path_functions && is_terminal_expand;
-
+            expand.has_path_functions = gm.has_path_functions && edges.is_empty();
             current = OwnedLogicalPlan::synthetic(LogicalOperator::GraphExpand(Box::new(expand)));
-            bound_vertices.insert(target_vertex.variable_name.clone(), target_vertex);
+            bound_vertices.insert(target_name.clone());
+            path_vertex = target_name.clone();
+        }
+        if let Some(predicate) = gm.bound_pattern.filter {
+            let slot = match &mut current.operator {
+                LogicalOperator::GraphExpand(expand) => &mut expand.target_filter,
+                LogicalOperator::GraphScan(scan) => &mut scan.filter,
+                _ => unreachable!(),
+            };
+            *slot = Some(match slot.take() {
+                Some(previous) => paro_planner::expression::Expression::Conjunction(
+                    paro_planner::expression::ConjunctionExpression::new(
+                        paro_planner::expression::ConjunctionType::And,
+                        vec![previous, predicate],
+                    )
+                    .into(),
+                ),
+                None => predicate,
+            });
         }
 
         // Output columns are applied in a final `Projection`.
@@ -182,9 +214,7 @@ mod tests {
     use paro_catalog::entry::{EdgeTableInfo, VertexTableInfo};
     use paro_common::types::LogicalType;
     use paro_parser::ast::EdgeDirection;
-    use paro_planner::binder::bind::graph::{
-        BoundEdgeVariable, BoundPatternElement, BoundVertexVariable,
-    };
+    use paro_planner::binder::bind::graph::{BoundEdgeVariable, BoundVertexVariable};
     use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::{BoundGraphColumn, BoundGraphPattern};
     use paro_planner::expression::{ColumnRefExpression, Expression};
@@ -261,7 +291,8 @@ mod tests {
     }
 
     fn make_graph_match(
-        elements: Vec<BoundPatternElement>,
+        vertices: Vec<BoundVertexVariable>,
+        edges: Vec<BoundEdgeVariable>,
         columns: Vec<BoundGraphColumn>,
         table_index: usize,
     ) -> LogicalOperator {
@@ -277,7 +308,11 @@ mod tests {
                 "test".to_string(),
                 paro_catalog::entry::CatalogObjectId::from_raw(10_001),
             )),
-            BoundGraphPattern { elements },
+            BoundGraphPattern {
+                vertices,
+                edges,
+                filter: None,
+            },
             columns,
             table_index,
             "graph_table".to_string(),
@@ -288,18 +323,57 @@ mod tests {
     }
 
     #[test]
+    fn path_payload_keeps_syntax_order_and_reverse_closing_direction() {
+        // A later self-loop is already bound at the root. It must not jump in
+        // front of the path, and a reverse closing edge must start at b.
+        let mut plan = make_graph_match(
+            vec![
+                make_vertex("a", "Person", 10),
+                make_vertex("b", "Person", 12),
+            ],
+            vec![
+                make_edge("first", "Knows", 11, EdgeDirection::Right, "a", "b"),
+                make_edge("back", "Knows", 13, EdgeDirection::Left, "a", "b"),
+                make_edge("loop", "Knows", 14, EdgeDirection::Right, "a", "a"),
+            ],
+            vec![make_column(10, 0)],
+            100,
+        );
+        if let LogicalOperator::GraphMatch(gm) = &mut plan {
+            gm.has_path_functions = true;
+        }
+        let result = GraphMatchDecompose::new().optimize(plan);
+        let LogicalOperator::Projection(projection) = result else {
+            panic!("projection");
+        };
+        let LogicalOperator::GraphExpand(last) = &projection.child.operator else {
+            panic!("last expand");
+        };
+        assert_eq!(last.edge_table_index, 14);
+        assert!(last.has_path_functions);
+        let LogicalOperator::GraphExpand(back) = &last.child.operator else {
+            panic!("closing expand");
+        };
+        assert_eq!(back.edge_table_index, 13);
+        assert_eq!(back.source_table_index, 12);
+        assert_eq!(back.direction, ExpandDirection::Backward);
+        assert!(back.target_is_bound);
+        let LogicalOperator::GraphExpand(first) = &back.child.operator else {
+            panic!("first expand");
+        };
+        assert_eq!(first.edge_table_index, 11);
+    }
+
+    #[test]
     fn test_one_hop_decompose() {
         let v_a = make_vertex("a", "Person", 10);
         let e_k = make_edge("k", "Knows", 11, EdgeDirection::Right, "a", "b");
         let v_b = make_vertex("b", "Person", 12);
 
-        let elements = vec![
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k),
-            BoundPatternElement::Vertex(v_b),
-        ];
+        let vertices = vec![v_a, v_b];
+        let edges = vec![e_k];
         let columns = vec![make_column(10, 1), make_column(12, 1)];
-        let plan = make_graph_match(elements, columns, 100);
+        let plan = make_graph_match(vertices, edges, columns, 100);
 
         let mut decompose = GraphMatchDecompose::new();
         let result = decompose.optimize(plan);
@@ -316,12 +390,9 @@ mod tests {
         let v_a = make_vertex("a", "Person", 10);
         let e_k = make_edge("k", "Knows", 11, EdgeDirection::Right, "a", "b");
         let v_b = make_vertex("b", "Person", 12);
-        let elements = vec![
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k),
-            BoundPatternElement::Vertex(v_b),
-        ];
-        let plan = make_graph_match(elements, vec![make_column(99, 1)], 100);
+        let vertices = vec![v_a, v_b];
+        let edges = vec![e_k];
+        let plan = make_graph_match(vertices, edges, vec![make_column(99, 1)], 100);
 
         let mut decompose = GraphMatchDecompose::new();
         let result = OwnedLogicalPlan::synthetic(decompose.optimize(plan));
@@ -337,13 +408,10 @@ mod tests {
         let e_k = make_edge("k", "Knows", 11, EdgeDirection::Right, "a", "b");
         let v_b = make_vertex("b", "Person", 12);
 
-        let elements = vec![
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k),
-            BoundPatternElement::Vertex(v_b),
-        ];
+        let vertices = vec![v_a, v_b];
+        let edges = vec![e_k];
         let columns = vec![make_column(10, 1), make_column(12, 1)];
-        let plan = make_graph_match(elements, columns, 100);
+        let plan = make_graph_match(vertices, edges, columns, 100);
 
         let mut decompose = GraphMatchDecompose::new();
         let result = decompose.optimize(plan);
@@ -380,15 +448,10 @@ mod tests {
         let e_k2 = make_edge("k2", "Knows", 13, EdgeDirection::Right, "b", "c");
         let v_c = make_vertex("c", "Person", 14);
 
-        let elements = vec![
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k1),
-            BoundPatternElement::Vertex(v_b),
-            BoundPatternElement::Edge(e_k2),
-            BoundPatternElement::Vertex(v_c),
-        ];
+        let vertices = vec![v_a, v_b, v_c];
+        let edges = vec![e_k1, e_k2];
         let columns = vec![make_column(10, 1), make_column(12, 1), make_column(14, 1)];
-        let plan = make_graph_match(elements, columns, 100);
+        let plan = make_graph_match(vertices, edges, columns, 100);
 
         let mut decompose = GraphMatchDecompose::new();
         let result = decompose.optimize(plan);
@@ -425,16 +488,13 @@ mod tests {
     #[test]
     fn test_backward_edge_decompose() {
         let v_a = make_vertex("a", "Person", 10);
-        let e_k = make_edge("k", "Knows", 11, EdgeDirection::Left, "a", "b");
+        let e_k = make_edge("k", "Knows", 11, EdgeDirection::Left, "b", "a");
         let v_b = make_vertex("b", "Person", 12);
 
-        let elements = vec![
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k),
-            BoundPatternElement::Vertex(v_b),
-        ];
+        let vertices = vec![v_a, v_b];
+        let edges = vec![e_k];
         let columns = vec![make_column(10, 1)];
-        let plan = make_graph_match(elements, columns, 100);
+        let plan = make_graph_match(vertices, edges, columns, 100);
 
         let mut decompose = GraphMatchDecompose::new();
         let result = decompose.optimize(plan);
@@ -456,13 +516,10 @@ mod tests {
         let e_k = make_edge("k", "Knows", 11, EdgeDirection::Undirected, "a", "b");
         let v_b = make_vertex("b", "Person", 12);
 
-        let elements = vec![
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k),
-            BoundPatternElement::Vertex(v_b),
-        ];
+        let vertices = vec![v_a, v_b];
+        let edges = vec![e_k];
         let columns = vec![make_column(10, 1)];
-        let plan = make_graph_match(elements, columns, 100);
+        let plan = make_graph_match(vertices, edges, columns, 100);
 
         let mut decompose = GraphMatchDecompose::new();
         let result = decompose.optimize(plan);
@@ -483,13 +540,10 @@ mod tests {
         let e_k = make_edge("k", "Knows", 11, EdgeDirection::Right, "a", "b");
         let v_b = make_vertex("b", "Person", 12);
 
-        let elements = vec![
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k),
-            BoundPatternElement::Vertex(v_b),
-        ];
+        let vertices = vec![v_a, v_b];
+        let edges = vec![e_k];
         let columns = vec![make_column(10, 1)];
-        let graph_match = make_graph_match(elements, columns, 100);
+        let graph_match = make_graph_match(vertices, edges, columns, 100);
 
         let plan = LogicalOperator::Filter(paro_planner::logical::operator::Filter::new(
             OwnedLogicalPlan::synthetic(graph_match),
@@ -509,20 +563,15 @@ mod tests {
     #[test]
     fn test_middle_start_expand_uses_bound_source_vertex() {
         let v_b = make_vertex("b", "Person", 12);
-        let e_k1 = make_edge("k1", "Knows", 11, EdgeDirection::Left, "b", "a");
+        let e_k1 = make_edge("k1", "Knows", 11, EdgeDirection::Left, "a", "b");
         let v_a = make_vertex("a", "Person", 10);
         let e_k2 = make_edge("k2", "Knows", 13, EdgeDirection::Right, "b", "c");
         let v_c = make_vertex("c", "Person", 14);
 
-        let elements = vec![
-            BoundPatternElement::Vertex(v_b),
-            BoundPatternElement::Edge(e_k1),
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k2),
-            BoundPatternElement::Vertex(v_c),
-        ];
+        let vertices = vec![v_b, v_a, v_c];
+        let edges = vec![e_k1, e_k2];
         let columns = vec![make_column(10, 1), make_column(12, 1), make_column(14, 1)];
-        let plan = make_graph_match(elements, columns, 100);
+        let plan = make_graph_match(vertices, edges, columns, 100);
 
         let mut decompose = GraphMatchDecompose::new();
         let result = decompose.optimize(plan);

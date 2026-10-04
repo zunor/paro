@@ -950,8 +950,17 @@ impl StatisticsGathering {
                 )
             })
             .unwrap_or(4.0);
-        let expected =
-            ((child.expected.max(1) as f64) * factor.max(0.01) * hop_multiplier).ceil() as u64;
+        let factor = if expand.target_is_bound {
+            let target_count = stats
+                .as_ref()
+                .and_then(|stats| stats.vertex_count(&expand.target_label))
+                .unwrap_or(1)
+                .max(1);
+            factor / target_count as f64
+        } else {
+            factor
+        };
+        let expected = ((child.expected.max(1) as f64) * factor * hop_multiplier).ceil() as u64;
         CardinalityEstimate {
             min: expected.saturating_div(2).max(1),
             expected: expected.max(1),

@@ -33,6 +33,7 @@ pub struct GraphExpandSpec {
     pub target_label: String,
     pub source_local_col_idx: usize,
     pub source_rowid_col_idx: usize,
+    pub target_local_col_idx: Option<usize>,
     pub min_hops: u64,
     pub max_hops: u64,
     pub source_table_oid: u64,

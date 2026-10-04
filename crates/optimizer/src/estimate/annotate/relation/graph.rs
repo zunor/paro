@@ -31,30 +31,16 @@ pub(super) fn estimate_expand_factor(
 ) -> f64 {
     use paro_planner::logical::operator::ExpandDirection;
 
-    match direction {
-        ExpandDirection::Forward => {
-            estimate_pattern_factor(stats, source_label, edge_label, target_label)
-        }
-        ExpandDirection::Backward => {
-            estimate_pattern_factor(stats, target_label, edge_label, source_label)
-        }
-        ExpandDirection::Both => {
-            estimate_pattern_factor(stats, source_label, edge_label, target_label)
-                + estimate_pattern_factor(stats, target_label, edge_label, source_label)
-        }
-    }
-}
-
-pub(super) fn estimate_pattern_factor(
-    stats: &dyn GraphStatsProvider,
-    source_label: &str,
-    edge_label: &str,
-    target_label: &str,
-) -> f64 {
     let source_count = stats.vertex_count(source_label).unwrap_or(1).max(1) as f64;
-    stats
-        .pattern_step_count(source_label, edge_label, target_label)
-        .map(|count| (count as f64 / source_count).max(1.0 / source_count))
+    let forward = stats.pattern_step_count(source_label, edge_label, target_label);
+    let backward = stats.pattern_step_count(target_label, edge_label, source_label);
+    let count = match direction {
+        ExpandDirection::Forward => forward,
+        ExpandDirection::Backward => backward,
+        ExpandDirection::Both => forward.zip(backward).map(|(a, b)| a.saturating_add(b)),
+    };
+    count
+        .map(|count| count as f64 / source_count)
         .or_else(|| stats.avg_degree(source_label))
         .unwrap_or(1.0)
 }
@@ -68,5 +54,28 @@ pub(super) fn graph_name_for_plan(mut plan: &OwnedLogicalPlan) -> Option<&str> {
             LogicalOperator::EmptyResult(empty) => empty.child.as_ref(),
             _ => return None,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_planner::logical::operator::ExpandDirection;
+    use paro_storage::index::graph::GraphStatistics;
+
+    #[test]
+    fn backward_degree_uses_the_traversal_source_population() {
+        let stats = GraphStatistics::default()
+            .with_vertex_count("person", 100)
+            .with_vertex_count("city", 10)
+            .with_pattern_step_count("person", "lives", "city", 100);
+        assert_eq!(
+            estimate_expand_factor(&stats, "person", "lives", "city", ExpandDirection::Forward),
+            1.0
+        );
+        assert_eq!(
+            estimate_expand_factor(&stats, "city", "lives", "person", ExpandDirection::Backward),
+            10.0
+        );
     }
 }

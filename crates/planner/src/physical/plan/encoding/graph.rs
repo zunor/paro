@@ -105,6 +105,7 @@ pub(super) fn write(b: &mut StableFingerprintBuilder, kind: &PhysicalNodeKind) -
             ] {
                 b.write_u64(value);
             }
+            write_hashed(b, b"target-local-column", &s.target_local_col_idx);
             expressions(b, s.edge_filter.iter());
             expressions(b, s.target_filter.iter());
         }

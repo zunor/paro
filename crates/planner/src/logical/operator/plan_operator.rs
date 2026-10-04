@@ -401,7 +401,11 @@ impl LogicalOperator {
             LogicalOperator::GraphMatch(gm) => vec![gm.table_index],
             LogicalOperator::GraphScan(gs) => vec![gs.table_index],
             LogicalOperator::GraphExpand(ge) => {
-                vec![ge.edge_table_index, ge.target_table_index]
+                if ge.target_is_bound {
+                    vec![ge.edge_table_index]
+                } else {
+                    vec![ge.edge_table_index, ge.target_table_index]
+                }
             }
             // Operators that don't introduce new table indices
             LogicalOperator::Filter(_)

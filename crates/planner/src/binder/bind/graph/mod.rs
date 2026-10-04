@@ -3,4 +3,4 @@
 
 pub mod context;
 
-pub use context::{BoundEdgeVariable, BoundPatternElement, BoundVertexVariable, GraphBindContext};
+pub use context::{BoundEdgeVariable, BoundVertexVariable, GraphBindContext};

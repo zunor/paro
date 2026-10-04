@@ -11,7 +11,7 @@ selector, rule-disable switch or implicit fallback to another planner.
 paro-planner: bind SQL -> typed logical plan
     rewrite::program::Normalization -> committed semantic rewrites
     estimate::annotate             -> column and relation evidence
-    region::plan                   -> bounded join / aggregate-grain choices
+    region::plan                   -> bounded join / aggregate-grain / graph-frontier choices
     physical::choose               -> implementation and resource choices
     physical::lower                -> immutable executable contracts
 paro-planner::physical::CompiledPhysicalPlan
@@ -159,3 +159,24 @@ Architectural decisions and remaining problems live in
 [open issues](../../docs/optimizer/open-issues.md). Contributor workflow belongs
 in [AGENTS.md](../../AGENTS.md) and the versioned `paro-optimizer`,
 `paro-benchmark` and `paro-evidence` skills, not in this architecture document.
+
+## Fixed-edge graph regions
+
+Binding owns canonical vertex identities and directed edge endpoints, including
+shared vertices across comma-separated paths. Decomposition emits a connected
+frontier and constrains closing edges against the already-bound target. Repeated
+edges retain their bag multiplicity; vertex identity is not a DISTINCT operation.
+
+`region::graph` orders fixed-edge frontiers under a graph projection. Quantified
+or path-valued patterns and fallible/volatile predicates retain their canonical
+order. Graph statistics provide populations and edge counts. The search keeps
+compact edge-subset states, uses the region transition budget, and retains a
+legal greedy order when exact search is bounded out. Its work is included in
+RegionPlanning diagnostics. `cost::graph` ranks adjacency visits and emitted
+carrier slots in relative work units; these are not calibrated milliseconds.
+
+Execution shares immutable dictionary views of input carrier columns instead of
+copying every value for every match. The canonical vector API owns selection
+validation, composition and input lifetime; expand still owns adjacency and
+edge/target identities. Graph index persistence uses buffered I/O without
+changing its on-disk format or publication order.
