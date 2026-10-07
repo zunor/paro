@@ -490,6 +490,7 @@ pub fn get_first_function() -> AggregateFunctionSet {
     );
 
     set.with_empty_input(AggregateEmptyInput::Null)
+        .with_preserves_input_domain()
 }
 
 /// Get the LAST aggregate function set.
@@ -540,6 +541,7 @@ pub fn get_last_function() -> AggregateFunctionSet {
     ));
 
     set.with_empty_input(AggregateEmptyInput::Null)
+        .with_preserves_input_domain()
 }
 
 fn alias_function_set(mut set: AggregateFunctionSet, alias_name: &str) -> AggregateFunctionSet {
@@ -610,6 +612,7 @@ pub fn get_any_value_function() -> AggregateFunctionSet {
     ));
 
     set.with_empty_input(AggregateEmptyInput::Null)
+        .with_preserves_input_domain()
 }
 
 /// Get the ARBITRARY aggregate function set.
@@ -660,6 +663,7 @@ pub fn get_arbitrary_function() -> AggregateFunctionSet {
     ));
 
     set.with_empty_input(AggregateEmptyInput::Null)
+        .with_preserves_input_domain()
 }
 
 #[cfg(test)]
@@ -702,6 +706,16 @@ mod tests {
         let (last_value_func, _) = last_value_set.bind(&[LogicalType::Integer]).unwrap();
         assert_eq!(first_value_func.name, "first_value");
         assert_eq!(last_value_func.name, "last_value");
+        assert!(first_value_func.preserves_input_domain());
+        assert!(last_value_func.preserves_input_domain());
+
+        let (decimal_alias, _) = first_value_set
+            .bind(&[LogicalType::Decimal {
+                precision: 20,
+                scale: 2,
+            }])
+            .expect("bind dynamic decimal alias");
+        assert!(decimal_alias.preserves_input_domain());
     }
 
     #[test]

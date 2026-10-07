@@ -58,6 +58,7 @@ pub(crate) use segment_indexes::RuntimeScalarIndex;
 pub use segment::{Segment, SegmentMeta, SegmentOptions, SegmentSharedPtr};
 pub use segment_format::{ColumnMeta, SegmentFooter};
 pub use segment_iterator::{SegmentBatch, SegmentIterator};
+pub use segment_predicate::leading_stage_columns;
 pub use segment_writer::{
     ColumnData, HnswColumnBuildOptions, SegmentInlineIndexKind, SegmentInlineIndexPage,
     SegmentWriter, SegmentWriterBuilder, SegmentWriterOptions,

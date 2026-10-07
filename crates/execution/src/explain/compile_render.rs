@@ -1,0 +1,728 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+//! Render only the sealed target observation; never invoke planning or admission.
+use paro_context::compile_diagnostics::{
+    CompileRecord, ExecutionReceipt, SealedCompileCapture, ENCODED_LIMIT,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write};
+
+struct LimitedWriter(Vec<u8>);
+impl Write for LimitedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > ENCODED_LIMIT.saturating_sub(self.0.len()) {
+            return Err(io::Error::other("compile document capacity"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_json_bounded<T: serde::Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let mut writer = LimitedWriter(Vec::new());
+    writer
+        .0
+        .try_reserve_exact(ENCODED_LIMIT)
+        .map_err(|_| io::Error::other("compile document capacity"))?;
+    serde_json::to_writer(&mut writer, value).map_err(io::Error::other)?;
+    Ok(writer.0)
+}
+
+/// Count escaped wire bytes without materializing another diagnostic buffer.
+/// Keep a source-ordered prefix: dropping arbitrary events can strand child
+/// references whose parent event was discarded.
+fn fit_detail(record: &mut CompileRecord) -> io::Result<()> {
+    struct Counter(usize);
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| io::Error::other("compile size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn size(value: &impl serde::Serialize) -> io::Result<usize> {
+        let mut counter = Counter(0);
+        serde_json::to_writer(&mut counter, value).map_err(io::Error::other)?;
+        Ok(counter.0)
+    }
+    let mut events = std::mem::take(&mut record.detail);
+    let prior_omitted = record.omitted_encoding_detail;
+    // Reserve enough digits for the worst-case omission count before sizing
+    // the mandatory summary, receipts and terminal state.
+    record.omitted_encoding_detail = prior_omitted.saturating_add(events.len() as u64);
+    let mut available = ENCODED_LIMIT
+        .checked_sub(size(record)?)
+        .ok_or_else(|| io::Error::other("compile summary capacity"))?;
+    let mut retained = 0;
+    for event in &events {
+        let bytes = size(event)?.saturating_add(usize::from(retained != 0));
+        let Some(remainder) = available.checked_sub(bytes) else {
+            break;
+        };
+        available = remainder;
+        retained += 1;
+    }
+    record.omitted_encoding_detail = prior_omitted.saturating_add((events.len() - retained) as u64);
+    events.truncate(retained);
+    record.detail = events;
+    Ok(())
+}
+
+pub fn render(capture: &SealedCompileCapture, json: bool) -> String {
+    render_with_execution(capture, json, None)
+}
+
+/// Render a sealed compile record and, when ANALYZE actually ran the same
+/// compiled statement, append the immutable execution receipt.  Admission is
+/// never inferred from the artifact fields in the compile record.
+pub fn render_with_execution(
+    capture: &SealedCompileCapture,
+    json: bool,
+    execution: Option<ExecutionReceipt>,
+) -> String {
+    render_with_execution_level(capture, json, execution, false)
+}
+
+pub fn render_with_execution_level(
+    capture: &SealedCompileCapture,
+    json: bool,
+    execution: Option<ExecutionReceipt>,
+    include_detail: bool,
+) -> String {
+    let mut writer = LimitedWriter(Vec::new());
+    if writer.0.try_reserve_exact(ENCODED_LIMIT).is_err() {
+        return unavailable(json);
+    }
+    let result = capture.read(|record| {
+        let mut record: CompileRecord = record.clone();
+        record.execution_receipt = execution;
+        if json {
+            // Detail is optional; the summary, terminal state, and receipt
+            // are not.  Trim only optional events when the sealed document is
+            // larger than the wire lease, instead of replacing an executed
+            // ANALYZE result with an Unavailable/NotExecuted document.
+            if !record.detail.is_empty() {
+                fit_detail(&mut record)?;
+            }
+            writer.write_all(&encode_json_bounded(&record)?)
+        } else {
+            writeln!(writer, "EXPLAIN (COMPILE) / schema {} / ForcedCompile", record.schema_version)?;
+            writeln!(writer, "phase             nanoseconds (Observed / Uncovered)")?;
+            writeln!(writer, "bind              {:?}\noptimizer         {:?}\nverify            {:?}\nfinish            {:?}\ncompiler wall     {:?}", record.bind_ns, record.optimizer_ns, record.verify_ns, record.finish_ns, record.compiler_ns)?;
+            writeln!(writer, "compiler other    {:?}\nparse             {:?}", record.compiler_other_ns, record.parse)?;
+            writeln!(writer, "artifact={:?} safety={:?} planning={:?} bounded={:?}", record.artifact, record.safety_verified, record.planning_status, record.budget_limited)?;
+            writeln!(writer, "input={:?} output={:?} artifact_identity={:?} settings={:?} memory_bytes={:?} parallel_tasks={:?}", record.input_fingerprint, record.output_identity, record.artifact_identity, record.planning_settings, record.available_memory_bytes, record.available_parallel_tasks)?;
+            writeln!(writer, "expected_class={:?} variants={:?} selected_fingerprint={:?}", record.expected_class, record.variant_count, record.selected_fingerprint)?;
+            for v in &record.variants { writeln!(writer, "variant {} fingerprint={:?} admissible_classes={}", v.ordinal,v.physical_fingerprint,v.admissible_classes)?; }
+            writeln!(writer, "admission={:?} execution={:?}", record.admission, record.execution)?;
+            writeln!(writer, "omitted_variants={} omitted_source_detail={} omitted_capture_detail={} omitted_encoding_detail={} retained_limit={} encoded_limit={} response_terminal={:?} execution_receipt={:?}",record.omitted_variants,record.omitted_source_detail,record.omitted_capture_detail,record.omitted_encoding_detail,record.retained_limit,record.encoded_limit,record.response_terminal,record.execution_receipt)?;
+            if include_detail {
+                for event in &record.detail {
+                    writeln!(writer, "detail {}", serde_json::to_string(event).map_err(io::Error::other)?)?;
+                }
+            }
+            Ok(())
+        }
+    });
+    if result.is_err() {
+        return unavailable(json);
+    }
+    String::from_utf8(writer.0).expect("UTF-8 renderer")
+}
+
+pub fn unavailable(json: bool) -> String {
+    use paro_context::compile_diagnostics::{CompileDocument, UnavailableReason};
+    if json {
+        serde_json::to_string(&CompileDocument::unavailable(UnavailableReason::Capacity))
+            .expect("fixed-size unavailable document")
+    } else {
+        "EXPLAIN (COMPILE): DiagnosticUnavailable(Capacity)".into()
+    }
+}
+
+/// Current schema only. Size is checked before deserializing untrusted input.
+pub fn validate_json(
+    bytes: &[u8],
+) -> Result<paro_context::compile_diagnostics::CompileDocument, String> {
+    use paro_context::compile_diagnostics::*;
+    if bytes.len() > ENCODED_LIMIT {
+        return Err("encoded capacity exceeded".into());
+    }
+    let document: CompileDocument = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let r = match &document {
+        CompileDocument::Summary(r) => r,
+        CompileDocument::Unavailable(r) => {
+            if r.schema_version != SCHEMA_VERSION
+                || r.target_compile != CompileOutcome::Success
+                || r.target_execution != Observation::NotExecuted
+            {
+                return Err("inconsistent unavailable document".into());
+            }
+            return Ok(document);
+        }
+    };
+    if r.schema_version != SCHEMA_VERSION
+        || r.encoded_limit != ENCODED_LIMIT
+        || r.retained_limit != RETAINED_LIMIT
+        || r.process_limit != PROCESS_LIMIT
+        || r.process_reservation != 2 << 20
+        || r.search_counters.len() > MAX_SEARCH_COUNTERS
+        || r.variants.len() > MAX_VARIANTS
+        || r.detail_limit != MAX_DETAIL_EVENTS
+        || r.detail.len() > MAX_DETAIL_EVENTS
+        || (r.capture_level == CaptureLevel::Summary
+            && (r.omitted_source_detail != 0
+                || r.omitted_capture_detail != 0
+                || r.omitted_encoding_detail != 0
+                || !r.detail.is_empty()))
+    {
+        return Err("schema/capacity profile mismatch".into());
+    }
+    let mut search_counter_names = BTreeSet::new();
+    for counter in &r.search_counters {
+        if counter.name.is_empty() || !search_counter_names.insert(counter.name.as_str()) {
+            return Err("search counter names are not unique".into());
+        }
+    }
+    let mut source_sequences = BTreeMap::<&'static str, u64>::new();
+    for event in &r.detail {
+        if let Some(previous) =
+            source_sequences.insert(event.stream_name(), event.source_sequence())
+        {
+            if event.source_sequence() <= previous {
+                return Err("detail source sequence is unordered".into());
+            }
+        }
+    }
+    if let Observation::Observed(identity) = r.artifact_identity {
+        if identity.schema_version != IDENTITY_SCHEMA_VERSION {
+            return Err("compile artifact uses an unsupported identity schema".into());
+        }
+    }
+    if let Some(execution) = &r.execution_receipt {
+        use paro_context::compile_diagnostics::{LoweringStatus, ResourceReservationStatus};
+        if execution.schema_version != paro_context::compile_diagnostics::RECEIPT_SCHEMA_VERSION
+            || r.artifact_identity != Observation::Observed(execution.artifact_identity)
+        {
+            return Err("execution receipt is not bound to the sealed compile artifact".into());
+        }
+        if execution.artifact_identity.schema_version
+            != paro_context::compile_diagnostics::IDENTITY_SCHEMA_VERSION
+        {
+            return Err("execution receipt uses an unsupported artifact identity schema".into());
+        }
+        if execution.admission == AdmissionResult::Selected
+            && (execution.actual_class.is_none()
+                || execution.actual_fingerprint.is_none()
+                || execution.resources.is_none()
+                || execution.selection_identity.is_none())
+        {
+            return Err("selected execution receipt lacks actual admission".into());
+        }
+        if let (Some(actual_class), Some(resources)) = (execution.actual_class, execution.resources)
+        {
+            if resources.class != actual_class
+                || resources.max_parallel_tasks == 0
+                || resources.memory_ceiling_bytes < resources.minimum_memory_bytes
+                || resources.working_set_memory_bytes < resources.minimum_memory_bytes
+            {
+                return Err("execution resource contract is inconsistent".into());
+            }
+            if let paro_context::compile_diagnostics::MemoryCompletionReceipt::RuntimeCappedKnown {
+                uncapped_memory_bytes,
+            } = resources.memory_completion
+            {
+                if uncapped_memory_bytes < resources.working_set_memory_bytes {
+                    return Err("known uncapped memory is below the working set".into());
+                }
+            }
+        }
+        if execution.admission == AdmissionResult::Selected
+            && matches!(
+                execution.terminal,
+                ExecutionTerminal::Running
+                    | ExecutionTerminal::Completed
+                    | ExecutionTerminal::Dropped
+            )
+            && execution.image != ExecutionImageStatus::Ready
+        {
+            return Err("selected execution terminal lacks an executable image".into());
+        }
+        if execution.admission != AdmissionResult::Selected
+            && (execution.actual_class.is_some()
+                || execution.actual_fingerprint.is_some()
+                || execution.selection_identity.is_some()
+                || execution.resources.is_some()
+                || execution.reservation != ResourceReservationStatus::NotRequired
+                || execution.lowering != LoweringStatus::NotStarted
+                || execution.lowering_error.is_some()
+                || execution.image != ExecutionImageStatus::NotReady)
+        {
+            return Err("non-selected receipt claims an actual resource or image".into());
+        }
+        if let Some(selection) = execution.selection_identity {
+            if selection.artifact != execution.artifact_identity.artifact
+                || selection.grant_class != execution.actual_class
+                || selection.physical_fingerprint != execution.actual_fingerprint
+            {
+                return Err("selection identity does not match actual admission".into());
+            }
+        }
+        if execution.admission != AdmissionResult::Selected
+            && execution.terminal != ExecutionTerminal::NotExecuted
+        {
+            return Err("non-selected receipt claims execution".into());
+        }
+        if execution.image == ExecutionImageStatus::Ready
+            && execution.lowering != LoweringStatus::Ready
+        {
+            return Err("ready image has no successful lowering".into());
+        }
+        if execution.lowering == LoweringStatus::Failed && execution.lowering_error.is_none() {
+            return Err("failed lowering lacks its original error".into());
+        }
+        if execution.reservation == ResourceReservationStatus::Failed
+            && (execution.terminal != ExecutionTerminal::Failed
+                || execution.lowering != LoweringStatus::NotStarted
+                || execution.image != ExecutionImageStatus::NotReady
+                || execution.terminal_error.is_none())
+        {
+            return Err("failed reservation has an inconsistent lifecycle".into());
+        }
+        if execution.reservation == ResourceReservationStatus::Failed
+            && execution.lowering_error.is_some()
+        {
+            return Err("failed reservation must not claim lowering".into());
+        }
+        if execution.lowering == LoweringStatus::Failed
+            && (execution.terminal != ExecutionTerminal::Failed
+                || execution.image != ExecutionImageStatus::NotReady
+                || execution.terminal_error.is_none())
+        {
+            return Err("failed lowering has an inconsistent lifecycle".into());
+        }
+        if execution.lowering == LoweringStatus::NotStarted
+            && execution.image != ExecutionImageStatus::NotReady
+        {
+            return Err("image is ready before lowering".into());
+        }
+        if matches!(
+            execution.terminal,
+            ExecutionTerminal::Failed | ExecutionTerminal::Cancelled
+        ) && execution.terminal_error.is_none()
+        {
+            return Err("failed execution lacks its original error".into());
+        }
+        if execution.terminal == ExecutionTerminal::Completed
+            && (execution.reservation != ResourceReservationStatus::Committed
+                || execution.lowering != LoweringStatus::Ready
+                || execution.image != ExecutionImageStatus::Ready)
+        {
+            return Err("completed execution has incomplete lifecycle phases".into());
+        }
+    }
+    if r.variants
+        .windows(2)
+        .any(|pair| pair[0].ordinal >= pair[1].ordinal)
+    {
+        return Err("duplicate or unordered bounded identity".into());
+    }
+    if let Observation::Observed(count) = r.variant_count {
+        if (r.variants.len() as u64).checked_add(r.omitted_variants) != Some(count as u64)
+            || r.variants.iter().any(|v| usize::from(v.ordinal) >= count)
+        {
+            return Err("artifact coverage does not close".into());
+        }
+    }
+    if let Observation::Observed(fingerprint) = r.selected_fingerprint {
+        let Observation::Observed(class) = r.expected_class else {
+            return Err("selected artifact has no expected class".into());
+        };
+        let bit = 1u64
+            .checked_shl(class)
+            .ok_or("unrepresented expected class")?;
+        if !r
+            .variants
+            .iter()
+            .any(|v| v.physical_fingerprint == fingerprint && v.admissible_classes & bit != 0)
+        {
+            return Err("selected artifact is not represented in its artifact".into());
+        }
+    }
+    if r.admission != Observation::NotExecuted || r.execution != Observation::NotExecuted {
+        return Err("Summary cannot claim target execution".into());
+    }
+    match r.planning_status {
+        Observation::Observed(PlanningStatus::Planned)
+            if r.budget_limited != Observation::Observed(false) =>
+        {
+            return Err("planned status contradicts regional fallback".into())
+        }
+        Observation::Observed(PlanningStatus::PlannedWithFallback)
+            if r.budget_limited != Observation::Observed(true) =>
+        {
+            return Err("bounded status lacks a regional fallback".into())
+        }
+        _ => {}
+    }
+    if r.outcome == CompileOutcome::Success
+        && (r.artifact != ArtifactStatus::CompiledArtifactReady
+            || r.safety_verified != Observation::Observed(true)
+            || !matches!(r.artifact_identity, Observation::Observed(_)))
+    {
+        return Err("successful compiler record lacks a verified artifact".into());
+    }
+    if let (
+        Observation::Observed(total),
+        Observation::Observed(bind),
+        Observation::Observed(opt),
+        Observation::Observed(verify),
+        Observation::Observed(finish),
+        Observation::Observed(other),
+    ) = (
+        r.compiler_ns,
+        r.bind_ns,
+        r.optimizer_ns,
+        r.verify_ns,
+        r.finish_ns,
+        r.compiler_other_ns,
+    ) {
+        if [bind, opt, verify, finish, other]
+            .into_iter()
+            .try_fold(0u64, |a, b| a.checked_add(b))
+            != Some(total)
+        {
+            return Err("compiler phase accounting does not close".into());
+        }
+    } else if r.outcome == CompileOutcome::Success {
+        return Err("successful compiler record lacks phase accounting".into());
+    }
+    if let Observation::Observed(work) = r.optimizer_work {
+        if !work.is_closed()
+            || matches!(r.optimizer_ns, Observation::Observed(ns) if ns != work.total_ns)
+        {
+            return Err("optimizer work accounting does not close".into());
+        }
+    }
+    Ok(document)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_context::compile_diagnostics::CompileCapture;
+    #[test]
+    fn wire_capacity_retains_a_valid_detail_prefix() {
+        use paro_context::compile_diagnostics::*;
+        let capture = CompileCapture::try_start_with_level(CaptureLevel::Detail).unwrap();
+        for source_sequence in 0..MAX_DETAIL_EVENTS as u64 {
+            capture.detail(DetailEvent::Stage {
+                source_sequence,
+                stage: work::WorkKind::RegionPlanning,
+                elapsed_ns: source_sequence,
+                items: 1,
+                fallbacks: 0,
+            });
+        }
+        let sealed = capture.seal();
+        let retained = sealed.read(|record| record.detail.len());
+        let json = render(&sealed, true);
+        let CompileDocument::Summary(record) = validate_json(json.as_bytes()).unwrap() else {
+            panic!("capacity must preserve the summary");
+        };
+        assert!(!record.detail.is_empty());
+        assert!(record.detail.len() < retained);
+        assert_eq!(
+            record.detail.len() + record.omitted_encoding_detail as usize,
+            retained
+        );
+        assert!(json.len() <= ENCODED_LIMIT);
+        assert_eq!(sealed.read(|record| record.detail.len()), retained);
+    }
+    #[test]
+    fn schema_and_capacity_rejects_fabricated_execution() {
+        let capture = CompileCapture::try_start().unwrap();
+        let json = render(&capture.seal(), true);
+        // The encoded document owns its bytes. Keep at most one capture per
+        // rendering test so parallel fixtures respect the real process quota.
+        drop(capture);
+        validate_json(json.as_bytes()).unwrap();
+        assert!(validate_json(json.replace("NotExecuted", "NotApplicable").as_bytes()).is_err());
+        assert!(validate_json(
+            json.replace("\"schema_version\":4", "\"schema_version\":2")
+                .as_bytes()
+        )
+        .is_err());
+        assert!(validate_json(&vec![b' '; ENCODED_LIMIT + 1]).is_err());
+        assert!(json.len() < 4096);
+        let mut writer = LimitedWriter(Vec::new());
+        writer.write_all(&vec![b'x'; ENCODED_LIMIT]).unwrap();
+        assert!(writer.write_all(b"x").is_err());
+        assert_eq!(writer.0.len(), ENCODED_LIMIT);
+        let invalid = CompileCapture::try_start().unwrap();
+        invalid.update(|r| {
+            r.variant_count = paro_context::compile_diagnostics::Observation::Observed(1)
+        });
+        assert!(validate_json(render(&invalid.seal(), true).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn detail_rejects_duplicate_producer_sequences() {
+        use paro_context::compile_diagnostics::*;
+        let capture = CompileCapture::try_start_with_level(CaptureLevel::Detail).unwrap();
+        capture.detail(DetailEvent::Stage {
+            source_sequence: 1,
+            stage: work::WorkKind::Normalization,
+            elapsed_ns: 10,
+            items: 1,
+            fallbacks: 0,
+        });
+        let json = render(&capture.seal(), true);
+        validate_json(json.as_bytes()).unwrap();
+        let mut invalid: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let detail = invalid["detail"].as_array_mut().unwrap();
+        detail.push(detail[0].clone());
+        assert!(validate_json(serde_json::to_string(&invalid).unwrap().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn observation_wire_fixture_matches_rust_producer() {
+        use paro_context::compile_diagnostics::{Observation, UncoveredReason};
+        let values: [Observation<u64>; 7] = [
+            Observation::NotExecuted,
+            Observation::NotApplicable,
+            Observation::Observed(0),
+            Observation::Observed(u64::MAX),
+            Observation::Uncovered(UncoveredReason::NotInstrumented),
+            Observation::Uncovered(UncoveredReason::FutureBoundary),
+            Observation::Uncovered(UncoveredReason::Capacity),
+        ];
+        assert_eq!(
+            serde_json::to_string(&values).unwrap(),
+            r#"["NotExecuted","NotApplicable",{"Observed":0},{"Observed":18446744073709551615},{"Uncovered":"NotInstrumented"},{"Uncovered":"FutureBoundary"},{"Uncovered":"Capacity"}]"#
+        );
+    }
+
+    #[test]
+    fn unavailable_and_terminal_consistency_share_the_reader() {
+        use paro_context::compile_diagnostics::*;
+        assert!(matches!(
+            validate_json(unavailable(true).as_bytes()).unwrap(),
+            CompileDocument::Unavailable(_)
+        ));
+        let process = serde_json::to_vec(&CompileDocument::unavailable(
+            UnavailableReason::ProcessCapacity,
+        ))
+        .unwrap();
+        assert!(matches!(
+            validate_json(&process).unwrap(),
+            CompileDocument::Unavailable(_)
+        ));
+        let capture = CompileCapture::try_start().unwrap();
+        capture.update(|r| {
+            r.planning_status = Observation::Observed(PlanningStatus::Planned);
+
+            r.budget_limited = Observation::Observed(true);
+        });
+        assert!(validate_json(render(&capture.seal(), true).as_bytes()).is_err());
+        drop(capture);
+        let capture = CompileCapture::try_start().unwrap();
+        capture.update(|r| {
+            r.outcome = CompileOutcome::Success;
+            r.safety_verified = Observation::Observed(true);
+            r.artifact = ArtifactStatus::CompiledArtifactReady;
+        });
+        assert!(validate_json(render(&capture.seal(), true).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn execution_receipt_validates_selection_reservation_and_lowering_order() {
+        use paro_context::compile_diagnostics::*;
+
+        let identity = ArtifactIdentity {
+            schema_version: IDENTITY_SCHEMA_VERSION,
+            artifact: CompiledArtifactId([1, 2]),
+            structure: PlanStructureId([3, 4]),
+            dependencies: [5, 6],
+        };
+        let resources = ResourceReceipt {
+            class: 2,
+            minimum_memory_bytes: 100,
+            working_set_memory_bytes: 200,
+            memory_ceiling_bytes: 1_000,
+            memory_completion: MemoryCompletionReceipt::Guaranteed,
+            max_parallel_tasks: 4,
+            external_worker_slots: 0,
+        };
+        let receipt = ExecutionReceipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            execution_id: ExecutionReceiptId(7),
+            admission_receipt_id: AdmissionReceiptId(7),
+            selection_identity: Some(SelectionIdentity {
+                artifact: identity.artifact,
+                grant_class: Some(2),
+                physical_fingerprint: Some([7, 8]),
+            }),
+            statement_decision_id: Some(4),
+            artifact_identity: identity,
+            expected_class: Some(2),
+            actual_class: Some(2),
+            actual_fingerprint: Some([7, 8]),
+            resources: Some(resources),
+            admission: AdmissionResult::Selected,
+            fallback: None,
+            reservation: ResourceReservationStatus::Committed,
+            lowering: LoweringStatus::Ready,
+            lowering_error: None,
+            image: ExecutionImageStatus::Ready,
+            terminal: ExecutionTerminal::Completed,
+            terminal_error: None,
+        };
+
+        let capture = CompileCapture::try_start().unwrap();
+        capture.update(|record| {
+            record.outcome = CompileOutcome::Success;
+            record.safety_verified = Observation::Observed(true);
+            record.artifact = ArtifactStatus::CompiledArtifactReady;
+            record.artifact_identity = Observation::Observed(identity);
+            record.compiler_ns = Observation::Observed(0);
+            record.bind_ns = Observation::Observed(0);
+            record.optimizer_ns = Observation::Observed(0);
+            record.verify_ns = Observation::Observed(0);
+            record.finish_ns = Observation::Observed(0);
+            record.compiler_other_ns = Observation::Observed(0);
+        });
+        let json = render_with_execution(&capture.seal(), true, Some(receipt.clone()));
+        drop(capture);
+        validate_json(json.as_bytes()).unwrap();
+
+        let mut invalid = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        let execution = invalid
+            .get_mut("execution_receipt")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        execution.insert("image".into(), serde_json::Value::String("NotReady".into()));
+        assert!(validate_json(serde_json::to_string(&invalid).unwrap().as_bytes()).is_err());
+
+        let capture = CompileCapture::try_start().unwrap();
+        capture.update(|record| {
+            record.outcome = CompileOutcome::Success;
+            record.safety_verified = Observation::Observed(true);
+            record.artifact = ArtifactStatus::CompiledArtifactReady;
+            record.artifact_identity = Observation::Observed(identity);
+            record.compiler_ns = Observation::Observed(0);
+            record.bind_ns = Observation::Observed(0);
+            record.optimizer_ns = Observation::Observed(0);
+            record.verify_ns = Observation::Observed(0);
+            record.finish_ns = Observation::Observed(0);
+            record.compiler_other_ns = Observation::Observed(0);
+        });
+        let mut invalid = serde_json::from_str::<serde_json::Value>(&render_with_execution(
+            &capture.seal(),
+            true,
+            Some(receipt),
+        ))
+        .unwrap();
+        let execution = invalid
+            .get_mut("execution_receipt")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        execution.insert(
+            "reservation".into(),
+            serde_json::Value::String("Failed".into()),
+        );
+        execution.insert(
+            "terminal".into(),
+            serde_json::Value::String("Completed".into()),
+        );
+        assert!(validate_json(serde_json::to_string(&invalid).unwrap().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn detail_overflow_preserves_analyze_receipt_and_summary() {
+        use paro_context::compile_diagnostics::*;
+
+        let identity = ArtifactIdentity {
+            schema_version: IDENTITY_SCHEMA_VERSION,
+            artifact: CompiledArtifactId([101, 102]),
+            structure: PlanStructureId([103, 104]),
+            dependencies: [105, 106],
+        };
+        let receipt = ExecutionReceipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            execution_id: ExecutionReceiptId(99),
+            admission_receipt_id: AdmissionReceiptId(99),
+            selection_identity: Some(SelectionIdentity {
+                artifact: identity.artifact,
+                grant_class: Some(2),
+                physical_fingerprint: Some([107, 108]),
+            }),
+            statement_decision_id: Some(7),
+            artifact_identity: identity,
+            expected_class: Some(2),
+            actual_class: Some(2),
+            actual_fingerprint: Some([107, 108]),
+            resources: Some(ResourceReceipt {
+                class: 2,
+                minimum_memory_bytes: 100,
+                working_set_memory_bytes: 200,
+                memory_ceiling_bytes: 300,
+                memory_completion: MemoryCompletionReceipt::Guaranteed,
+                max_parallel_tasks: 4,
+                external_worker_slots: 0,
+            }),
+            admission: AdmissionResult::Selected,
+            fallback: None,
+            reservation: ResourceReservationStatus::Committed,
+            lowering: LoweringStatus::Ready,
+            lowering_error: None,
+            image: ExecutionImageStatus::Ready,
+            terminal: ExecutionTerminal::Completed,
+            terminal_error: None,
+        };
+        let capture = CompileCapture::try_start_with_level(CaptureLevel::Detail).unwrap();
+        capture.update(|record| {
+            record.outcome = CompileOutcome::Success;
+            record.safety_verified = Observation::Observed(true);
+            record.artifact = ArtifactStatus::CompiledArtifactReady;
+            record.artifact_identity = Observation::Observed(identity);
+            record.compiler_ns = Observation::Observed(0);
+            record.bind_ns = Observation::Observed(0);
+            record.optimizer_ns = Observation::Observed(0);
+            record.verify_ns = Observation::Observed(0);
+            record.finish_ns = Observation::Observed(0);
+            record.compiler_other_ns = Observation::Observed(0);
+        });
+        for sequence in 0..MAX_DETAIL_EVENTS {
+            capture.detail(DetailEvent::Stage {
+                source_sequence: sequence as u64,
+                stage: work::WorkKind::RegionPlanning,
+                elapsed_ns: 0,
+                items: 1,
+                fallbacks: 0,
+            });
+        }
+        let json = render_with_execution(&capture.seal(), true, Some(receipt));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("detail").is_some());
+        assert!(value.get("execution_receipt").is_some());
+        assert!(
+            value
+                .get("omitted_encoding_detail")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(!json.contains("DiagnosticUnavailable"));
+        validate_json(json.as_bytes()).unwrap();
+    }
+}

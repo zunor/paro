@@ -136,6 +136,22 @@ EXCEPT
 SELECT v
 FROM (SELECT v FROM setop_null_right) AS r;
 
+-- Equality classes must not erase the UNKNOWN truth value of x = x.
+-- @query
+SELECT x FROM (VALUES (NULL::INTEGER), (1), (1), (2)) AS v(x)
+WHERE x = x ORDER BY x NULLS LAST;
+
+-- Unsupported disjunctions remain exact residuals when combining an AND.
+-- @query
+SELECT x FROM (VALUES (NULL::INTEGER), (1), (1), (2)) AS v(x)
+WHERE (x = x AND (x = 1 OR x IS NULL)) AND (x >= 0 OR x IS NULL)
+ORDER BY x NULLS LAST;
+
+-- NULL-safe equality has a different truth contract from ordinary equality.
+-- @query
+SELECT x FROM (VALUES (NULL::INTEGER), (1), (1), (2)) AS v(x)
+WHERE x IS NOT DISTINCT FROM x ORDER BY x NULLS LAST;
+
 -- @teardown
 DROP TABLE IF EXISTS join_null_left;
 -- @teardown

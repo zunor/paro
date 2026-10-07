@@ -26,6 +26,8 @@ POLICY_EVOLUTION ?=
 ARCHIVE ?=
 ARCHIVE_CACHE ?=
 RUN_ID ?=
+REPORT_ROOT ?=
+COLLECT_RECEIPTS ?= 1
 PLATFORM ?= auto
 POLICY_VERSION ?= auto
 QUORUM_RETRIES ?=
@@ -51,7 +53,10 @@ export PARO_ALLOC_AUDIT
 
 .DEFAULT_GOAL := help
 
-.PHONY: setup run check bless calibrate bisect archive-manifest archive-recompute-calibration archive-finalize-calibration ci test ping clean clean-venv distclean help
+QUALITY_REPORT ?=
+QUALITY_BASELINE ?=
+QUALITY_LISTEN ?= 127.0.0.1:6442
+.PHONY: setup run check bless calibrate bisect quality quality-collect archive-manifest archive-recompute-calibration archive-finalize-calibration ci test ping clean clean-venv distclean help
 
 setup: ## Create .venv and install benchmark dependencies
 	@$(PYTHON_SYS) -m venv $(VENV_DIR)
@@ -65,7 +70,10 @@ run: ## Run benchmark (WORKLOAD= FILTER= SUITE= PARAMS="k=v a=b")
 		$(if $(WORKLOAD),--workload $(WORKLOAD)) \
 		$(if $(FILTER),--filter "$(FILTER)") \
 		$(foreach p,$(PARAMS),--param $(p)) \
-		$(if $(PID),--pid $(PID))
+		$(if $(PID),--pid $(PID)) \
+		$(if $(REPORT_ROOT),--report-root $(REPORT_ROOT)) \
+		$(if $(RUN_ID),--run-id $(RUN_ID)) \
+		$(if $(filter 1 true yes on,$(COLLECT_RECEIPTS)),--collect-receipts,$(if $(COLLECT_RECEIPTS),--no-collect-receipts))
 
 check: ## Run performance gate (GATE= INCLUDE_SOURCE= BASELINE= PID=)
 	$(RUNNER) gate check \
@@ -76,7 +84,9 @@ check: ## Run performance gate (GATE= INCLUDE_SOURCE= BASELINE= PID=)
 		$(if $(INCLUDE_SOURCE),--include-source $(INCLUDE_SOURCE)) \
 		$(if $(ARCHIVE),--archive $(ARCHIVE)) \
 		$(if $(ARCHIVE_CACHE),--archive-cache $(ARCHIVE_CACHE)) \
-		$(if $(QUORUM_RETRIES),--quorum-retries $(QUORUM_RETRIES))
+		$(if $(QUORUM_RETRIES),--quorum-retries $(QUORUM_RETRIES)) \
+		$(if $(REPORT_ROOT),--report-root $(REPORT_ROOT)) \
+		$(if $(RUN_ID),--run-id $(RUN_ID))
 
 bless: ## Update gate baseline (GATE= BASELINE= PID=)
 	$(RUNNER) gate bless \
@@ -86,7 +96,9 @@ bless: ## Update gate baseline (GATE= BASELINE= PID=)
 		$(if $(PID),--pid $(PID)) \
 		$(if $(INCLUDE_SOURCE),--include-source $(INCLUDE_SOURCE)) \
 		$(if $(BLESS_RUNS),--bless-runs $(BLESS_RUNS)) \
-		$(if $(POLICY_EVOLUTION),--policy-evolution)
+		$(if $(POLICY_EVOLUTION),--policy-evolution) \
+		$(if $(REPORT_ROOT),--report-root $(REPORT_ROOT)) \
+		$(if $(RUN_ID),--run-id $(RUN_ID))
 
 calibrate: ## Append clean gate observations to archive (GATE= ARCHIVE= RUN_ID=)
 	$(RUNNER) gate calibrate \
@@ -97,6 +109,7 @@ calibrate: ## Append clean gate observations to archive (GATE= ARCHIVE= RUN_ID=)
 		$(if $(INCLUDE_SOURCE),--include-source $(INCLUDE_SOURCE)) \
 		$(if $(ARCHIVE),--archive $(ARCHIVE)) \
 		$(if $(ARCHIVE_CACHE),--archive-cache $(ARCHIVE_CACHE)) \
+		$(if $(REPORT_ROOT),--report-root $(REPORT_ROOT)) \
 		$(if $(RUN_ID),--run-id $(RUN_ID))
 
 bisect: ## Compare this checkout against archived gate result (GATE= AGAINST=<sha> ARCHIVE=)
@@ -107,7 +120,9 @@ bisect: ## Compare this checkout against archived gate result (GATE= AGAINST=<sh
 		$(if $(PID),--pid $(PID)) \
 		$(if $(INCLUDE_SOURCE),--include-source $(INCLUDE_SOURCE)) \
 		$(if $(ARCHIVE),--archive $(ARCHIVE)) \
-		$(if $(ARCHIVE_CACHE),--archive-cache $(ARCHIVE_CACHE))
+		$(if $(ARCHIVE_CACHE),--archive-cache $(ARCHIVE_CACHE)) \
+		$(if $(REPORT_ROOT),--report-root $(REPORT_ROOT)) \
+		$(if $(RUN_ID),--run-id $(RUN_ID))
 
 archive-manifest: ## Rebuild archive manifest from listing (ARCHIVE= GATE= PLATFORM= POLICY_VERSION=)
 	$(PYTHON) -m harness.archive.manifest rebuild \
@@ -139,10 +154,23 @@ ci: ## Run CI benchmark suite (default: SUITE=pr-smoke)
 	$(RUNNER) run \
 		--suite $(if $(SUITE),$(SUITE),pr-smoke) \
 		$(foreach p,$(PARAMS),--param $(p)) \
-		$(if $(PID),--pid $(PID))
+		$(if $(PID),--pid $(PID)) \
+		$(if $(REPORT_ROOT),--report-root $(REPORT_ROOT)) \
+		$(if $(RUN_ID),--run-id $(RUN_ID)) \
+		$(if $(filter 1 true yes on,$(COLLECT_RECEIPTS)),--collect-receipts,$(if $(COLLECT_RECEIPTS),--no-collect-receipts))
 
 test: ## Run benchmark harness unit tests
 	PYTHONPATH=.. $(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
+
+quality: ## Check estimate-vs-actual q-error (QUALITY_REPORT= QUALITY_BASELINE=)
+	PYTHONPATH=.. $(PYTHON) -m harness.quality_gate \
+		--report $(QUALITY_REPORT) \
+		$(if $(QUALITY_BASELINE),--baseline $(QUALITY_BASELINE))
+
+quality-collect: ## Build and collect known-cardinality cases in a fresh owned server
+	$(PYTHON) corpora/plan_quality.py --report $(QUALITY_REPORT) \
+		--listen $(QUALITY_LISTEN) \
+		$(if $(QUALITY_BASELINE),--baseline $(QUALITY_BASELINE))
 
 ping: ## Verify Paro connectivity from config.toml
 	@$(PYTHON) -c "\

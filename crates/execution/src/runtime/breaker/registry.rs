@@ -495,6 +495,7 @@ mod tests {
             .expect("topn")
             .initialize(TopNRuntimeState {
                 heap: TopNHeap::new(vec![LogicalType::Integer], &[], 1, 0),
+                pending_heaps: Vec::new(),
                 boundary: Arc::new(TopNBoundaryValue::new()),
             })
             .expect("initialize topn");
@@ -513,7 +514,10 @@ mod tests {
             }))
             .expect("initialize aggregate");
 
-        let mut window_chunks = vec![Chunk::try_new(test_allocator()).expect("chunk")];
+        let mut window_chunks = vec![crate::runtime::breaker::radix::RadixChunk {
+            input: Chunk::try_new(test_allocator()).expect("chunk"),
+            routing: Default::default(),
+        }];
         registry
             .get::<WindowHandle>(HandleRef::new(ids[5]))
             .expect("window")

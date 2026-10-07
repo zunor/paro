@@ -5,7 +5,7 @@ DROP FUNCTION
 CREATE FUNCTION py_imported(a INTEGER) RETURNS INTEGER
 LANGUAGE python
 IMMUTABLE
-IMPORTS ('<repo>/regress/report/fixtures/python_udf/scalar/imported_helper/python_udf/modules/basic_math/basic_math.py')
+IMPORTS ('{{fixture:python_udf/modules/basic_math}}/basic_math.py')
 AS $$
 from basic_math import shift_all
 return shift_all(a.materialize_py())

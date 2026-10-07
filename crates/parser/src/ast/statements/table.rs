@@ -593,7 +593,9 @@ impl Display for VacuumTableStmt {
                 .chain(&self.schema)
                 .chain(Some(&self.table)),
         )?;
-        write!(f, " {}", &self.option)?;
+        if self.option.dry_run.is_some() {
+            write!(f, " {}", &self.option)?;
+        }
 
         Ok(())
     }

@@ -54,29 +54,29 @@ SELECT
     (fingerprint <> '') AS has_fingerprint
 FROM paro_property_graphs();
 graph_name	vertex_tables	edge_tables	vertex_count	edge_count	state	delta_size	has_last_rebuild	has_fingerprint
-social_network	Person, Company	Knows, WorksAt	5	6	READY	0	true	true
+social_network	person, company	knows, worksat	5	6	READY	0	true	true
 
 SELECT label, type, count FROM paro_graph_statistics('social_network') ORDER BY type, label;
 label	type	count
-Knows	edge	3
-WorksAt	edge	3
-Company	vertex	2
-Person	vertex	3
+knows	edge	3
+worksat	edge	3
+company	vertex	2
+person	vertex	3
 
 SELECT label, type, count, avg_degree FROM paro_graph_statistics('social_network') WHERE type = 'edge' ORDER BY label;
 label	type	count	avg_degree
-Knows	edge	3	1.000000
-WorksAt	edge	3	1.000000
+knows	edge	3	1.000000
+worksat	edge	3	1.000000
 
 SELECT * FROM paro_graph_statistics('nonexistent');
 paro_graph_statistics.label	paro_graph_statistics.type	paro_graph_statistics.count	paro_graph_statistics.avg_degree	paro_graph_statistics.index_size_bytes
 
 SELECT label, type, (index_size_bytes > 0) AS has_index FROM paro_graph_statistics('social_network') ORDER BY type, label;
 label	type	has_index
-Knows	edge	true
-WorksAt	edge	true
-Company	vertex	true
-Person	vertex	true
+knows	edge	true
+worksat	edge	true
+company	vertex	true
+person	vertex	true
 
 INSERT INTO knows VALUES (3, 1, '2024-01-01');
 INSERT 0 1
@@ -107,8 +107,8 @@ social_network	READY	0	6	7
 
 SELECT label, type, count, avg_degree FROM paro_graph_statistics('social_network') WHERE type = 'edge' ORDER BY label;
 label	type	count	avg_degree
-Knows	edge	4	1.000000
-WorksAt	edge	3	0.750000
+knows	edge	4	1.000000
+worksat	edge	3	0.750000
 
 DROP PROPERTY GRAPH social_network;
 DROP PROPERTY GRAPH

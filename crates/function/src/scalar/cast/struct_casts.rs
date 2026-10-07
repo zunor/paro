@@ -20,6 +20,12 @@ pub struct StructBoundCastData {
 }
 
 impl BoundCastData for StructBoundCastData {
+    fn local_equals(&self, other: &dyn BoundCastData) -> bool {
+        other.as_any().is::<Self>()
+    }
+    fn child_casts(&self) -> &[BoundCastInfo] {
+        &self.field_casts
+    }
     fn copy(&self) -> Box<dyn BoundCastData> {
         Box::new(Self {
             field_casts: self.field_casts.clone(),

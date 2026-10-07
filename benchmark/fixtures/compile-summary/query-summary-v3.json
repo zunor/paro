@@ -1,0 +1,16 @@
+{
+  "schema_version": 3,
+  "cache": "ForcedCompile",
+  "measurement_mode": "Diagnostic",
+  "timer_boundary": "ParsedAstCompilerEntryToReturnV1",
+  "parse": {"Uncovered": "NotInstrumented"},
+  "output_columns": {"Observed": 1},
+  "artifact": "CompiledArtifactReady",
+  "safety_verified": {"Observed": true},
+  "admission": "NotExecuted",
+  "execution": "NotExecuted",
+  "outcome": "Success",
+  "retained_limit": 1048576,
+  "encoded_limit": 200000,
+  "process_limit": 67108864
+}

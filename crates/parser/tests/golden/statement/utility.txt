@@ -720,7 +720,7 @@ Presign(
 ---------- Input ----------
 VACUUM TABLE t;
 ---------- Output ---------
-VACUUM TABLE t 
+VACUUM TABLE t
 ---------- AST ------------
 VacuumTable(
     VacuumTableStmt {
@@ -905,7 +905,7 @@ VacuumDropTable(
 ---------- Input ----------
 SHOW WAREHOUSES
 ---------- Output ---------
-SHOW WAREHOUSES
+SHOW warehouses
 ---------- AST ------------
 VariableShow(
     VariableShowStmt {
@@ -914,7 +914,7 @@ VariableShow(
                 span: Some(
                     5..15,
                 ),
-                name: "WAREHOUSES",
+                name: "warehouses",
                 quote: None,
                 ident_type: None,
             },

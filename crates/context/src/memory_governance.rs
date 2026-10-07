@@ -80,6 +80,14 @@ impl QueryMemoryRegistration {
     pub fn coordinator(&self) -> &Arc<dyn QueryMemoryCoordinator> {
         &self.coordinator
     }
+
+    /// Atomically reserve a capacity floor for the rest of this query's
+    /// registration lifetime. A successful reservation prevents later fair
+    /// share recomputation from shrinking the query below `minimum_bytes`.
+    pub fn try_reserve_minimum_capacity(&self, minimum_bytes: usize) -> MemoryResult<bool> {
+        self.coordinator
+            .try_reserve_minimum_capacity(self.query_id, minimum_bytes)
+    }
 }
 
 impl fmt::Debug for QueryMemoryRegistration {
@@ -109,6 +117,14 @@ pub trait QueryMemoryCoordinator: Send + Sync + fmt::Debug {
         requester_query_id: u64,
         target_bytes: usize,
     ) -> MemoryResult<usize>;
+
+    /// Atomically establish a query-lifetime lower bound on assigned
+    /// capacity. Returns false when the process cannot honor all live floors.
+    fn try_reserve_minimum_capacity(
+        &self,
+        query_id: u64,
+        minimum_bytes: usize,
+    ) -> MemoryResult<bool>;
 
     fn available_for_queries(&self) -> usize;
 

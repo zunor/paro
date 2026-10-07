@@ -86,11 +86,11 @@ QUERY PLAN
 ORDER_BY  (rows=3)
   Sort Key: g_region ASC NULLS LAST, region ASC NULLS LAST
   ->  PROJECTION  (rows=3)
-    Output: g_region, region, sum_sales
-    ->  AGGREGATE  (rows=3)
-      Group Key: agg_grp_values.region
-      Aggregates: sum(agg_grp_values.sales)
-      Grouping Sets: (agg_grp_values.region), ()
-      ->  PROJECTION  (rows=3)
-        Output: region, sales
-        ->  VALUES  (rows=3)
+        Output: g_region, region, sum_sales
+        ->  AGGREGATE  (rows=3)
+              Group Key: agg_grp_values.region
+              Aggregates: sum(agg_grp_values.sales)
+              Grouping Sets: (agg_grp_values.region), ()
+              ->  PROJECTION  (rows=3)
+                    Output: region, sales
+                    ->  VALUES  (rows=3)

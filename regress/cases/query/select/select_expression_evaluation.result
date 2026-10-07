@@ -70,9 +70,9 @@ label	quotient	remainder
 EXPLAIN
 SELECT random() = random() AS independent_calls;
 QUERY PLAN
-PROJECTION
+PROJECTION  (rows=1)
   Output: independent_calls
-  ->  DUMMY_SCAN
+  ->  DUMMY_SCAN  (rows=1)
 
 EXPLAIN
 SELECT r
@@ -85,10 +85,10 @@ QUERY PLAN
 PROJECTION  (rows=30)
   Output: r
   ->  FILTER  (rows=30)
-    Filter: r < 0.5
-    ->  PROJECTION  (rows=100)
-      Output: r
-      ->  TABLE_FUNCTION_SCAN  (rows=100)
+        Filter: r < 0.5
+        ->  PROJECTION  (rows=100)
+              Output: r
+              ->  TABLE_FUNCTION_SCAN  (rows=100)
 
 EXPLAIN
 SELECT count(*)
@@ -100,12 +100,12 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: COUNT(*)
   ->  AGGREGATE  (rows=1)
-    Aggregates: count_star(*)
-    ->  PROJECTION  (rows=100)
-      Output: 42
-      ->  PROJECTION  (rows=100)
-        Output: r
-        ->  TABLE_FUNCTION_SCAN  (rows=100)
+        Aggregates: count_star(*)
+        ->  PROJECTION  (rows=100)
+              Output: 42
+              ->  PROJECTION  (rows=100)
+                    Output: r
+                    ->  TABLE_FUNCTION_SCAN  (rows=100)
 
 SELECT v
 FROM (

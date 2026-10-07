@@ -84,8 +84,7 @@ pub fn bind_literal(value: Literal) -> Result<Expression> {
         Literal::Null => (Value::Null(LogicalType::Null), LogicalType::Null),
     };
 
-    Ok(Expression::Constant(ConstantExpression {
-        value,
-        return_type,
-    }))
+    Ok(Expression::Constant(
+        ConstantExpression { value, return_type }.into(),
+    ))
 }

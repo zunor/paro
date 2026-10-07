@@ -25,7 +25,8 @@ use crate::operators::aggregate::build_helpers::{
 };
 use crate::operators::aggregate::distinct_state::{DistinctAggregateState, DistinctKeyTable};
 use crate::operators::aggregate::grouped_aggregate_hashtable::{
-    GroupedAggregateHashTable, HashTableCapacityHint, SerializedGroupLookup, SerializedSourceRows,
+    AggregateHashRuntimeStats, GroupedAggregateHashTable, HashTableCapacityHint,
+    SerializedGroupLookup, SerializedSourceRows,
 };
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::{
     AggregateHTScanPosition, AggregateHashTable,
@@ -233,9 +234,10 @@ pub(crate) fn finalize_distinct_into_tables(
     modifier_memory: &MemoryAccountingContext,
     distinct: &mut DistinctAggregateState,
     tables: &mut [AggregateHashTable],
-) -> Result<()> {
+) -> Result<AggregateHashRuntimeStats> {
     let group_count = group_refs.len();
     let group_types = group_types(spec)?;
+    let mut hash_runtime_stats = AggregateHashRuntimeStats::default();
     if grouping_sets.len() != tables.len() {
         return Err(paro_error::internal(format!(
             "hash aggregate grouping table count mismatch while finalizing DISTINCT: grouping_sets={} tables={}",
@@ -250,6 +252,7 @@ pub(crate) fn finalize_distinct_into_tables(
         let Some(mut key_table) = distinct.take_coalesced(agg_idx)? else {
             continue;
         };
+        hash_runtime_stats.merge(key_table.take_hash_runtime_stats());
         if key_table.count() == 0 {
             continue;
         }
@@ -300,7 +303,7 @@ pub(crate) fn finalize_distinct_into_tables(
             )?;
         }
     }
-    Ok(())
+    Ok(hash_runtime_stats)
 }
 
 /// Apply one globally unique DISTINCT-key partition to a regular aggregate
@@ -618,14 +621,14 @@ impl<'a> SerializedDistinctTableUpdater<'a> {
         if previous.is_empty() {
             self.flush_range(source, 0, source.count())?;
             for row_idx in 0..source.count() {
-                filter.insert(source.serialized_group_hash(row_idx)?);
+                filter.insert(source.serialized_lookup_hash(row_idx)?);
             }
             return Ok(());
         }
 
         let mut unique_run_start = 0usize;
         for row_idx in 0..source.count() {
-            let hash = source.serialized_group_hash(row_idx)?;
+            let hash = source.serialized_lookup_hash(row_idx)?;
             let duplicate = if filter.contains(hash) {
                 let mut found = false;
                 for lookup in previous {
@@ -681,6 +684,7 @@ impl<'a> SerializedDistinctTableUpdater<'a> {
                 offset,
                 count,
                 self.group_count,
+                self.table.routing_hash_contract(),
                 &mut self.run_starts,
                 &mut self.hashes,
             )?;

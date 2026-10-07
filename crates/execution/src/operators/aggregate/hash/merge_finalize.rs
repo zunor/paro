@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::vector::VECTOR_SIZE;
 
+use crate::operators::aggregate::grouped_aggregate_hashtable::AggregateHashRuntimeStats;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::{
     AggregateHashTable, ConcurrentRadixAggregateBuild,
 };
@@ -27,11 +28,187 @@ use super::distinct_finalize::{
 
 const PARALLEL_RADIX_MERGE_MIN_SOURCE_ROWS: usize = VECTOR_SIZE * 2;
 
+/// One task owns one grouping-set domain, including the first completed local.
+/// Domain tasks may finish in any order, but each task combines its sources in
+/// the same order as the former coordinator loop. In particular, an empty-set
+/// identity is not inserted before adopting the first local's aggregate state.
+#[derive(Debug)]
+struct GroupingMergeDriver {
+    handle: Arc<AggregateHandle>,
+    work: Mutex<Vec<Option<Vec<AggregateHashTable>>>>,
+    results: Mutex<Vec<Option<AggregateHashTable>>>,
+    next_task: AtomicUsize,
+}
+
+impl ParallelFinishDriver for GroupingMergeDriver {
+    fn next_task(&self, ctx: &mut OperatorFinishContext) -> Result<NextFinishTask> {
+        ctx.cancel.check()?;
+        let task_idx = self.next_task.fetch_add(1, Ordering::AcqRel);
+        if task_idx >= self.work.lock().len() {
+            return Ok(NextFinishTask::Drained);
+        }
+        Ok(NextFinishTask::Task(FinishTaskId(
+            u32::try_from(task_idx).map_err(|_| {
+                paro_error::internal("grouping merge task exceeds runtime id range")
+            })?,
+        )))
+    }
+
+    fn run_task(
+        &self,
+        task: FinishTaskId,
+        ctx: &mut OperatorFinishContext,
+    ) -> Result<FinishTaskPoll> {
+        ctx.cancel.check()?;
+        let task_idx = task.0 as usize;
+        let tables = self
+            .work
+            .lock()
+            .get_mut(task_idx)
+            .ok_or_else(|| paro_error::internal("grouping merge task index out of bounds"))?
+            .take()
+            .ok_or_else(|| paro_error::internal("grouping merge task executed more than once"))?;
+        let mut tables = tables.into_iter();
+        let mut target = tables
+            .next()
+            .ok_or_else(|| paro_error::internal("grouping merge domain has no local target"))?;
+        for mut source in tables {
+            ctx.cancel.check()?;
+            target.combine(&mut source)?;
+        }
+        ctx.cancel.check()?;
+        self.results.lock()[task_idx] = Some(target);
+        Ok(FinishTaskPoll::Done)
+    }
+
+    fn finish_group(&self, ctx: &mut OperatorFinishContext) -> Result<()> {
+        ctx.cancel.check()?;
+        let mut results = self.results.lock();
+        if results.iter().any(Option::is_none) {
+            return Err(paro_error::internal(
+                "parallel grouping merge has an unfinished domain",
+            ));
+        }
+        self.handle.with_state_mut(|state| {
+            let AggregateRuntimeState::Hash(global) = state else {
+                return Err(paro_error::internal(
+                    "aggregate handle does not contain hash aggregate state",
+                ));
+            };
+            if !global.tables.is_empty() || !global.pending_radix_merges.is_empty() {
+                return Err(paro_error::internal(
+                    "parallel grouping merge result has competing state",
+                ));
+            }
+            global.tables = results.iter_mut().filter_map(Option::take).collect();
+            Ok(())
+        })
+    }
+}
+
+pub(super) fn prepare_parallel_grouping_merge(
+    handle: Arc<AggregateHandle>,
+) -> Result<Option<FinishTaskGroup>> {
+    let mut locals = Vec::new();
+    handle.with_state_mut(|state| {
+        let AggregateRuntimeState::Hash(global) = state else {
+            return Err(paro_error::internal(
+                "aggregate handle does not contain hash aggregate state",
+            ));
+        };
+        let Some(first) = global.pending_radix_merges.first() else {
+            return Ok(());
+        };
+        let domain_count = first.len();
+        if domain_count <= 1 {
+            return Ok(());
+        }
+        if global
+            .pending_radix_merges
+            .iter()
+            .any(|tables| tables.len() != domain_count)
+            || (!global.tables.is_empty() && global.tables.len() != domain_count)
+        {
+            return Err(paro_error::internal(
+                "grouping merge local domain count mismatch",
+            ));
+        }
+        // prepare_finish routes spilled domains back through the serial replay
+        // owner before any parallel tasks can take their tables.
+        if !global.spilled_payloads.is_empty() || !global.spilled_states.is_empty() {
+            return Err(paro_error::internal(
+                "grouping merge still has pending spill replay",
+            ));
+        }
+        if !global.tables.is_empty() {
+            locals.push(std::mem::take(&mut global.tables));
+        }
+        locals.append(&mut global.pending_radix_merges);
+        if locals.len() == 1 {
+            global.tables = locals
+                .pop()
+                .ok_or_else(|| paro_error::internal("single grouping local lost its domains"))?;
+        }
+        Ok(())
+    })?;
+    if locals.is_empty() {
+        return Ok(None);
+    }
+    let domain_count = locals[0].len();
+    let mut work = (0..domain_count)
+        .map(|_| Vec::with_capacity(locals.len()))
+        .collect::<Vec<_>>();
+    for local in locals {
+        for (domain_idx, table) in local.into_iter().enumerate() {
+            work[domain_idx].push(table);
+        }
+    }
+    Ok(Some(FinishTaskGroup {
+        task_count: domain_count,
+        driver: Arc::new(GroupingMergeDriver {
+            handle,
+            work: Mutex::new(work.into_iter().map(Some).collect()),
+            results: Mutex::new((0..domain_count).map(|_| None).collect()),
+            next_task: AtomicUsize::new(0),
+        }),
+        memory_class: MemoryClass::Blocking,
+        coordinator_participation: FinishCoordinatorParticipation::DrainAvailable,
+    }))
+}
+
 #[derive(Debug)]
 struct RadixMergePartition {
     partition_idx: usize,
     sources: Vec<AggregateHashTable>,
     distinct: Vec<DistinctAggregatePartition>,
+}
+
+fn partition_radix_merge_sources(
+    tables: Vec<AggregateHashTable>,
+    partition_count: usize,
+) -> Result<(Vec<RadixMergePartition>, AggregateHashRuntimeStats)> {
+    let mut work = (0..partition_count)
+        .map(|partition_idx| RadixMergePartition {
+            partition_idx,
+            sources: Vec::with_capacity(tables.len()),
+            distinct: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let mut hash_runtime_stats = AggregateHashRuntimeStats::default();
+    for table in tables {
+        let bundle = table.into_scan_partitions();
+        hash_runtime_stats.merge(bundle.hash_runtime_stats);
+        if bundle.partitions.len() != partition_count {
+            return Err(paro_error::internal(format!(
+                "aggregate merge radix partition mismatch: expected={partition_count} actual={}",
+                bundle.partitions.len()
+            )));
+        }
+        for (partition_idx, partition) in bundle.partitions.into_iter().enumerate() {
+            work[partition_idx].sources.push(partition);
+        }
+    }
+    Ok((work, hash_runtime_stats))
 }
 
 #[derive(Debug)]
@@ -123,9 +300,7 @@ impl ParallelFinishDriver for RadixMergeDriver {
                 ))
             })?;
         let mut target = self.result.take_partition(work.partition_idx)?;
-        for mut source in work.sources {
-            target.combine(&mut source)?;
-        }
+        target.combine_sources(work.sources)?;
         if let Some(distinct) = &self.distinct {
             distinct.finalize_partition(work.distinct, ctx, &mut target)?;
         }
@@ -196,9 +371,7 @@ pub(super) fn prepare_parallel_radix_merge(
         .unwrap_or(usize::MAX);
     if source_rows < PARALLEL_RADIX_MERGE_MIN_SOURCE_ROWS {
         let mut target = tables.remove(0);
-        for mut source in tables {
-            target.combine(&mut source)?;
-        }
+        target.combine_sources(tables)?;
         handle.with_state_mut(|state| {
             let AggregateRuntimeState::Hash(global) = state else {
                 return Err(paro_error::internal(
@@ -215,25 +388,8 @@ pub(super) fn prepare_parallel_radix_merge(
     let partition_count = result_table.radix_partition_count().ok_or_else(|| {
         paro_error::internal("parallel aggregate merge target is not radix partitioned")
     })?;
-    let mut work = (0..partition_count)
-        .map(|partition_idx| RadixMergePartition {
-            partition_idx,
-            sources: Vec::with_capacity(tables.len()),
-            distinct: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    for table in tables {
-        let partitions = table.into_scan_partitions();
-        if partitions.len() != partition_count {
-            return Err(paro_error::internal(format!(
-                "aggregate merge radix partition mismatch: expected={partition_count} actual={}",
-                partitions.len()
-            )));
-        }
-        for (partition_idx, partition) in partitions.into_iter().enumerate() {
-            work[partition_idx].sources.push(partition);
-        }
-    }
+    let (mut work, source_hash_runtime_stats) =
+        partition_radix_merge_sources(tables, partition_count)?;
     let distinct = handle.with_state_mut(|state| {
         let AggregateRuntimeState::Hash(global) = state else {
             return Err(paro_error::internal(
@@ -242,7 +398,7 @@ pub(super) fn prepare_parallel_radix_merge(
         };
         take_partitioned_distinct_work(spec, global, partition_count)
     })?;
-    let distinct_context = if let Some((context, partitions)) = distinct {
+    let mut distinct_context = if let Some((context, partitions)) = distinct {
         if partitions.len() != work.len() {
             return Err(paro_error::internal(format!(
                 "aggregate merge DISTINCT partition mismatch: merge={} distinct={}",
@@ -257,11 +413,91 @@ pub(super) fn prepare_parallel_radix_merge(
     } else {
         None
     };
-    let result = ConcurrentRadixAggregateBuild::try_new(result_table)?;
+    let mut result = ConcurrentRadixAggregateBuild::try_new(result_table)?;
+    result.merge_hash_runtime_stats(source_hash_runtime_stats);
+    if let Some(distinct) = distinct_context.as_mut() {
+        result.merge_hash_runtime_stats(distinct.take_hash_runtime_stats());
+    }
     Ok(Some(RadixMergeDriver::group(
         handle,
         result,
         distinct_context,
         work,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use paro_common::chunk::Chunk;
+    use paro_common::test_utils::{
+        test_allocator, test_i32_vector_with_allocator, test_selection_with_capacity,
+        test_vector_with_capacity,
+    };
+    use paro_common::types::LogicalType;
+
+    use super::*;
+
+    #[test]
+    fn parallel_radix_source_bundle_preserves_runtime_stats_above_threshold() {
+        let allocator = test_allocator();
+        let row_count = PARALLEL_RADIX_MERGE_MIN_SOURCE_ROWS;
+        let values = (0..row_count as i32).collect::<Vec<_>>();
+        let groups = Chunk::from_vectors(
+            vec![test_i32_vector_with_allocator(&values, allocator.clone())],
+            allocator.clone(),
+        );
+        let mut source = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            allocator.clone(),
+        )
+        .expect("source radix table");
+        let hashes = source.hash_groups(&groups).expect("source hashes");
+        let mut addresses = test_vector_with_capacity(LogicalType::BigInt, row_count);
+        let mut new_groups = test_selection_with_capacity(row_count);
+        source
+            .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+            .expect("source groups");
+        assert!(source.count() >= PARALLEL_RADIX_MERGE_MIN_SOURCE_ROWS);
+
+        let partition_count = source
+            .radix_partition_count()
+            .expect("source partition count");
+        let (work, source_stats) = partition_radix_merge_sources(vec![source], partition_count)
+            .expect("partition source work");
+        assert!(source_stats.max_radix_partition_skew_percent > 0);
+
+        let target = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            allocator,
+        )
+        .expect("target radix table");
+        let mut result = ConcurrentRadixAggregateBuild::try_new(target).expect("result build");
+        result.merge_hash_runtime_stats(source_stats);
+        for partition_work in work {
+            let mut target = result
+                .take_partition(partition_work.partition_idx)
+                .expect("take target partition");
+            target
+                .combine_sources(partition_work.sources)
+                .expect("combine source partition");
+            result
+                .install(partition_work.partition_idx, target)
+                .expect("install target partition");
+        }
+
+        let mut merged = result.finish().expect("finish result");
+        assert_eq!(merged.count(), row_count);
+        assert!(
+            merged
+                .take_hash_runtime_stats()
+                .max_radix_partition_skew_percent
+                > 0
+        );
+    }
 }

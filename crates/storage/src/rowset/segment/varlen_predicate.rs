@@ -151,13 +151,6 @@ impl VarlenMatcher {
         }
     }
 
-    pub(super) fn evaluation_priority(&self) -> (u8, usize) {
-        match &self.strategy {
-            VarlenMatchStrategy::PrefixMembership(membership) => (2, membership.prefixes.len()),
-            VarlenMatchStrategy::Like { .. } => (4, 1),
-        }
-    }
-
     pub(super) fn filter_batch(
         &self,
         batch: &PredicateColumnBatch,
@@ -526,28 +519,9 @@ impl VarlenConjunction {
                 .any(|prefix| value.starts_with(prefix.as_ref()))
     }
 
-    /// Static fallback ordering used when the storage layer has no histogram
-    /// estimate for this predicate.
-    pub(super) fn evaluation_priority(&self) -> (u8, usize) {
-        if self.contradiction {
-            return (0, 0);
-        }
-        if self.equality.is_some() {
-            return (1, 1);
-        }
-        if let Some(values) = &self.inclusions {
-            return (2, values.len());
-        }
-        if self.required_prefix.is_some() || (self.lower.is_some() && self.upper.is_some()) {
-            return (3, 0);
-        }
-        if self.lower.is_some() || self.upper.is_some() {
-            return (4, 0);
-        }
-        if !self.exclusions.is_empty() || !self.excluded_prefixes.is_empty() {
-            return (6, self.exclusions.len() + self.excluded_prefixes.len());
-        }
-        (7, 0)
+    /// Whether the conjunction is proven empty.
+    pub(super) fn is_contradiction(&self) -> bool {
+        self.contradiction
     }
 
     pub(super) fn filter_batch(

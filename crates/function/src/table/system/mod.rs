@@ -34,6 +34,7 @@
 pub mod paro_columns;
 pub mod paro_commit_frontiers;
 pub mod paro_commit_poison;
+pub mod paro_constraints;
 pub mod paro_databases;
 pub mod paro_graph_statistics;
 pub mod paro_indexes;
@@ -57,6 +58,7 @@ pub mod pragma_database_size;
 pub use paro_columns::create_paro_columns_function_set;
 pub use paro_commit_frontiers::create_paro_commit_frontiers_function_set;
 pub use paro_commit_poison::create_paro_commit_poison_function_set;
+pub use paro_constraints::create_paro_constraints_function_set;
 pub use paro_databases::create_paro_databases_function_set;
 pub use paro_graph_statistics::create_paro_graph_statistics_function_set;
 pub use paro_indexes::create_paro_indexes_function_set;

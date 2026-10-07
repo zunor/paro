@@ -8,7 +8,7 @@ use super::segment_predicate_program::{CompiledPredicateProgram, PredicateStageS
 use super::varlen_predicate::{VarlenConjunction, VarlenMatcher};
 use crate::buffer::Prefetcher;
 use crate::index::{
-    collect_predicate_columns, IndexEvaluator, Predicate, PredicateComparison, PredicateResult,
+    collect_predicate_columns, Predicate, PredicateComparison, PredicateIndexAnalysis,
     PredicateTree,
 };
 use crate::rowset::column::ColumnBatch;
@@ -135,6 +135,35 @@ pub(super) enum CompiledPredicate {
     },
 }
 
+/// Columns a staged scan of `tree` reads for every row. A conjunction of
+/// typed constant comparisons runs column by column in conjunct order, so
+/// only the leading conjunct's column is read in full and later columns only
+/// for its survivors. Any other predicate reads all its columns.
+pub fn leading_stage_columns<'a>(
+    tree: &PredicateTree,
+    column_type: impl Fn(ColumnId) -> Option<&'a LogicalType>,
+) -> Vec<ColumnId> {
+    if let PredicateTree::And(children) = tree {
+        let staged = children.iter().all(|child| {
+            let PredicateTree::Leaf(predicate) = child else {
+                return false;
+            };
+            predicate
+                .index_column_id()
+                .and_then(&column_type)
+                .is_some_and(|logical_type| {
+                    PredicateEvaluator::is_typed_constant_leaf(&CompiledPredicateTree::Leaf(
+                        PredicateEvaluator::compile_leaf(0, logical_type, predicate),
+                    ))
+                })
+        });
+        if let (true, Some(PredicateTree::Leaf(first))) = (staged, children.first()) {
+            return first.index_column_id().into_iter().collect();
+        }
+    }
+    collect_predicate_columns(tree)
+}
+
 impl PredicateEvaluator {
     pub(super) fn all_columns_projected(
         &self,
@@ -155,7 +184,7 @@ impl PredicateEvaluator {
         // column runs. Later stages can shrink that set, so the legacy
         // batch-index reuse protocol is intentionally disabled. Projection
         // columns are gathered once from the final absolute row-id set.
-        if self.program.is_staged() {
+        if self.program.is_staged() && !self.program.has_single_stage() {
             return None;
         }
         let column_idx = self
@@ -175,15 +204,15 @@ impl PredicateEvaluator {
     pub(super) fn new(
         segment: &Segment,
         tree: PredicateTree,
-        evaluator: &IndexEvaluator,
+        index_analysis: &PredicateIndexAnalysis,
         prefetcher: Option<Arc<Prefetcher>>,
         explicit_predicate_columns: Option<Vec<ColumnId>>,
     ) -> Result<Option<Self>> {
-        let Some(tree) = Self::remove_index_proven_conjuncts(tree, evaluator) else {
+        let Some(tree) = Self::remove_index_proven_conjuncts(tree, index_analysis) else {
             return Ok(None);
         };
         if !Self::predicate_tree_requires_row_verification(&tree)
-            && !Self::requires_row_level_predicate_eval(evaluator, &tree)
+            && !index_analysis.requires_row_verification()
         {
             return Ok(None);
         }
@@ -272,12 +301,9 @@ impl PredicateEvaluator {
     /// child from OR would change `TRUE OR x` into `x`.
     fn remove_index_proven_conjuncts(
         tree: PredicateTree,
-        evaluator: &IndexEvaluator,
+        index_analysis: &PredicateIndexAnalysis,
     ) -> Option<PredicateTree> {
-        if matches!(
-            evaluator.evaluate_with_proof(&tree).guaranteed(),
-            PredicateResult::AllMatch
-        ) {
+        if index_analysis.guaranteed_all() {
             return None;
         }
         let PredicateTree::And(children) = tree else {
@@ -285,33 +311,15 @@ impl PredicateEvaluator {
         };
         let residual = children
             .into_iter()
-            .filter(|child| {
-                !matches!(
-                    evaluator.evaluate_with_proof(child).guaranteed(),
-                    PredicateResult::AllMatch
-                )
+            .enumerate()
+            .filter_map(|(index, child)| {
+                (!index_analysis.conjunct_guaranteed_all(index)).then_some(child)
             })
             .collect::<Vec<_>>();
         match residual.len() {
             0 => None,
             1 => residual.into_iter().next(),
             _ => Some(PredicateTree::And(residual)),
-        }
-    }
-
-    pub(super) fn requires_row_level_predicate_eval(
-        evaluator: &IndexEvaluator,
-        predicate_tree: &PredicateTree,
-    ) -> bool {
-        match predicate_tree {
-            PredicateTree::Leaf(predicate) => {
-                let leaf = PredicateTree::Leaf(predicate.clone());
-                let evaluation = evaluator.evaluate_with_proof(&leaf);
-                matches!(evaluation.candidates, PredicateResult::Unknown) || !evaluation.is_exact()
-            }
-            PredicateTree::And(children) | PredicateTree::Or(children) => children
-                .iter()
-                .any(|child| Self::requires_row_level_predicate_eval(evaluator, child)),
         }
     }
 
@@ -488,47 +496,25 @@ impl PredicateEvaluator {
         )
     }
 
-    fn constant_filter_priority(predicate: &CompiledPredicateTree) -> (u8, usize, usize) {
+    /// Evaluation class of an AND child. The caller owns conjunct order by
+    /// selectivity; storage only moves proven contradictions first and runs
+    /// typed constant comparisons, which are vector kernels, ahead of
+    /// row-at-a-time predicates. The sort is stable within a class.
+    fn conjunction_class(predicate: &CompiledPredicateTree) -> u8 {
         match predicate {
             CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
                 comparisons,
                 ..
-            }) => {
-                let (class, cardinality_hint) = comparisons.evaluation_priority();
-                (class, cardinality_hint, comparisons.physical_width())
-            }
+            }) => u8::from(!comparisons.is_contradiction()),
             CompiledPredicateTree::Leaf(CompiledPredicate::VarlenComparisons {
                 comparisons,
                 ..
-            }) => {
-                let (class, cardinality_hint) = comparisons.evaluation_priority();
-                (class, cardinality_hint, usize::MAX)
-            }
-            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenMatch { matcher, .. }) => {
-                let (class, cardinality_hint) = matcher.evaluation_priority();
-                (class, cardinality_hint, usize::MAX)
-            }
-            _ => (u8::MAX, usize::MAX, usize::MAX),
-        }
-    }
-
-    fn conjunction_priority(predicate: &CompiledPredicateTree) -> (u8, usize, usize) {
-        let constant = Self::constant_filter_priority(predicate);
-        if constant.0 != u8::MAX {
-            return constant;
-        }
-        match predicate {
-            CompiledPredicateTree::Leaf(CompiledPredicate::FixedColumnComparison {
-                width, ..
-            }) => (5, 0, width.bytes()),
-            CompiledPredicateTree::Leaf(CompiledPredicate::Generic { .. }) => (6, 0, usize::MAX),
-            CompiledPredicateTree::Or(_) => (7, 0, usize::MAX),
-            CompiledPredicateTree::And(_) => (8, 0, usize::MAX),
-            CompiledPredicateTree::Leaf(
-                CompiledPredicate::FixedComparisons { .. }
-                | CompiledPredicate::VarlenComparisons { .. }
-                | CompiledPredicate::VarlenMatch { .. },
-            ) => unreachable!("constant comparisons returned above"),
+            }) => u8::from(!comparisons.is_contradiction()),
+            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenMatch { .. }) => 1,
+            CompiledPredicateTree::Leaf(CompiledPredicate::FixedColumnComparison { .. }) => 2,
+            CompiledPredicateTree::Leaf(CompiledPredicate::Generic { .. }) => 3,
+            CompiledPredicateTree::Or(_) => 4,
+            CompiledPredicateTree::And(_) => 5,
         }
     }
 
@@ -938,7 +924,7 @@ impl PredicateEvaluator {
                 // already rejected volatile expressions and represented cast
                 // failures before this point. Reordering AND children is
                 // therefore observable only through cost, not SQL semantics.
-                compiled.sort_by_key(Self::conjunction_priority);
+                compiled.sort_by_key(Self::conjunction_class);
                 Ok(CompiledPredicateTree::And(compiled))
             }
             PredicateTree::Or(children) => Ok(CompiledPredicateTree::Or(

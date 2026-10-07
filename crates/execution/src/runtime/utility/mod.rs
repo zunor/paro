@@ -225,10 +225,6 @@ pub fn run_once(spec: &UtilitySpec, ctx: &mut UtilityContext<'_>) -> Result<Util
             run_refresh_property_graph(info, ctx)?;
             Ok(UtilityRunResult::Done)
         }
-        UtilitySpec::Unsupported(spec) => Err(paro_error::not_supported(format!(
-            "utility runtime for {} is not available",
-            spec.name
-        ))),
     }
 }
 

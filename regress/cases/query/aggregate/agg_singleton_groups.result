@@ -82,23 +82,26 @@ QUERY PLAN
 ORDER_BY  (rows=2)
   Sort Key: c_count ASC NULLS LAST
   ->  PROJECTION  (rows=2)
-    Output: c_count, customer_distribution
-    ->  AGGREGATE  (rows=2)
-      Group Key: counts.c_count
-      Aggregates: count_star(*)
-      ->  PROJECTION  (rows=3)
-        Output: c_count
-        ->  HASH_JOIN  (rows=3)
-          Join Type: LEFT
-          Join Condition: c.customer_key = o.customer_key
-          ->  ROWSET_SCAN on public.singleton_customer c  (rows=3)
-            Columns: customer_key
-          ->  AGGREGATE  (rows=2)
-            Group Key: o.customer_key
-            Aggregates: count_star(*)
-            ->  ROWSET_SCAN on public.singleton_orders_large o  (rows=4050)
-              Columns: customer_key
-              Pushed Predicate: comment NOT LIKE "%special%requests%"
+        Output: c_count, customer_distribution
+        ->  AGGREGATE  (rows=2)
+              Group Key: counts.c_count
+              Aggregates: count_star(*)
+              ->  PROJECTION  (rows=3)
+                    Output: c_count
+                    ->  AGGREGATE  (rows=3)
+                          Group Key: c.customer_key
+                          Aggregates: count(o.order_key)
+                          ->  HASH_JOIN  (rows=4050)
+                                Join Type: RIGHT
+                                Build Index: integer_build_time
+                                Join Condition: o.customer_key = c.customer_key
+                                ->  ROWSET_SCAN on public.singleton_orders_large o  (rows=4050)
+                                      Column IDs: 0, 1, 2
+                                      Columns: order_key, customer_key, comment
+                                      Pushed Predicate: comment NOT LIKE "%special%requests%"
+                                ->  ROWSET_SCAN on public.singleton_customer c  (rows=3)
+                                      Column IDs: 0
+                                      Columns: customer_key
 
 SELECT c_count, count(*) AS customer_distribution
 FROM (
@@ -158,6 +161,38 @@ ORDER BY c_count;
 c_count	grouped_key_distribution
 0	1
 2	1
+
+BEGIN;
+BEGIN
+
+PREPARE singleton_reuse AS
+SELECT c.customer_key, count(o.order_key)
+FROM singleton_customer c LEFT JOIN singleton_orders o
+  ON c.customer_key = o.customer_key
+GROUP BY c.customer_key ORDER BY c.customer_key NULLS FIRST;
+PREPARE
+
+EXECUTE singleton_reuse;
+c.customer_key	count(o.order_key)
+1	2
+2	1
+3	0
+
+INSERT INTO singleton_customer VALUES (NULL), (NULL);
+INSERT 0 2
+
+EXECUTE singleton_reuse;
+c.customer_key	count(o.order_key)
+NULL	0
+1	2
+2	1
+3	0
+
+DEALLOCATE singleton_reuse;
+DEALLOCATE
+
+ROLLBACK;
+ROLLBACK
 
 DROP TABLE IF EXISTS nullable_singleton_customer;
 DROP TABLE

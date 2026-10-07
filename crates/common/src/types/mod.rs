@@ -12,7 +12,7 @@ pub mod pg_type_descriptor;
 mod physical_type;
 mod string_view;
 
-pub use logical_type::LogicalType;
+pub use logical_type::{FlatGroupKeyKind, LogicalType};
 pub use nested_types::{ArrayType, ListType, StructType};
 pub use pg_type_descriptor::{logical_type_from_pg_oid, PgTypeDescriptor};
 pub use physical_type::PhysicalType;

@@ -48,6 +48,12 @@ pub struct ListBoundCastData {
 }
 
 impl BoundCastData for ListBoundCastData {
+    fn local_equals(&self, other: &dyn BoundCastData) -> bool {
+        other.as_any().is::<Self>()
+    }
+    fn child_casts(&self) -> &[BoundCastInfo] {
+        std::slice::from_ref(&self.child_cast_info)
+    }
     fn copy(&self) -> Box<dyn BoundCastData> {
         Box::new(Self {
             child_cast_info: self.child_cast_info.clone(),
@@ -80,6 +86,12 @@ impl ArrayBoundCastData {
 }
 
 impl BoundCastData for ArrayBoundCastData {
+    fn local_equals(&self, other: &dyn BoundCastData) -> bool {
+        other.as_any().is::<Self>()
+    }
+    fn child_casts(&self) -> &[BoundCastInfo] {
+        std::slice::from_ref(&self.child_cast_info)
+    }
     fn copy(&self) -> Box<dyn BoundCastData> {
         Box::new(Self {
             child_cast_info: self.child_cast_info.clone(),

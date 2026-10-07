@@ -22,14 +22,21 @@ struct DirectDecimalInputUpdates {
     input_index: usize,
     width: DirectDecimalWidth,
     sums: DirectDecimalSums,
-    averages: Vec<usize>,
+    sums_are_disjoint: bool,
+    averages: Vec<DirectStateUpdate>,
 }
 
 #[derive(Debug, Clone)]
 enum DirectDecimalSums {
     None,
-    Narrow(Vec<usize>),
-    Wide(Vec<usize>),
+    Narrow(Vec<DirectStateUpdate>),
+    Wide(Vec<DirectStateUpdate>),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectStateUpdate {
+    state_offset: usize,
+    filter_slot: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +54,8 @@ enum DirectDecimalWidth {
 #[derive(Debug, Clone)]
 pub struct DirectGroupedAggregateProgram {
     decimal_inputs: Vec<DirectDecimalInputUpdates>,
-    count_star_offsets: Vec<usize>,
+    count_star_updates: Vec<DirectStateUpdate>,
+    filter_inputs: Vec<usize>,
     handled: Vec<bool>,
     update_count: usize,
     all_states_trivially_copyable: bool,
@@ -161,7 +169,8 @@ impl DirectGroupedAggregateProgram {
     pub fn new(aggregate_count: usize) -> Self {
         Self {
             decimal_inputs: Vec::new(),
-            count_star_offsets: Vec::new(),
+            count_star_updates: Vec::new(),
+            filter_inputs: Vec::new(),
             handled: vec![false; aggregate_count],
             update_count: 0,
             all_states_trivially_copyable: true,
@@ -176,21 +185,40 @@ impl DirectGroupedAggregateProgram {
         input_index: Option<usize>,
         state_is_trivially_copyable: bool,
     ) -> bool {
+        self.try_add_filtered(
+            aggregate_index,
+            update,
+            state_offset,
+            input_index,
+            None,
+            state_is_trivially_copyable,
+        )
+    }
+
+    pub fn try_add_filtered(
+        &mut self,
+        aggregate_index: usize,
+        update: Option<AggregateDirectUpdate>,
+        state_offset: usize,
+        input_index: Option<usize>,
+        filter_index: Option<usize>,
+        state_is_trivially_copyable: bool,
+    ) -> bool {
         let Some(update) = update else {
             return false;
         };
-        let Some(handled) = self.handled.get_mut(aggregate_index) else {
+        let Some(handled) = self.handled.get(aggregate_index) else {
             return false;
         };
         if *handled {
             return false;
         }
-        match update {
+        let decimal_source = match update {
             AggregateDirectUpdate::CountStar => {
                 if input_index.is_some() {
                     return false;
                 }
-                self.count_star_offsets.push(state_offset);
+                None
             }
             AggregateDirectUpdate::Decimal(decimal_update) => {
                 let Some(input_index) = input_index else {
@@ -204,20 +232,45 @@ impl DirectGroupedAggregateProgram {
                         DirectDecimalWidth::I128
                     }
                 };
+                if self
+                    .decimal_inputs
+                    .iter()
+                    .any(|source| source.input_index == input_index && source.width != width)
+                {
+                    return false;
+                }
+                Some((decimal_update, input_index, width))
+            }
+        };
+        let filter_slot = filter_index.map(|filter_index| {
+            self.filter_inputs
+                .iter()
+                .position(|candidate| *candidate == filter_index)
+                .unwrap_or_else(|| {
+                    self.filter_inputs.push(filter_index);
+                    self.filter_inputs.len() - 1
+                })
+        });
+        let state_update = DirectStateUpdate {
+            state_offset,
+            filter_slot,
+        };
+        match decimal_source {
+            None => self.count_star_updates.push(state_update),
+            Some((decimal_update, input_index, width)) => {
                 let source = if let Some(source) = self
                     .decimal_inputs
                     .iter_mut()
                     .find(|source| source.input_index == input_index)
                 {
-                    if source.width != width {
-                        return false;
-                    }
+                    debug_assert_eq!(source.width, width);
                     source
                 } else {
                     self.decimal_inputs.push(DirectDecimalInputUpdates {
                         input_index,
                         width,
                         sums: DirectDecimalSums::None,
+                        sums_are_disjoint: false,
                         averages: Vec::new(),
                     });
                     self.decimal_inputs
@@ -227,28 +280,67 @@ impl DirectGroupedAggregateProgram {
                 match decimal_update {
                     DecimalDirectUpdate::NarrowSumI64 => match &mut source.sums {
                         DirectDecimalSums::None => {
-                            source.sums = DirectDecimalSums::Narrow(vec![state_offset]);
+                            source.sums = DirectDecimalSums::Narrow(vec![state_update]);
                         }
-                        DirectDecimalSums::Narrow(offsets) => offsets.push(state_offset),
-                        DirectDecimalSums::Wide(_) => return false,
+                        DirectDecimalSums::Narrow(updates) => updates.push(state_update),
+                        DirectDecimalSums::Wide(_) => unreachable!("validated decimal width"),
                     },
                     DecimalDirectUpdate::WideSumI128 => match &mut source.sums {
                         DirectDecimalSums::None => {
-                            source.sums = DirectDecimalSums::Wide(vec![state_offset]);
+                            source.sums = DirectDecimalSums::Wide(vec![state_update]);
                         }
-                        DirectDecimalSums::Wide(offsets) => offsets.push(state_offset),
-                        DirectDecimalSums::Narrow(_) => return false,
+                        DirectDecimalSums::Wide(updates) => updates.push(state_update),
+                        DirectDecimalSums::Narrow(_) => unreachable!("validated decimal width"),
                     },
                     DecimalDirectUpdate::AverageI64 | DecimalDirectUpdate::AverageI128 => {
-                        source.averages.push(state_offset)
+                        source.averages.push(state_update)
                     }
                 }
             }
         }
-        *handled = true;
+        self.handled[aggregate_index] = true;
         self.update_count += 1;
         self.all_states_trivially_copyable &= state_is_trivially_copyable;
         true
+    }
+
+    /// Fuse a planner-proven set of mutually exclusive Boolean filter inputs.
+    ///
+    /// A decimal source whose sum updates are all guarded by distinct members
+    /// of this set can stop after the first passing filter. The proof is based
+    /// on physical payload indices; the program maps those indices to its
+    /// compact internal filter slots before enabling the fast path.
+    pub fn fuse_disjoint_filter_group(&mut self, filter_inputs: &[usize]) -> bool {
+        if filter_inputs.len() < 3 {
+            return false;
+        }
+        let registered_filters = &self.filter_inputs;
+        let mut changed = false;
+        for source in &mut self.decimal_inputs {
+            let updates = match &source.sums {
+                DirectDecimalSums::Narrow(updates) | DirectDecimalSums::Wide(updates) => updates,
+                DirectDecimalSums::None => continue,
+            };
+            if updates.len() < 3
+                || updates.iter().any(|update| {
+                    update.filter_slot.is_none_or(|slot| {
+                        registered_filters
+                            .get(slot)
+                            .is_none_or(|input| !filter_inputs.contains(input))
+                    })
+                })
+                || updates.iter().enumerate().any(|(index, update)| {
+                    updates[..index]
+                        .iter()
+                        .any(|candidate| candidate.filter_slot == update.filter_slot)
+                })
+            {
+                continue;
+            }
+            source.sums_are_disjoint = true;
+            changed = true;
+        }
+        changed
     }
 
     pub fn has_updates(&self) -> bool {
@@ -297,15 +389,17 @@ impl DirectGroupedAggregateProgram {
         if !self.supports_direct_combine() {
             return false;
         }
-        for &offset in &self.count_star_offsets {
+        for update in &self.count_star_updates {
+            let offset = update.state_offset;
             let source = unsafe { *source.add(offset).cast::<i64>() };
             let target = unsafe { &mut *target.add(offset).cast::<i64>() };
             *target += source;
         }
         for decimal in &self.decimal_inputs {
             match &decimal.sums {
-                DirectDecimalSums::Narrow(offsets) => {
-                    for &offset in offsets {
+                DirectDecimalSums::Narrow(updates) => {
+                    for update in updates {
+                        let offset = update.state_offset;
                         let source = unsafe { &*source.add(offset).cast::<DecimalNarrowState>() };
                         let target =
                             unsafe { &mut *target.add(offset).cast::<DecimalNarrowState>() };
@@ -316,8 +410,9 @@ impl DirectGroupedAggregateProgram {
                         }
                     }
                 }
-                DirectDecimalSums::Wide(offsets) => {
-                    for &offset in offsets {
+                DirectDecimalSums::Wide(updates) => {
+                    for update in updates {
+                        let offset = update.state_offset;
                         let source = unsafe { &*source.add(offset).cast::<DecimalSumState>() };
                         let target = unsafe { &mut *target.add(offset).cast::<DecimalSumState>() };
                         target.add_state(source);
@@ -337,7 +432,10 @@ impl DirectGroupedAggregateProgram {
         &self,
         payload: &'a Chunk,
     ) -> Option<PreparedDirectGroupedAggregateInput<'a>> {
-        self.prepare_inputs(payload)
+        if !self.filter_inputs.is_empty() {
+            return None;
+        }
+        self.prepare_inputs(payload, false)
     }
 
     /// Exact peak scratch bytes for this compiled update program.
@@ -461,36 +559,57 @@ impl DirectGroupedAggregateProgram {
         addresses: &Vector,
         count: usize,
     ) -> Result<bool> {
+        if !self.handles_all() {
+            return Ok(false);
+        }
         let Some(states) = AggregateStateInput::try_new(addresses, 0, None, count)?.direct_cursor()
         else {
             return Ok(false);
         };
-        let Some(inputs) = self.prepare_inputs(payload) else {
+        let Some(inputs) = self.prepare_inputs(payload, true) else {
             return Ok(false);
         };
 
         for row in 0..count {
             let base = unsafe { states.state_ptr(row) };
             let shared_physical_row = inputs.shared_physical_row(row);
-            for &state_offset in &self.count_star_offsets {
-                unsafe { *base.add(state_offset).cast::<i64>() += 1 };
+            for update in &self.count_star_updates {
+                if inputs.filter_passes(update.filter_slot, row) {
+                    unsafe { *base.add(update.state_offset).cast::<i64>() += 1 };
+                }
             }
             for (source_idx, source) in self.decimal_inputs.iter().enumerate() {
+                if !inputs.is_valid(source_idx, row, shared_physical_row) {
+                    continue;
+                }
+                if inputs.is_constant_zero(source_idx) {
+                    unsafe { Self::update_constant_zero(source, &inputs, row, base) };
+                    continue;
+                }
                 match source.width {
                     DirectDecimalWidth::I64 => {
                         let value =
                             unsafe { inputs.value_i64(source_idx, row, shared_physical_row) };
-                        if let DirectDecimalSums::Narrow(offsets) = &source.sums {
-                            for &state_offset in offsets {
+                        if let DirectDecimalSums::Narrow(updates) = &source.sums {
+                            for update in updates {
+                                if !inputs.filter_passes(update.filter_slot, row) {
+                                    continue;
+                                }
                                 let state = unsafe {
-                                    &mut *base.add(state_offset).cast::<DecimalNarrowState>()
+                                    &mut *base.add(update.state_offset).cast::<DecimalNarrowState>()
                                 };
                                 state.add_i64(value);
+                                if source.sums_are_disjoint {
+                                    break;
+                                }
                             }
                         }
-                        for &state_offset in &source.averages {
+                        for update in &source.averages {
+                            if !inputs.filter_passes(update.filter_slot, row) {
+                                continue;
+                            }
                             let state = unsafe {
-                                &mut *base.add(state_offset).cast::<DecimalAverageState>()
+                                &mut *base.add(update.state_offset).cast::<DecimalAverageState>()
                             };
                             state.update_direct_i64(value);
                         }
@@ -498,17 +617,26 @@ impl DirectGroupedAggregateProgram {
                     DirectDecimalWidth::I128 => {
                         let value =
                             unsafe { inputs.value_i128(source_idx, row, shared_physical_row) };
-                        if let DirectDecimalSums::Wide(offsets) = &source.sums {
-                            for &state_offset in offsets {
+                        if let DirectDecimalSums::Wide(updates) = &source.sums {
+                            for update in updates {
+                                if !inputs.filter_passes(update.filter_slot, row) {
+                                    continue;
+                                }
                                 let state = unsafe {
-                                    &mut *base.add(state_offset).cast::<DecimalSumState>()
+                                    &mut *base.add(update.state_offset).cast::<DecimalSumState>()
                                 };
                                 state.add_direct_i128(value);
+                                if source.sums_are_disjoint {
+                                    break;
+                                }
                             }
                         }
-                        for &state_offset in &source.averages {
+                        for update in &source.averages {
+                            if !inputs.filter_passes(update.filter_slot, row) {
+                                continue;
+                            }
                             let state = unsafe {
-                                &mut *base.add(state_offset).cast::<DecimalAverageState>()
+                                &mut *base.add(update.state_offset).cast::<DecimalAverageState>()
                             };
                             state.update_direct_i128(value, 1);
                         }
@@ -517,6 +645,65 @@ impl DirectGroupedAggregateProgram {
             }
         }
         Ok(true)
+    }
+
+    /// Apply the aggregate semantics of one non-NULL constant-zero row.
+    ///
+    /// Constant detection is a vector execution optimization, not a logical
+    /// rewrite: the state must still distinguish an empty SUM from an observed
+    /// zero, and AVG must still count every admitted row. Keeping those rules
+    /// in one width-dispatched operation prevents the row-wise kernels from
+    /// growing independent lifecycle implementations.
+    ///
+    /// # Safety
+    ///
+    /// `base` must address a live state row compiled by this program.
+    unsafe fn update_constant_zero(
+        source: &DirectDecimalInputUpdates,
+        inputs: &PreparedDirectGroupedAggregateInput<'_>,
+        row: usize,
+        base: *mut u8,
+    ) {
+        match &source.sums {
+            DirectDecimalSums::Narrow(updates) => {
+                for update in updates {
+                    if !inputs.filter_passes(update.filter_slot, row) {
+                        continue;
+                    }
+                    let state =
+                        unsafe { &mut *base.add(update.state_offset).cast::<DecimalNarrowState>() };
+                    state.observe_zero();
+                    if source.sums_are_disjoint {
+                        break;
+                    }
+                }
+            }
+            DirectDecimalSums::Wide(updates) => {
+                for update in updates {
+                    if !inputs.filter_passes(update.filter_slot, row) {
+                        continue;
+                    }
+                    let state =
+                        unsafe { &mut *base.add(update.state_offset).cast::<DecimalSumState>() };
+                    state.observe_zero();
+                    if source.sums_are_disjoint {
+                        break;
+                    }
+                }
+            }
+            DirectDecimalSums::None => {}
+        }
+        for update in &source.averages {
+            if !inputs.filter_passes(update.filter_slot, row) {
+                continue;
+            }
+            let state =
+                unsafe { &mut *base.add(update.state_offset).cast::<DecimalAverageState>() };
+            match source.width {
+                DirectDecimalWidth::I64 => state.update_direct_i64(0),
+                DirectDecimalWidth::I128 => state.update_direct_i128(0, 1),
+            }
+        }
     }
 
     /// Collapse a batch by slot and update states in direct-addressing storage.
@@ -608,7 +795,8 @@ impl DirectGroupedAggregateProgram {
         S: DirectGroupSlotSource,
         F: FnMut(usize, *mut u8) -> Result<()>,
     {
-        if scratch.decimal_sources.len() != self.decimal_inputs.len()
+        if !self.handles_all()
+            || scratch.decimal_sources.len() != self.decimal_inputs.len()
             || slot_source.slot_count() != scratch.slot_count
         {
             return Ok(false);
@@ -735,8 +923,8 @@ impl DirectGroupedAggregateProgram {
         base: *mut u8,
     ) {
         let row_count = rows.len();
-        for &state_offset in &self.count_star_offsets {
-            unsafe { *base.add(state_offset).cast::<i64>() += row_count as i64 };
+        for update in &self.count_star_updates {
+            unsafe { *base.add(update.state_offset).cast::<i64>() += row_count as i64 };
         }
         for (source_idx, source) in self.decimal_inputs.iter().enumerate() {
             match source.width {
@@ -747,17 +935,18 @@ impl DirectGroupedAggregateProgram {
                         sum +=
                             i128::from(unsafe { inputs.value_i64(source_idx, row, physical_row) });
                     }
-                    if let DirectDecimalSums::Narrow(offsets) = &source.sums {
-                        for &state_offset in offsets {
+                    if let DirectDecimalSums::Narrow(updates) = &source.sums {
+                        for update in updates {
                             let state = unsafe {
-                                &mut *base.add(state_offset).cast::<DecimalNarrowState>()
+                                &mut *base.add(update.state_offset).cast::<DecimalNarrowState>()
                             };
                             state.add_direct_i128(sum);
                         }
                     }
-                    for &state_offset in &source.averages {
-                        let state =
-                            unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
+                    for update in &source.averages {
+                        let state = unsafe {
+                            &mut *base.add(update.state_offset).cast::<DecimalAverageState>()
+                        };
                         state.update_direct_i128(sum, row_count as u64);
                     }
                 }
@@ -768,16 +957,18 @@ impl DirectGroupedAggregateProgram {
                         sum +=
                             i256::from(unsafe { inputs.value_i128(source_idx, row, physical_row) });
                     }
-                    if let DirectDecimalSums::Wide(offsets) = &source.sums {
-                        for &state_offset in offsets {
-                            let state =
-                                unsafe { &mut *base.add(state_offset).cast::<DecimalSumState>() };
+                    if let DirectDecimalSums::Wide(updates) = &source.sums {
+                        for update in updates {
+                            let state = unsafe {
+                                &mut *base.add(update.state_offset).cast::<DecimalSumState>()
+                            };
                             state.add_direct_i256(sum);
                         }
                     }
-                    for &state_offset in &source.averages {
-                        let state =
-                            unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
+                    for update in &source.averages {
+                        let state = unsafe {
+                            &mut *base.add(update.state_offset).cast::<DecimalAverageState>()
+                        };
                         state.update_direct_i256(sum, row_count as u64);
                     }
                 }
@@ -862,6 +1053,9 @@ impl DirectGroupedAggregateProgram {
             for (source_idx, source) in self.decimal_inputs.iter().enumerate() {
                 let source_scratch =
                     unsafe { scratch.decimal_sources.get_unchecked_mut(source_idx) };
+                if inputs.is_constant_zero(source_idx) {
+                    continue;
+                }
                 let source_overflowed = match (source.width, source_scratch) {
                     (DirectDecimalWidth::I64, DirectDecimalScratch::I64 { primary, .. }) => {
                         let value =
@@ -895,8 +1089,8 @@ impl DirectGroupedAggregateProgram {
         widths: &[ReducedDecimalWidth],
     ) {
         let row_count = scratch.row_counts[slot];
-        for &state_offset in &self.count_star_offsets {
-            unsafe { *base.add(state_offset).cast::<i64>() += row_count as i64 };
+        for update in &self.count_star_updates {
+            unsafe { *base.add(update.state_offset).cast::<i64>() += row_count as i64 };
         }
         for (source_idx, source) in self.decimal_inputs.iter().enumerate() {
             match widths[source_idx] {
@@ -907,17 +1101,18 @@ impl DirectGroupedAggregateProgram {
                         unreachable!("i64 reduction has non-i64 scratch")
                     };
                     let value = primary[slot];
-                    if let DirectDecimalSums::Narrow(offsets) = &source.sums {
-                        for &state_offset in offsets {
+                    if let DirectDecimalSums::Narrow(updates) = &source.sums {
+                        for update in updates {
                             let state = unsafe {
-                                &mut *base.add(state_offset).cast::<DecimalNarrowState>()
+                                &mut *base.add(update.state_offset).cast::<DecimalNarrowState>()
                             };
                             state.add_i64(value);
                         }
                     }
-                    for &state_offset in &source.averages {
-                        let state =
-                            unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
+                    for update in &source.averages {
+                        let state = unsafe {
+                            &mut *base.add(update.state_offset).cast::<DecimalAverageState>()
+                        };
                         state.update_direct_i64_sum(value, row_count as u64);
                     }
                     primary[slot] = 0;
@@ -936,27 +1131,28 @@ impl DirectGroupedAggregateProgram {
                         }
                     };
                     match &source.sums {
-                        DirectDecimalSums::Narrow(offsets) => {
-                            for &state_offset in offsets {
+                        DirectDecimalSums::Narrow(updates) => {
+                            for update in updates {
                                 let state = unsafe {
-                                    &mut *base.add(state_offset).cast::<DecimalNarrowState>()
+                                    &mut *base.add(update.state_offset).cast::<DecimalNarrowState>()
                                 };
                                 state.add_direct_i128(value);
                             }
                         }
-                        DirectDecimalSums::Wide(offsets) => {
-                            for &state_offset in offsets {
+                        DirectDecimalSums::Wide(updates) => {
+                            for update in updates {
                                 let state = unsafe {
-                                    &mut *base.add(state_offset).cast::<DecimalSumState>()
+                                    &mut *base.add(update.state_offset).cast::<DecimalSumState>()
                                 };
                                 state.add_direct_i128(value);
                             }
                         }
                         DirectDecimalSums::None => {}
                     }
-                    for &state_offset in &source.averages {
-                        let state =
-                            unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
+                    for update in &source.averages {
+                        let state = unsafe {
+                            &mut *base.add(update.state_offset).cast::<DecimalAverageState>()
+                        };
                         state.update_direct_i128(value, row_count as u64);
                     }
                 }
@@ -967,16 +1163,18 @@ impl DirectGroupedAggregateProgram {
                         unreachable!("i256 reduction has non-i128 scratch")
                     };
                     let value = fallback[slot];
-                    if let DirectDecimalSums::Wide(offsets) = &source.sums {
-                        for &state_offset in offsets {
-                            let state =
-                                unsafe { &mut *base.add(state_offset).cast::<DecimalSumState>() };
+                    if let DirectDecimalSums::Wide(updates) = &source.sums {
+                        for update in updates {
+                            let state = unsafe {
+                                &mut *base.add(update.state_offset).cast::<DecimalSumState>()
+                            };
                             state.add_direct_i256(value);
                         }
                     }
-                    for &state_offset in &source.averages {
-                        let state =
-                            unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
+                    for update in &source.averages {
+                        let state = unsafe {
+                            &mut *base.add(update.state_offset).cast::<DecimalAverageState>()
+                        };
                         state.update_direct_i256(value, row_count as u64);
                     }
                     fallback[slot] = i256::ZERO;
@@ -989,6 +1187,7 @@ impl DirectGroupedAggregateProgram {
     fn prepare_inputs<'a>(
         &self,
         payload: &'a Chunk,
+        allow_nulls: bool,
     ) -> Option<PreparedDirectGroupedAggregateInput<'a>> {
         let mut decoded = SmallVec::<[(DecodedVectorRef<'a>, DirectDecimalWidth); 8]>::new();
         for source in &self.decimal_inputs {
@@ -1004,12 +1203,26 @@ impl DirectGroupedAggregateProgram {
                 return None;
             }
             let input = vector.try_decode_ref(payload.size()).ok()?;
-            if !input.validity().all_valid() || !matches!(input.data(), DataRef::Ptr(_)) {
+            if (!allow_nulls && !input.validity().all_valid())
+                || !matches!(input.data(), DataRef::Ptr(_))
+            {
                 return None;
             }
             decoded.push((input, width));
         }
-        Some(PreparedDirectGroupedAggregateInput::new(decoded))
+        let mut filters = SmallVec::<[DecodedVectorRef<'a>; 8]>::new();
+        for &filter_index in &self.filter_inputs {
+            let vector = payload.column(filter_index)?;
+            if vector.logical_type() != &LogicalType::Boolean {
+                return None;
+            }
+            let input = vector.try_decode_ref(payload.size()).ok()?;
+            if !matches!(input.data(), DataRef::Ptr(_)) {
+                return None;
+            }
+            filters.push(input);
+        }
+        Some(PreparedDirectGroupedAggregateInput::new(decoded, filters))
     }
 }
 
@@ -1024,16 +1237,27 @@ struct PreparedDecimalInput<'a> {
     data: PreparedDecimalData,
     direct: bool,
     uses_shared_selection: bool,
+    constant_zero: bool,
+}
+
+struct PreparedFilterInput<'a> {
+    decoded: DecodedVectorRef<'a>,
+    data: *const bool,
+    direct: bool,
 }
 
 pub struct PreparedDirectGroupedAggregateInput<'a> {
     inputs: SmallVec<[PreparedDecimalInput<'a>; 8]>,
+    filters: SmallVec<[PreparedFilterInput<'a>; 8]>,
     shared_selection_input: Option<usize>,
     shared_selection_data: *const u32,
 }
 
 impl<'a> PreparedDirectGroupedAggregateInput<'a> {
-    fn new(decoded: SmallVec<[(DecodedVectorRef<'a>, DirectDecimalWidth); 8]>) -> Self {
+    fn new(
+        decoded: SmallVec<[(DecodedVectorRef<'a>, DirectDecimalWidth); 8]>,
+        filters: SmallVec<[DecodedVectorRef<'a>; 8]>,
+    ) -> Self {
         let shared_identity = decoded
             .iter()
             .find_map(|(input, _)| input.sel().allocation_identity());
@@ -1044,24 +1268,39 @@ impl<'a> PreparedDirectGroupedAggregateInput<'a> {
         });
         let inputs: SmallVec<[PreparedDecimalInput<'a>; 8]> = decoded
             .into_iter()
-            .map(|(decoded, width)| PreparedDecimalInput {
-                data: match width {
+            .map(|(decoded, width)| {
+                let data = match width {
                     DirectDecimalWidth::I64 => PreparedDecimalData::I64(decoded.get_data::<i64>()),
                     DirectDecimalWidth::I128 => {
                         PreparedDecimalData::I128(decoded.get_data::<i128>())
                     }
-                },
-                direct: matches!(decoded.sel(), SelectionRef::Incremental { .. }),
-                uses_shared_selection: shared_identity
-                    .is_some_and(|identity| decoded.sel().allocation_identity() == Some(identity)),
-                decoded,
+                };
+                let constant_zero = decoded_decimal_is_constant_zero(&decoded, data);
+                PreparedDecimalInput {
+                    data,
+                    direct: matches!(decoded.sel(), SelectionRef::Incremental { .. }),
+                    uses_shared_selection: shared_identity.is_some_and(|identity| {
+                        decoded.sel().allocation_identity() == Some(identity)
+                    }),
+                    constant_zero,
+                    decoded,
+                }
             })
             .collect();
         let shared_selection_data = shared_selection_input
             .and_then(|input| decoded_selection_data(&inputs[input].decoded))
             .unwrap_or(std::ptr::null());
+        let filters = filters
+            .into_iter()
+            .map(|decoded| PreparedFilterInput {
+                data: decoded.get_data::<bool>(),
+                direct: matches!(decoded.sel(), SelectionRef::Incremental { .. }),
+                decoded,
+            })
+            .collect();
         Self {
             inputs,
+            filters,
             shared_selection_input,
             shared_selection_data,
         }
@@ -1100,6 +1339,33 @@ impl<'a> PreparedDirectGroupedAggregateInput<'a> {
         }
     }
 
+    #[inline(always)]
+    fn is_valid(&self, source: usize, row: usize, shared_physical_row: usize) -> bool {
+        let input = unsafe { self.inputs.get_unchecked(source) };
+        let physical_row = unsafe { self.physical_row(input, row, shared_physical_row) };
+        input.decoded.validity().is_valid(physical_row)
+    }
+
+    #[inline(always)]
+    fn is_constant_zero(&self, source: usize) -> bool {
+        unsafe { self.inputs.get_unchecked(source).constant_zero }
+    }
+
+    #[inline(always)]
+    fn filter_passes(&self, filter_slot: Option<usize>, row: usize) -> bool {
+        let Some(filter_slot) = filter_slot else {
+            return true;
+        };
+        let filter = unsafe { self.filters.get_unchecked(filter_slot) };
+        let physical_row = if filter.direct {
+            row
+        } else {
+            filter.decoded.physical_index(row)
+        };
+        filter.decoded.validity().is_valid(physical_row)
+            && unsafe { *filter.data.add(physical_row) }
+    }
+
     /// # Safety
     ///
     /// The prepared source must be an i64 DECIMAL and all row indices must be
@@ -1129,10 +1395,27 @@ impl<'a> PreparedDirectGroupedAggregateInput<'a> {
     }
 }
 
+fn decoded_decimal_is_constant_zero(
+    decoded: &DecodedVectorRef<'_>,
+    data: PreparedDecimalData,
+) -> bool {
+    let SelectionRef::Constant { index, .. } = decoded.sel() else {
+        return false;
+    };
+    if !decoded.validity().is_valid(*index) {
+        return false;
+    }
+    match data {
+        PreparedDecimalData::I64(data) => unsafe { *data.add(*index) == 0 },
+        PreparedDecimalData::I128(data) => unsafe { *data.add(*index) == 0 },
+    }
+}
+
 struct FixedReductionInputs<const N: usize> {
     input_data: [*const u8; N],
     scratch_data: [*mut u8; N],
     direct_mask: u8,
+    constant_zero_mask: u8,
     shared_selection: *const u32,
 }
 
@@ -1204,6 +1487,7 @@ fn prepare_fixed_reduction<const N: usize, const WIDTH_MASK: u8>(
     let mut input_data = [std::ptr::null(); N];
     let mut scratch_data = [std::ptr::null_mut(); N];
     let mut direct_mask = 0_u8;
+    let mut constant_zero_mask = 0_u8;
     for source_idx in 0..N {
         let input = &inputs.inputs[source_idx];
         let expects_i128 = WIDTH_MASK & (1_u8 << source_idx) != 0;
@@ -1226,6 +1510,9 @@ fn prepare_fixed_reduction<const N: usize, const WIDTH_MASK: u8>(
         } else if !input.uses_shared_selection {
             return None;
         }
+        if input.constant_zero {
+            constant_zero_mask |= 1_u8 << source_idx;
+        }
     }
     if direct_mask != ((1_u16 << N) - 1) as u8 && inputs.shared_selection_data.is_null() {
         return None;
@@ -1234,6 +1521,7 @@ fn prepare_fixed_reduction<const N: usize, const WIDTH_MASK: u8>(
         input_data,
         scratch_data,
         direct_mask,
+        constant_zero_mask,
         shared_selection: inputs.shared_selection_data,
     })
 }
@@ -1258,6 +1546,9 @@ fn reduce_fixed_inputs<const N: usize, const WIDTH_MASK: u8, S: DirectGroupSlotS
             unsafe { *prepared.shared_selection.add(row) as usize }
         };
         for source_idx in 0..N {
+            if prepared.constant_zero_mask & (1_u8 << source_idx) != 0 {
+                continue;
+            }
             let physical_row = if prepared.direct_mask & (1_u8 << source_idx) != 0 {
                 row
             } else {
@@ -1302,11 +1593,15 @@ fn clear_reduced_source(
     traversal: ReducedSlotTraversal,
 ) {
     let mut clear_slot = |slot: usize| match source {
-        DirectDecimalScratch::I64 { primary, fallback } => {
+        DirectDecimalScratch::I64 {
+            primary, fallback, ..
+        } => {
             primary[slot] = 0;
             fallback[slot] = 0;
         }
-        DirectDecimalScratch::I128 { primary, fallback } => {
+        DirectDecimalScratch::I128 {
+            primary, fallback, ..
+        } => {
             primary[slot] = 0;
             fallback[slot] = i256::ZERO;
         }

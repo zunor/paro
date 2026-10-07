@@ -72,6 +72,201 @@ fn lookup_entries_only_pay_for_inline_keys_when_supported() {
 }
 
 #[test]
+fn compact_prepared_keys_match_independent_scalar_encoding() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let rows = 16;
+    let values = [
+        (LogicalType::TinyInt, Value::TinyInt(-17)),
+        (LogicalType::UTinyInt, Value::UTinyInt(241)),
+        (LogicalType::SmallInt, Value::SmallInt(-12345)),
+        (LogicalType::USmallInt, Value::USmallInt(54321)),
+        (LogicalType::Integer, Value::Integer(i32::MIN)),
+        (LogicalType::UInteger, Value::UInteger(u32::MAX)),
+        (LogicalType::BigInt, Value::BigInt(i64::MIN)),
+        (LogicalType::UBigInt, Value::UBigInt(u64::MAX)),
+    ];
+    let mut vectors = values
+        .iter()
+        .map(|(ty, value)| {
+            let mut vector =
+                Vector::try_constant_from_value(ty.clone(), value.clone(), rows, allocator.clone())
+                    .unwrap();
+            vector.try_flatten().unwrap();
+            vector.try_set_null(3, true).unwrap();
+            vector.try_set_null(9, true).unwrap();
+            Arc::new(vector)
+        })
+        .collect::<Vec<_>>();
+    vectors.push(Arc::new(
+        Vector::try_sequence(-9, 3, rows, allocator.clone()).unwrap(),
+    ));
+    vectors.push(Arc::new(
+        Vector::try_constant(LogicalType::BigInt, -99_i64, rows, allocator.clone()).unwrap(),
+    ));
+    // Widths exercise both single and composite packed keys, with constants,
+    // flat vectors, sequences, repeated and nested dictionary selections.
+    for indices in [
+        vec![0, 1, 2, 3],
+        vec![4, 5],
+        vec![6],
+        vec![7],
+        vec![8],
+        vec![9],
+    ] {
+        for nesting in 0..3 {
+            let columns = indices
+                .iter()
+                .map(|&index| {
+                    let mut column = vectors[index].clone();
+                    for _ in 0..nesting {
+                        let selection = SelectionVector::try_from_indices(
+                            (0..rows).map(|i| ((i * 3) % rows) as u32).collect(),
+                            allocator.clone(),
+                        )
+                        .unwrap();
+                        column = Arc::new(Vector::try_dictionary(column, selection).unwrap());
+                    }
+                    column
+                })
+                .collect::<Vec<_>>();
+            let types = columns
+                .iter()
+                .map(|col| col.logical_type().clone())
+                .collect::<Vec<_>>();
+            let groups = Chunk::from_arc_vectors(columns, allocator.clone());
+            let table =
+                GroupedAggregateHashTable::new(types.clone(), vec![], vec![], allocator.clone())
+                    .unwrap();
+            let prepared = table.layout.prepare_scatter(&groups).unwrap();
+            let scalar = InlineKeyLayout::try_new(&types).unwrap();
+            for row in 0..rows {
+                let mut bytes = [0xcc; INLINE_KEY_MAX_BYTES];
+                let null_mask = prepared.copy_fixed_key(row, &mut bytes).unwrap();
+                assert_eq!(
+                    InlineKey {
+                        bits: u64::from_le_bytes(bytes),
+                        null_mask
+                    },
+                    scalar.encode_row(&groups, row).unwrap()
+                );
+            }
+            assert_eq!(prepared.out_of_line_bytes_upper_bound(None).unwrap(), 0);
+            assert!(prepared
+                .out_of_line_bytes_upper_bound(Some(&[rows as u32]))
+                .is_err());
+        }
+    }
+}
+
+#[test]
+fn growth_is_fully_precharged_before_the_table_owner_is_entered() {
+    let pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let owner: Arc<dyn MemoryOwner> = pool.clone();
+    let memory = MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::Revocable,
+    );
+    let mut table = GroupedAggregateHashTable::new_with_memory(
+        vec![LogicalType::Integer],
+        Vec::new(),
+        Vec::new(),
+        paro_common::test_utils::test_allocator(),
+        memory.clone(),
+    )
+    .expect("table");
+    let requirement = table.growth_requirement(32, 0).expect("growth requirement");
+    let reservation = memory
+        .with_class(MemoryAccountingClass::Metadata)
+        .reserve_grant(
+            requirement
+                .persistent_bytes
+                .checked_add(requirement.overlap_bytes)
+                .expect("bounded growth reservation"),
+        )
+        .expect("precharge transition");
+    table
+        .prepare_growth(32, 0, &reservation)
+        .expect("transfer persistent grant");
+
+    // Leave no unissued query capacity. The physical Vec reallocations can
+    // succeed only from grants transferred by prepare_growth; an owner call
+    // from inside the table transition would fail here.
+    pool.set_capacity_bytes(pool.issued_bytes());
+    table
+        .reserve_for_insertions(32)
+        .expect("prepared growth must not re-enter query reclaim");
+
+    assert!(table.capacity() >= 64);
+}
+
+#[test]
+fn varlen_group_transition_is_precharged_before_table_update() {
+    let pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let owner: Arc<dyn MemoryOwner> = pool.clone();
+    let memory = MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::Revocable,
+    );
+    let allocator = paro_common::test_utils::test_allocator();
+    let values = (0..32)
+        .map(|index| format!("long-group-value-{index:04}-payload"))
+        .collect::<Vec<_>>();
+    let value_refs = values.iter().map(String::as_str).collect::<Vec<_>>();
+    let groups = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_string_vector_with_allocator(
+                &value_refs,
+                allocator.clone(),
+            ),
+        )],
+        allocator.clone(),
+    );
+    let hashes = hash_group_columns(&groups).expect("group hashes");
+    let mut table = GroupedAggregateHashTable::new_with_memory(
+        vec![LogicalType::Varchar],
+        Vec::new(),
+        Vec::new(),
+        allocator,
+        memory.clone(),
+    )
+    .expect("table");
+    let varlen_bytes = table
+        .varlen_bytes_upper_bound(&groups, None)
+        .expect("varlen transition upper");
+    let requirement = table
+        .growth_requirement(groups.size(), varlen_bytes)
+        .expect("complete growth requirement");
+    let reservation = memory
+        .with_class(MemoryAccountingClass::Metadata)
+        .reserve_grant(
+            requirement
+                .persistent_bytes
+                .checked_add(requirement.overlap_bytes)
+                .expect("bounded transition reservation"),
+        )
+        .expect("precharge complete transition");
+    table
+        .prepare_growth(groups.size(), varlen_bytes, &reservation)
+        .expect("transfer complete transition");
+
+    pool.set_capacity_bytes(pool.issued_bytes());
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
+    table
+        .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+        .expect("precharged varlen insertion must not reacquire query capacity");
+
+    assert_eq!(table.count(), groups.size());
+    assert!(table.varlen_heap.capacity() >= varlen_bytes);
+    assert!(table.varlen_heap.dedup_cache_memory_usage() > 0);
+}
+
+#[test]
 fn dictionary_varlen_groups_share_owned_heap_bytes() {
     let allocator = paro_common::test_utils::test_allocator();
     let value = "shared-dictionary-group-value";
@@ -188,10 +383,9 @@ fn make_sum_object() -> AggregateObject {
     );
     let bound = AggregateExpression::new(
         function,
-        vec![Expression::Reference(ReferenceExpression::new(
-            0,
-            LogicalType::BigInt,
-        ))],
+        vec![Expression::Reference(
+            ReferenceExpression::new(0, LogicalType::BigInt).into(),
+        )],
         LogicalType::BigInt,
     )
     .with_aggr_type(AggregateType::NonDistinct);
@@ -242,6 +436,102 @@ fn build_map_from_scan(rows: Vec<Vec<Value>>) -> HashMap<i32, i64> {
     result
 }
 
+fn sum_table(groups: &[i32], values: &[i64]) -> GroupedAggregateHashTable {
+    let allocator = paro_common::test_utils::test_allocator();
+    sum_table_with_allocator(groups, values, allocator)
+}
+
+fn sum_table_with_allocator(
+    groups: &[i32],
+    values: &[i64],
+    allocator: Arc<dyn Allocator>,
+) -> GroupedAggregateHashTable {
+    sum_table_with_memory(groups, values, allocator, detached_table_memory())
+}
+
+fn sum_table_with_memory(
+    groups: &[i32],
+    values: &[i64],
+    allocator: Arc<dyn Allocator>,
+    memory: MemoryAccountingContext,
+) -> GroupedAggregateHashTable {
+    assert_eq!(groups.len(), values.len());
+    let mut table = GroupedAggregateHashTable::new_with_memory(
+        vec![LogicalType::Integer],
+        vec![make_sum_object()],
+        vec![vec![0]],
+        allocator.clone(),
+        memory,
+    )
+    .expect("sum table");
+    let groups = Chunk::from_vectors(
+        vec![paro_common::test_utils::test_i32_vector_with_allocator(
+            groups,
+            allocator.clone(),
+        )],
+        allocator.clone(),
+    );
+    let hashes = table.hash_groups(&groups).expect("sum table hashes");
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
+    table
+        .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+        .expect("sum table find/create");
+    let payload = Chunk::from_vectors(
+        vec![paro_common::test_utils::test_i64_vector_with_allocator(
+            values, allocator,
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    table
+        .update_aggregates(&payload, &addresses, None)
+        .expect("sum table update");
+    table
+}
+
+fn count_table(groups: &[i32]) -> GroupedAggregateHashTable {
+    let allocator = paro_common::test_utils::test_allocator();
+    let function = get_count_star_function();
+    let object = AggregateObject {
+        payload_size: function.state_size,
+        function,
+        bind_info: None,
+        child_count: 0,
+        aggr_type: AggregateType::NonDistinct,
+        return_type: LogicalType::BigInt,
+        filter: None,
+        order_bys: Vec::new(),
+    };
+    let mut table = GroupedAggregateHashTable::new(
+        vec![LogicalType::Integer],
+        vec![object],
+        vec![Vec::new()],
+        allocator.clone(),
+    )
+    .expect("count table");
+    let groups = Chunk::from_vectors(
+        vec![paro_common::test_utils::test_i32_vector_with_allocator(
+            groups, allocator,
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    let hashes = table.hash_groups(&groups).expect("count table hashes");
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
+    table
+        .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+        .expect("count table find/create");
+    unsafe {
+        let states = addresses.flat_data::<*mut u8>();
+        for row in 0..groups.size() {
+            *(*states.add(row)).cast::<i64>() += 1;
+        }
+    }
+    table
+}
+
 #[test]
 fn grouped_hash_table_find_create_and_update() {
     let mut table = GroupedAggregateHashTable::with_capacity(
@@ -286,6 +576,475 @@ fn grouped_hash_table_find_create_and_update() {
     let actual = build_map_from_scan(collect_scan_rows(&mut table));
     let expected = HashMap::from([(1, 15), (2, 28), (3, 7)]);
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn correlated_hash_prefix_falls_back_to_full_key_without_changing_results() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let row_count = 192usize;
+    let leading = vec![7i32; row_count];
+    let suffix = (0..row_count)
+        .map(|row| ((row * 37) % 80) as i32)
+        .collect::<Vec<_>>();
+    let values = (0..row_count).map(|row| row as i64 + 1).collect::<Vec<_>>();
+    let groups = Chunk::from_vectors(
+        vec![
+            paro_common::test_utils::test_i32_vector_with_allocator(&leading, allocator.clone()),
+            paro_common::test_utils::test_i32_vector_with_allocator(&suffix, allocator.clone()),
+        ],
+        allocator.clone(),
+    );
+    let payload = Chunk::from_vectors(
+        vec![paro_common::test_utils::test_i64_vector_with_allocator(
+            &values,
+            allocator.clone(),
+        )],
+        allocator.clone(),
+    );
+
+    let build = |lookup_width: usize| {
+        let hash_contract =
+            AggregateHashContract::try_new(2, lookup_width).expect("aggregate hash contract");
+        GroupedAggregateHashTable::new_configured(
+            vec![LogicalType::Integer, LogicalType::Integer],
+            vec![make_sum_object()],
+            vec![vec![0]],
+            allocator.clone(),
+            detached_table_memory(),
+            GroupedAggregateHashTableConfig::fixed(hash_contract, 8),
+        )
+        .expect("group table")
+    };
+    let mut adaptive = build(1);
+    let mut full = build(2);
+
+    let prefix_hashes = adaptive.hash_groups(&groups).expect("prefix hashes");
+    assert!(prefix_hashes
+        .as_slice::<u64>()
+        .windows(2)
+        .all(|pair| pair[0] == pair[1]));
+    let complete_hashes = full.hash_groups(&groups).expect("complete hashes");
+    assert!(complete_hashes
+        .as_slice::<u64>()
+        .windows(2)
+        .any(|pair| pair[0] != pair[1]));
+
+    for table in [&mut adaptive, &mut full] {
+        let hashes = table.hash_groups(&groups).expect("group hashes");
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, row_count);
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(row_count);
+        table
+            .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+            .expect("find/create groups");
+        table
+            .update_aggregates(&payload, &addresses, None)
+            .expect("update aggregates");
+    }
+
+    assert_eq!(adaptive.routing_hash_contract().width(), 2);
+    assert_eq!(adaptive.lookup_hash_contract().width(), 2);
+    let stats = adaptive.take_hash_runtime_stats();
+    assert_eq!(stats.full_key_fallback_count, 1);
+    assert!(stats.max_prefix_probe_distance >= MAX_PREFIX_PROBE_DISTANCE as u64);
+
+    // The second lookup is hashed under the promoted contract and must find
+    // every existing group rather than splitting state across hash modes.
+    let promoted_hashes = adaptive.hash_groups(&groups).expect("promoted hashes");
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, row_count);
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(row_count);
+    assert_eq!(
+        adaptive
+            .find_or_create_groups(&groups, &promoted_hashes, &mut addresses, &mut new_groups,)
+            .expect("probe promoted table"),
+        0
+    );
+
+    let collect = |table: &mut GroupedAggregateHashTable| {
+        collect_scan_rows(table)
+            .into_iter()
+            .map(|row| {
+                let [Value::Integer(left), Value::Integer(right), Value::BigInt(sum)] =
+                    row.as_slice()
+                else {
+                    panic!("unexpected aggregate row: {row:?}");
+                };
+                ((*left, *right), *sum)
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    assert_eq!(collect(&mut adaptive), collect(&mut full));
+}
+
+#[test]
+fn varlen_prefix_fallback_rebuilds_from_canonical_rows() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let row_count = 80usize;
+    let leading = vec!["shared out-of-line prefix value"; row_count];
+    let suffixes = (0..row_count)
+        .map(|row| format!("out-of-line suffix value number {row:04}"))
+        .collect::<Vec<_>>();
+    let suffix_refs = suffixes.iter().map(String::as_str).collect::<Vec<_>>();
+    let groups = Chunk::from_vectors(
+        vec![
+            paro_common::test_utils::test_string_vector_with_allocator(&leading, allocator.clone()),
+            paro_common::test_utils::test_string_vector_with_allocator(
+                &suffix_refs,
+                allocator.clone(),
+            ),
+        ],
+        allocator.clone(),
+    );
+    let contract = AggregateHashContract::try_new(2, 1).expect("hash contract");
+    let mut table = GroupedAggregateHashTable::new_configured(
+        vec![LogicalType::Varchar, LogicalType::Varchar],
+        Vec::new(),
+        Vec::new(),
+        allocator,
+        detached_table_memory(),
+        GroupedAggregateHashTableConfig::fixed(contract, 8),
+    )
+    .expect("varlen prefix table");
+
+    let prefix_hashes = table.hash_groups(&groups).expect("prefix hashes");
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, row_count);
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(row_count);
+    assert_eq!(
+        table
+            .find_or_create_groups(&groups, &prefix_hashes, &mut addresses, &mut new_groups)
+            .expect("insert varlen groups"),
+        row_count
+    );
+    assert_eq!(table.lookup_hash_contract().width(), 2);
+    assert_eq!(table.take_hash_runtime_stats().full_key_fallback_count, 1);
+
+    let full_hashes = table.hash_groups(&groups).expect("promoted hashes");
+    assert_eq!(
+        table
+            .find_or_create_groups(&groups, &full_hashes, &mut addresses, &mut new_groups)
+            .expect("reprobe varlen groups"),
+        0
+    );
+    assert_eq!(table.count(), row_count);
+}
+
+#[test]
+fn merge_accepts_independently_promoted_lookup_contracts() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let build = || {
+        let contract = AggregateHashContract::try_new(2, 1).expect("hash contract");
+        GroupedAggregateHashTable::new_configured(
+            vec![LogicalType::Integer, LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            allocator.clone(),
+            detached_table_memory(),
+            GroupedAggregateHashTableConfig::fixed(contract, 8),
+        )
+        .expect("prefix table")
+    };
+    let insert = |table: &mut GroupedAggregateHashTable, suffixes: &[i32]| {
+        let groups = Chunk::from_vectors(
+            vec![
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    &vec![9; suffixes.len()],
+                    allocator.clone(),
+                ),
+                paro_common::test_utils::test_i32_vector_with_allocator(
+                    suffixes,
+                    allocator.clone(),
+                ),
+            ],
+            allocator.clone(),
+        );
+        let hashes = table.hash_groups(&groups).expect("group hashes");
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, suffixes.len());
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(suffixes.len());
+        table
+            .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+            .expect("insert groups");
+    };
+
+    let mut target = build();
+    insert(&mut target, &(0..8).collect::<Vec<_>>());
+    assert_eq!(target.lookup_hash_contract().width(), 1);
+
+    let mut promoted_source = build();
+    insert(&mut promoted_source, &(0..80).collect::<Vec<_>>());
+    assert_eq!(promoted_source.lookup_hash_contract().width(), 2);
+    target
+        .combine(&mut promoted_source)
+        .expect("merge promoted source");
+    assert_eq!(target.count(), 80);
+    assert_eq!(target.lookup_hash_contract().width(), 2);
+
+    let mut prefix_source = build();
+    insert(&mut prefix_source, &(70..90).collect::<Vec<_>>());
+    assert_eq!(prefix_source.lookup_hash_contract().width(), 1);
+    target
+        .combine(&mut prefix_source)
+        .expect("merge prefix source");
+    assert_eq!(target.count(), 90);
+    let merge_stats = target.take_hash_runtime_stats();
+    assert_eq!(
+        merge_stats.full_key_fallback_count, 2,
+        "one fallback belongs to the source and one to the target during merge"
+    );
+    assert!(merge_stats.max_prefix_probe_distance >= MAX_PREFIX_PROBE_DISTANCE as u64);
+}
+
+#[test]
+fn bulk_merge_transfers_source_fallback_observation() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let build = |lookup_width: usize| {
+        let contract = AggregateHashContract::try_new(2, lookup_width).expect("hash contract");
+        GroupedAggregateHashTable::new_configured(
+            vec![LogicalType::Integer, LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            allocator.clone(),
+            detached_table_memory(),
+            GroupedAggregateHashTableConfig::fixed(contract, 8),
+        )
+        .expect("group table")
+    };
+    let mut target = build(2);
+    let mut source = build(1);
+    let row_count = 80usize;
+    let groups = Chunk::from_vectors(
+        vec![
+            paro_common::test_utils::test_i32_vector_with_allocator(
+                &vec![17; row_count],
+                allocator.clone(),
+            ),
+            paro_common::test_utils::test_i32_vector_with_allocator(
+                &(0..row_count as i32).collect::<Vec<_>>(),
+                allocator.clone(),
+            ),
+        ],
+        paro_common::test_utils::test_allocator(),
+    );
+    let hashes = source.hash_groups(&groups).expect("prefix hashes");
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, row_count);
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(row_count);
+    source
+        .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+        .expect("build promoted source");
+    assert_eq!(source.take_hash_runtime_stats().full_key_fallback_count, 1);
+
+    // Recreate the observation after proving it belongs to the source alone.
+    let mut source = build(1);
+    let hashes = source.hash_groups(&groups).expect("prefix hashes");
+    source
+        .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+        .expect("build promoted source");
+    target
+        .combine_many(std::slice::from_mut(&mut source))
+        .expect("bulk merge source");
+
+    let stats = target.take_hash_runtime_stats();
+    assert_eq!(stats.full_key_fallback_count, 1);
+    assert!(stats.max_prefix_probe_distance >= MAX_PREFIX_PROBE_DISTANCE as u64);
+    assert_eq!(source.take_hash_runtime_stats(), Default::default());
+}
+
+#[test]
+fn state_spill_scan_emits_immutable_full_key_routing_hash() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let row_count = 80usize;
+    let leading = vec![5i32; row_count];
+    let suffix = (0..row_count).map(|row| row as i32).collect::<Vec<_>>();
+    let groups = Chunk::from_vectors(
+        vec![
+            paro_common::test_utils::test_i32_vector_with_allocator(&leading, allocator.clone()),
+            paro_common::test_utils::test_i32_vector_with_allocator(&suffix, allocator.clone()),
+        ],
+        allocator.clone(),
+    );
+    let full_hashes = hash_group_columns(&groups).expect("full hashes");
+    let expected = suffix
+        .iter()
+        .copied()
+        .zip(full_hashes.as_slice::<u64>().iter().copied())
+        .collect::<HashMap<_, _>>();
+    let contract = AggregateHashContract::try_new(2, 1).expect("hash contract");
+    let mut table = GroupedAggregateHashTable::new_configured(
+        vec![LogicalType::Integer, LogicalType::Integer],
+        Vec::new(),
+        Vec::new(),
+        allocator.clone(),
+        detached_table_memory(),
+        GroupedAggregateHashTableConfig::fixed(contract, 8),
+    )
+    .expect("prefix table");
+    let prefix_hashes = table.hash_groups(&groups).expect("prefix hashes");
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, row_count);
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(row_count);
+    table
+        .find_or_create_groups(&groups, &prefix_hashes, &mut addresses, &mut new_groups)
+        .expect("insert groups");
+    assert_eq!(table.lookup_hash_contract().width(), 2);
+
+    let mut output = Chunk::try_initialize(
+        &[
+            LogicalType::UBigInt,
+            LogicalType::Integer,
+            LogicalType::Integer,
+            LogicalType::Blob,
+        ],
+        17,
+        allocator,
+    )
+    .expect("state scan output");
+    let mut position = HTScanPosition::default();
+    let mut seen = 0usize;
+    while table
+        .scan_state_rows(&mut position, &mut output)
+        .expect("scan state rows")
+    {
+        for row in 0..output.size() {
+            let Value::UBigInt(hash) = output.column(0).expect("hash column").get_value(row) else {
+                panic!("unexpected state hash value");
+            };
+            let Value::Integer(key) = output.column(2).expect("suffix column").get_value(row)
+            else {
+                panic!("unexpected suffix value");
+            };
+            assert_eq!(Some(&hash), expected.get(&key));
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, row_count);
+
+    let replay_contract = AggregateHashContract::try_new(2, 1).expect("replay contract");
+    let mut replay = GroupedAggregateHashTable::new_configured(
+        vec![LogicalType::Integer, LogicalType::Integer],
+        Vec::new(),
+        Vec::new(),
+        groups.allocator().clone(),
+        detached_table_memory(),
+        GroupedAggregateHashTableConfig::fixed(replay_contract, 8),
+    )
+    .expect("replay table");
+    replay
+        .find_or_create_groups_with_routing_hashes(
+            &groups,
+            &full_hashes,
+            &mut addresses,
+            &mut new_groups,
+        )
+        .expect("replay full routing hashes");
+    assert_eq!(replay.count(), row_count);
+    assert_eq!(
+        replay.take_hash_runtime_stats().full_key_fallback_count,
+        1,
+        "finish-time telemetry drain must see fallback triggered during replay"
+    );
+}
+
+#[test]
+fn adaptive_integer_groups_preserve_canonical_fallback() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let mut table = GroupedAggregateHashTable::new(
+        vec![LogicalType::Integer],
+        vec![make_sum_object()],
+        vec![vec![0]],
+        allocator.clone(),
+    )
+    .expect("adaptive integer table");
+
+    let update_batch = |table: &mut GroupedAggregateHashTable,
+                        group_values: &[i32],
+                        payload_values: &[i64],
+                        expect_adaptive: bool| {
+        let groups = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                group_values,
+                allocator.clone(),
+            )],
+            allocator.clone(),
+        );
+        let payload = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                payload_values,
+                allocator.clone(),
+            )],
+            allocator.clone(),
+        );
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
+        let used_adaptive = table
+            .try_find_or_create_adaptive_integer_groups(&groups, &mut addresses, &mut new_groups)
+            .expect("adaptive lookup");
+        assert_eq!(used_adaptive, expect_adaptive);
+        if !used_adaptive {
+            let hashes = table.hash_groups(&groups).expect("fallback hashes");
+            table
+                .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+                .expect("canonical fallback");
+        }
+        table
+            .update_aggregates(&payload, &addresses, None)
+            .expect("aggregate update");
+    };
+
+    update_batch(&mut table, &[1, 2, 1, 3], &[10, 20, 5, 7], true);
+    assert!(matches!(
+        table.adaptive_integer_index,
+        AdaptiveIntegerGroupIndexState::Active(_)
+    ));
+    update_batch(&mut table, &[2, 10_000, 1], &[8, 11, 4], false);
+    assert!(matches!(
+        table.adaptive_integer_index,
+        AdaptiveIntegerGroupIndexState::Disabled
+    ));
+    update_batch(&mut table, &[10_000, 2], &[9, 3], false);
+
+    let actual = build_map_from_scan(collect_scan_rows(&mut table));
+    let expected = HashMap::from([(1, 19), (2, 31), (3, 7), (10_000, 20)]);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn adaptive_integer_groups_expand_and_reuse_null_slot() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let mut table = GroupedAggregateHashTable::new(
+        vec![LogicalType::Integer],
+        Vec::new(),
+        Vec::new(),
+        allocator.clone(),
+    )
+    .expect("adaptive nullable table");
+
+    let mut first_values =
+        paro_common::test_utils::test_i32_vector_with_allocator(&[0, 5, 6], allocator.clone());
+    first_values.set_null(0, true);
+    let first = Chunk::from_vectors(vec![first_values], allocator.clone());
+    let mut first_addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, first.size());
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(first.size());
+    assert!(table
+        .try_find_or_create_adaptive_integer_groups(&first, &mut first_addresses, &mut new_groups)
+        .expect("first adaptive lookup"));
+    assert_eq!(table.count(), 3);
+
+    let mut second_values =
+        paro_common::test_utils::test_i32_vector_with_allocator(&[4, 0, 8], allocator.clone());
+    second_values.set_null(1, true);
+    let second = Chunk::from_vectors(vec![second_values], allocator);
+    let mut second_addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, second.size());
+    assert!(table
+        .try_find_or_create_adaptive_integer_groups(&second, &mut second_addresses, &mut new_groups)
+        .expect("expanded adaptive lookup"));
+    assert_eq!(table.count(), 5);
+    assert_eq!(second_addresses.get_i64(1), Some(table.state_ptr(0) as i64));
 }
 
 #[test]
@@ -449,6 +1208,9 @@ fn serialized_prefix_projection_coalesces_only_adjacent_equal_runs() {
             0,
             source.count(),
             1,
+            AggregateHashContract::try_new(1, 1)
+                .expect("projection contract")
+                .routing(),
             &mut run_starts,
             &mut prefix_hashes,
         )
@@ -590,88 +1352,182 @@ fn grouped_hash_table_reclaims_finalized_lookup_storage_without_breaking_scan() 
 }
 
 #[test]
-fn grouped_hash_table_combines_other_table() {
-    let mut left = GroupedAggregateHashTable::new(
-        vec![LogicalType::Integer],
-        vec![make_sum_object()],
-        vec![vec![0]],
+fn owned_merge_moves_first_fragment_without_rebuilding_states() {
+    reset_destructor_calls();
+    let pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let memory = MemoryAccountingContext::from_owner(
+        pool.clone(),
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::Revocable,
+    );
+    let mut target = sum_table_with_memory(
+        &[],
+        &[],
         paro_common::test_utils::test_allocator(),
-    )
-    .expect("left table");
-    let mut right = GroupedAggregateHashTable::new(
-        vec![LogicalType::Integer],
-        vec![make_sum_object()],
-        vec![vec![0]],
+        memory.clone(),
+    );
+    let source = sum_table_with_memory(
+        &[1, 2],
+        &[10, 20],
         paro_common::test_utils::test_allocator(),
-    )
-    .expect("right table");
+        memory,
+    );
+    let storage = source.data.as_ptr();
+    let source_bytes = source.memory_usage();
+    target.combine_owned(vec![source]).unwrap();
+    assert_eq!(
+        target.data.as_ptr(),
+        storage,
+        "tuple storage must move, not be reconstructed"
+    );
+    assert_eq!(target.memory_usage(), source_bytes);
+    assert_eq!(destructor_calls(), 0, "moved source states must stay alive");
+    assert_eq!(
+        build_map_from_scan(collect_scan_rows(&mut target)),
+        HashMap::from([(1, 10), (2, 20)])
+    );
+    drop(target);
+    assert_eq!(pool.issued_bytes(), 0);
+    assert_eq!(
+        destructor_calls(),
+        2,
+        "each transferred state is destroyed exactly once"
+    );
+}
 
-    let left_groups = Chunk::from_vectors(
-        vec![paro_common::test_utils::test_i32_vector_with_allocator(
-            &[1, 2],
-            paro_common::test_utils::test_allocator(),
-        )],
-        paro_common::test_utils::test_allocator(),
-    );
-    let left_hashes = left.hash_groups(&left_groups).expect("left hashes");
-    let mut left_addresses =
-        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, left_groups.size());
-    let mut left_new_groups =
-        paro_common::test_utils::test_selection_with_capacity(left_groups.size());
-    left.find_or_create_groups(
-        &left_groups,
-        &left_hashes,
-        &mut left_addresses,
-        &mut left_new_groups,
-    )
-    .expect("left find/create");
-    let left_payload = Chunk::from_vectors(
-        vec![paro_common::test_utils::test_i64_vector_with_allocator(
-            &[10, 20],
-            paro_common::test_utils::test_allocator(),
-        )],
-        paro_common::test_utils::test_allocator(),
-    );
-    left.update_aggregates(&left_payload, &left_addresses, None)
-        .expect("left update");
-
-    let right_groups = Chunk::from_vectors(
-        vec![paro_common::test_utils::test_i32_vector_with_allocator(
-            &[2, 3, 2],
-            paro_common::test_utils::test_allocator(),
-        )],
-        paro_common::test_utils::test_allocator(),
-    );
-    let right_hashes = right.hash_groups(&right_groups).expect("right hashes");
-    let mut right_addresses = paro_common::test_utils::test_vector_with_capacity(
-        LogicalType::BigInt,
-        right_groups.size(),
-    );
-    let mut right_new_groups =
-        paro_common::test_utils::test_selection_with_capacity(right_groups.size());
-    right
-        .find_or_create_groups(
-            &right_groups,
-            &right_hashes,
-            &mut right_addresses,
-            &mut right_new_groups,
+#[test]
+fn owned_merge_preserves_floating_point_fragment_order() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let build = |keys: &[i32], values: &[f64]| {
+        let (function, _) = paro_function::aggregate::distributive::sum::get_sum_function()
+            .bind(&[LogicalType::Double])
+            .unwrap();
+        let object = AggregateObject::from_bound(&AggregateExpression::new(
+            function,
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Double).into(),
+            )],
+            LogicalType::Double,
+        ))
+        .unwrap();
+        let mut table = GroupedAggregateHashTable::new(
+            vec![LogicalType::Integer],
+            vec![object],
+            vec![vec![0]],
+            allocator.clone(),
         )
-        .expect("right find/create");
-    let right_payload = Chunk::from_vectors(
-        vec![paro_common::test_utils::test_i64_vector_with_allocator(
-            &[7, 8, 1],
-            paro_common::test_utils::test_allocator(),
-        )],
-        paro_common::test_utils::test_allocator(),
-    );
-    right
-        .update_aggregates(&right_payload, &right_addresses, None)
-        .expect("right update");
+        .unwrap();
+        if !keys.is_empty() {
+            let groups = Chunk::from_vectors(
+                vec![paro_common::test_utils::test_i32_vector(keys)],
+                allocator.clone(),
+            );
+            let hashes = table.hash_groups(&groups).unwrap();
+            let mut addresses =
+                paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, keys.len());
+            let mut selection = paro_common::test_utils::test_selection_with_capacity(keys.len());
+            table
+                .find_or_create_groups(&groups, &hashes, &mut addresses, &mut selection)
+                .unwrap();
+            let payload = Chunk::from_vectors(
+                vec![paro_common::test_utils::test_f64_vector(values)],
+                allocator.clone(),
+            );
+            table.update_aggregates(&payload, &addresses, None).unwrap();
+        }
+        table
+    };
+    let mut target = build(&[], &[]);
+    // The larger second fragment must not replace the first as merge base.
+    target
+        .combine_owned(vec![
+            build(&[1], &[1e16]),
+            build(&[1, 2], &[-1e16, 2.0]),
+            build(&[1], &[1.0]),
+        ])
+        .unwrap();
+    let rows = collect_scan_rows(&mut target);
+    let row = rows.iter().find(|row| row[0] == Value::Integer(1)).unwrap();
+    let Value::Double(value) = row[1] else {
+        panic!("double sum");
+    };
+    assert_eq!(value.to_bits(), 1.0_f64.to_bits());
+}
 
-    left.combine(&mut right)
-        .expect("combine grouped hash tables");
+#[test]
+fn owned_merge_does_not_move_between_accounting_owners() {
+    let memory = |pool: Arc<QueryMemoryPool>| {
+        MemoryAccountingContext::from_owner(
+            pool,
+            MemoryDomain::Host,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+        )
+    };
+    let target_pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let source_pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let mut target = sum_table_with_memory(
+        &[],
+        &[],
+        paro_common::test_utils::test_allocator(),
+        memory(target_pool.clone()),
+    );
+    let source = sum_table_with_memory(
+        &[1, 2],
+        &[10, 20],
+        paro_common::test_utils::test_allocator(),
+        memory(source_pool.clone()),
+    );
+    let allocator = target.allocator();
+    assert!(!Arc::ptr_eq(&allocator, &source.allocator()));
+    target.combine_owned(vec![source]).unwrap();
+    assert!(Arc::ptr_eq(&allocator, &target.allocator()));
+    assert_eq!(source_pool.issued_bytes(), 0);
+    assert!(target_pool.issued_bytes() > 0);
+    assert_eq!(
+        build_map_from_scan(collect_scan_rows(&mut target)),
+        HashMap::from([(1, 10), (2, 20)])
+    );
+    drop(target);
+    assert_eq!(target_pool.issued_bytes(), 0);
+}
+
+#[test]
+fn owned_merge_validates_all_sources_before_adopting_first() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let mut target = sum_table_with_allocator(&[], &[], allocator.clone());
+    let first = sum_table_with_allocator(&[1], &[10], allocator);
+    let incompatible = count_table(&[2]);
+    assert!(target.combine_owned(vec![first, incompatible]).is_err());
+    assert_eq!(target.count(), 0);
+}
+
+#[test]
+fn grouped_hash_table_bulk_combines_source_frontier() {
+    let mut left = sum_table(&[1, 2], &[10, 20]);
+    let right = sum_table(&[2, 3, 2], &[7, 8, 1]);
+    let tail = sum_table(&[1, 4, 3], &[5, 11, 2]);
+    let mut sources = vec![right, tail];
+
+    left.combine_many(&mut sources)
+        .expect("bulk combine grouped hash tables");
     let actual = build_map_from_scan(collect_scan_rows(&mut left));
-    let expected = HashMap::from([(1, 10), (2, 28), (3, 8)]);
+    let expected = HashMap::from([(1, 15), (2, 28), (3, 10), (4, 11)]);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn grouped_hash_table_bulk_combines_trivial_states_directly() {
+    let mut target = count_table(&[1, 2]);
+    let mut sources = vec![count_table(&[2, 3, 2]), count_table(&[1, 4, 3])];
+    assert!(target.direct_update_program.is_some());
+
+    target
+        .combine_many(&mut sources)
+        .expect("direct bulk combine grouped hash tables");
+    let actual = build_map_from_scan(collect_scan_rows(&mut target));
+    let expected = HashMap::from([(1, 2), (2, 3), (3, 2), (4, 1)]);
     assert_eq!(actual, expected);
 }
 
@@ -900,7 +1756,14 @@ fn serialized_prefix_projection_reuses_varlen_and_null_groups() {
     let mut projected_hashes =
         paro_common::test_utils::test_vector_with_capacity(LogicalType::UBigInt, 4);
     let run_count = source
-        .project_serialized_group_prefix_runs(0, 4, 2, &mut run_starts, &mut projected_hashes)
+        .project_serialized_group_prefix_runs(
+            0,
+            4,
+            2,
+            target.routing_hash_contract(),
+            &mut run_starts,
+            &mut projected_hashes,
+        )
         .expect("project source prefix runs");
     assert_eq!(run_count, 3);
     assert_eq!(run_starts.as_slice(), &[0, 2, 3]);

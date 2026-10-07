@@ -5,19 +5,19 @@ use paro_common::error::Result;
 use paro_common::memory::{
     AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryReleaseHandle,
 };
+use paro_common::sort_key::MAX_SORT_KEY_SLOT_SIZE;
 
 use super::{grant_for_metadata, metadata_context};
 
 /// TopN entry whose persistent sort-key storage is query-accounted metadata.
 #[derive(Debug)]
 pub(super) struct TopNEntry {
-    pub(super) sort_key: Vec<u8>,
+    pub(super) sort_key: TopNKey,
     pub(super) index: usize,
-    _sort_key_memory: TopNKeyReservation,
 }
 
 #[derive(Debug)]
-struct TopNKeyReservation(MemoryReleaseHandle);
+pub(super) struct TopNKeyReservation(MemoryReleaseHandle);
 
 impl Drop for TopNKeyReservation {
     fn drop(&mut self) {
@@ -25,24 +25,84 @@ impl Drop for TopNKeyReservation {
     }
 }
 
+/// Persistent normalized key with a no-allocation path for the common case.
+///
+/// `MAX_SORT_KEY_SLOT_SIZE` is also the canonical sort store's largest fixed
+/// slot. Keeping keys no larger than that inside the heap entry removes a
+/// separate allocation without creating a TopN-only size contract. Longer
+/// VARCHAR/BLOB keys retain their exact encoded bytes in query-accounted
+/// storage.
+#[derive(Debug)]
+pub(super) enum TopNKey {
+    Inline {
+        len: u8,
+        bytes: [u8; MAX_SORT_KEY_SLOT_SIZE],
+    },
+    Allocated {
+        bytes: Vec<u8>,
+        _memory: TopNKeyReservation,
+    },
+}
+
+impl TopNKey {
+    fn try_from_scratch(scratch: &mut Vec<u8>, memory: &MemoryAccountingContext) -> Result<Self> {
+        if scratch.len() <= MAX_SORT_KEY_SLOT_SIZE {
+            let mut bytes = [0; MAX_SORT_KEY_SLOT_SIZE];
+            bytes[..scratch.len()].copy_from_slice(scratch);
+            return Ok(Self::Inline {
+                len: scratch.len() as u8,
+                bytes,
+            });
+        }
+
+        let bytes = std::mem::take(scratch);
+        let reservation = metadata_context(memory).retain(bytes.capacity())?;
+        Ok(Self::Allocated {
+            bytes,
+            _memory: TopNKeyReservation(reservation),
+        })
+    }
+
+    pub(super) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            Self::Allocated { bytes, .. } => bytes,
+        }
+    }
+
+    pub(super) fn allocated_bytes(&self) -> usize {
+        match self {
+            Self::Inline { .. } => 0,
+            Self::Allocated { bytes, .. } => bytes.capacity(),
+        }
+    }
+}
+
 impl TopNEntry {
+    #[cfg(test)]
     pub(super) fn try_new(
-        sort_key: Vec<u8>,
+        mut sort_key: Vec<u8>,
         index: usize,
         memory: &MemoryAccountingContext,
     ) -> Result<Self> {
-        let reservation = metadata_context(memory).retain(sort_key.capacity())?;
+        Self::try_from_scratch(&mut sort_key, index, memory)
+    }
+
+    pub(super) fn try_from_scratch(
+        sort_key: &mut Vec<u8>,
+        index: usize,
+        memory: &MemoryAccountingContext,
+    ) -> Result<Self> {
         Ok(Self {
-            sort_key,
+            sort_key: TopNKey::try_from_scratch(sort_key, memory)?,
             index,
-            _sort_key_memory: TopNKeyReservation(reservation),
         })
     }
 }
 
 impl PartialEq for TopNEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.sort_key == other.sort_key
+        self.sort_key.as_slice() == other.sort_key.as_slice()
     }
 }
 
@@ -56,7 +116,7 @@ impl PartialOrd for TopNEntry {
 
 impl Ord for TopNEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.sort_key.cmp(&other.sort_key)
+        self.sort_key.as_slice().cmp(other.sort_key.as_slice())
     }
 }
 
@@ -143,7 +203,6 @@ impl TopNEntryHeap {
         self.entries.len()
     }
 
-    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

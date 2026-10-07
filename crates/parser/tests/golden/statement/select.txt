@@ -5441,7 +5441,7 @@ Query(
 ---------- Input ----------
 SELECT func(ROW) FROM (SELECT 1 as ROW) t
 ---------- Output ---------
-SELECT func(row) FROM (SELECT 1 AS ROW) AS t
+SELECT func(row) FROM (SELECT 1 AS row) AS t
 ---------- AST ------------
 Query(
     Query {
@@ -5539,7 +5539,7 @@ Query(
                                                     span: Some(
                                                         35..38,
                                                     ),
-                                                    name: "ROW",
+                                                    name: "row",
                                                     quote: None,
                                                     ident_type: None,
                                                 },

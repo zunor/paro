@@ -4,7 +4,7 @@
 use crate::binder::ir::BoundFromSubquery;
 use crate::binder::Binder;
 use crate::expression::{ColumnRefExpression, Expression};
-use crate::operator::{LogicalOperator, Projection};
+use crate::logical::operator::{LogicalOperator, Projection};
 use paro_common::error::Result;
 
 impl Binder {
@@ -24,14 +24,17 @@ impl Binder {
                 .iter()
                 .enumerate()
                 .map(|(i, binding)| {
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        *binding,
-                        sub_ref
-                            .column_types
-                            .get(i)
-                            .cloned()
-                            .unwrap_or(paro_common::types::LogicalType::Unknown),
-                    ))
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            *binding,
+                            sub_ref
+                                .column_types
+                                .get(i)
+                                .cloned()
+                                .unwrap_or(paro_common::types::LogicalType::Unknown),
+                        )
+                        .into(),
+                    )
                 })
                 .collect();
 

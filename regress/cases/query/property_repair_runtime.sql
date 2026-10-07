@@ -37,7 +37,7 @@ INSERT INTO property_repair_right VALUES
   (5, 'right-e');
 
 -- Join output is unordered; ORDER BY must lower to SortBuild + SortEmit roles.
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 -- @query
 EXPLAIN ANALYZE
 SELECT l.label, r.payload

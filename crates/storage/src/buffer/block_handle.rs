@@ -463,17 +463,18 @@ impl BlockHandle {
         Ok(())
     }
 
-    /// Set the buffer data and mark the block as loaded.
+    /// Install buffer data and publish the first pin atomically.
     ///
     /// This method is used when loading a block from disk or temporary file.
-    /// It takes ownership of the provided buffer and marks the block as loaded.
+    /// It takes ownership of the provided buffer and makes the allocation
+    /// immediately safe for the caller to expose through a `BufferHandle`.
     ///
     /// # Arguments
     /// * `buffer` - The buffer data to set
     ///
     /// # Panics
     /// Panics if the buffer size doesn't match the block size.
-    pub fn set_buffer(&self, buffer: Vec<u8>) -> Result<()> {
+    pub(crate) fn set_buffer_pinned(&self, buffer: Vec<u8>) -> Result<()> {
         if buffer.len() != self.size {
             return Err(paro_error::internal(format!(
                 "Buffer size mismatch: expected {}, got {}",
@@ -489,20 +490,20 @@ impl BlockHandle {
         }
 
         // SAFETY: The allocator returned a valid allocation of `self.size`.
-        self.install_buffer(unsafe { NonNull::new_unchecked(ptr) })
+        self.install_buffer_pinned(unsafe { NonNull::new_unchecked(ptr) })
     }
 
     /// Reconstruct an evicted scratch block directly in its final allocation.
     /// This avoids a temporary `Vec` plus a second full-size copy for large
     /// query workspaces.
-    pub(crate) fn reconstruct_zeroed(&self) -> Result<()> {
+    pub(crate) fn reconstruct_zeroed_pinned(&self) -> Result<()> {
         let ptr = self.allocator.allocate_zeroed(self.size)?;
         // SAFETY: The allocator returned a valid zeroed allocation of
         // `self.size`, owned exclusively by this unloaded block.
-        self.install_buffer(unsafe { NonNull::new_unchecked(ptr) })
+        self.install_buffer_pinned(unsafe { NonNull::new_unchecked(ptr) })
     }
 
-    fn install_buffer(&self, non_null: NonNull<u8>) -> Result<()> {
+    fn install_buffer_pinned(&self, non_null: NonNull<u8>) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().unwrap();
         if self.state() != BlockState::Unloaded
             || !self.buffer.load(Ordering::Acquire).is_null()
@@ -515,9 +516,11 @@ impl BlockHandle {
             )));
         }
         self.buffer.store(non_null.as_ptr(), Ordering::Release);
+        self.pin_count.store(1, Ordering::Release);
 
-        // Publish the pointer before the loaded state. `try_pin` takes the same
-        // lifecycle lock and therefore cannot observe a half-published block.
+        // Publish both the pointer and its first pin before the loaded state.
+        // `try_pin` and eviction take the same lifecycle lock, so the freshly
+        // reconstructed allocation cannot be detached between load and pin.
         self.state
             .store(BlockState::Loaded as u8, Ordering::Release);
         Ok(())

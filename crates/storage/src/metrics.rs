@@ -350,6 +350,11 @@ pub struct StorageMetricsSnapshot {
     pub page_cache_misses: u64,
     pub page_cache_evictions: u64,
     pub page_cache_entries: usize,
+    pub decoded_page_cache_hits: u64,
+    pub decoded_page_cache_misses: u64,
+    pub decoded_page_cache_first_touch_admissions: u64,
+    pub decoded_page_cache_probation_promotions: u64,
+    pub decoded_page_cache_policy_rejections: u64,
     pub primary_index_hits: u64,
     pub primary_index_misses: u64,
     pub primary_index_conflicts: u64,
@@ -464,6 +469,11 @@ pub struct StorageMetrics {
     page_cache_misses: AtomicU64,
     page_cache_evictions: AtomicU64,
     page_cache_entries: AtomicUsize,
+    decoded_page_cache_hits: AtomicU64,
+    decoded_page_cache_misses: AtomicU64,
+    decoded_page_cache_first_touch_admissions: AtomicU64,
+    decoded_page_cache_probation_promotions: AtomicU64,
+    decoded_page_cache_policy_rejections: AtomicU64,
     primary_index_hits: AtomicU64,
     primary_index_misses: AtomicU64,
     primary_index_conflicts: AtomicU64,
@@ -590,6 +600,30 @@ impl StorageMetrics {
     /// Update PageCache entry count gauge.
     pub fn set_page_cache_entries(&self, entries: usize) {
         self.page_cache_entries.store(entries, Ordering::Relaxed);
+    }
+
+    pub fn inc_decoded_page_cache_hit(&self) {
+        self.decoded_page_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_decoded_page_cache_miss(&self) {
+        self.decoded_page_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_decoded_page_cache_first_touch_admission(&self) {
+        self.decoded_page_cache_first_touch_admissions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_decoded_page_cache_probation_promotion(&self) {
+        self.decoded_page_cache_probation_promotions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_decoded_page_cache_policy_rejection(&self) {
+        self.decoded_page_cache_policy_rejections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a PrimaryIndex lookup hit.
@@ -1461,6 +1495,17 @@ impl StorageMetrics {
             page_cache_misses: self.page_cache_misses.load(Ordering::Relaxed),
             page_cache_evictions: self.page_cache_evictions.load(Ordering::Relaxed),
             page_cache_entries: self.page_cache_entries.load(Ordering::Relaxed),
+            decoded_page_cache_hits: self.decoded_page_cache_hits.load(Ordering::Relaxed),
+            decoded_page_cache_misses: self.decoded_page_cache_misses.load(Ordering::Relaxed),
+            decoded_page_cache_first_touch_admissions: self
+                .decoded_page_cache_first_touch_admissions
+                .load(Ordering::Relaxed),
+            decoded_page_cache_probation_promotions: self
+                .decoded_page_cache_probation_promotions
+                .load(Ordering::Relaxed),
+            decoded_page_cache_policy_rejections: self
+                .decoded_page_cache_policy_rejections
+                .load(Ordering::Relaxed),
             primary_index_hits: self.primary_index_hits.load(Ordering::Relaxed),
             primary_index_misses: self.primary_index_misses.load(Ordering::Relaxed),
             primary_index_conflicts: self.primary_index_conflicts.load(Ordering::Relaxed),
@@ -1618,6 +1663,14 @@ impl StorageMetrics {
         self.page_cache_misses.store(0, Ordering::Relaxed);
         self.page_cache_evictions.store(0, Ordering::Relaxed);
         self.page_cache_entries.store(0, Ordering::Relaxed);
+        self.decoded_page_cache_hits.store(0, Ordering::Relaxed);
+        self.decoded_page_cache_misses.store(0, Ordering::Relaxed);
+        self.decoded_page_cache_first_touch_admissions
+            .store(0, Ordering::Relaxed);
+        self.decoded_page_cache_probation_promotions
+            .store(0, Ordering::Relaxed);
+        self.decoded_page_cache_policy_rejections
+            .store(0, Ordering::Relaxed);
         self.primary_index_hits.store(0, Ordering::Relaxed);
         self.primary_index_misses.store(0, Ordering::Relaxed);
         self.primary_index_conflicts.store(0, Ordering::Relaxed);
@@ -1817,6 +1870,11 @@ mod tests {
         m.inc_page_cache_miss();
         m.inc_page_cache_eviction();
         m.set_page_cache_entries(3);
+        m.inc_decoded_page_cache_hit();
+        m.inc_decoded_page_cache_miss();
+        m.inc_decoded_page_cache_first_touch_admission();
+        m.inc_decoded_page_cache_probation_promotion();
+        m.inc_decoded_page_cache_policy_rejection();
 
         m.inc_primary_index_hit();
         m.inc_primary_index_miss();
@@ -1892,6 +1950,11 @@ mod tests {
         assert_eq!(snap.page_cache_misses, 1);
         assert_eq!(snap.page_cache_evictions, 1);
         assert_eq!(snap.page_cache_entries, 3);
+        assert_eq!(snap.decoded_page_cache_hits, 1);
+        assert_eq!(snap.decoded_page_cache_misses, 1);
+        assert_eq!(snap.decoded_page_cache_first_touch_admissions, 1);
+        assert_eq!(snap.decoded_page_cache_probation_promotions, 1);
+        assert_eq!(snap.decoded_page_cache_policy_rejections, 1);
         assert_eq!(snap.primary_index_hits, 1);
         assert_eq!(snap.primary_index_misses, 1);
         assert_eq!(snap.primary_index_conflicts, 2);

@@ -26,6 +26,7 @@ use paro_common::effect::{GraphDmlTableDelta, PostCommitHookDescriptor};
 use paro_common::error::{self as paro_error, ParoError, Result};
 use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
+use paro_common::types::LogicalType;
 use paro_common::version::{pg_compat_server_version, PG_COMPAT_SERVER_VERSION_NUM};
 use paro_context::{
     AttachedDatabaseCommitFrontierSnapshot, AttachedDatabaseCommitPoisonSnapshot,
@@ -34,14 +35,17 @@ use paro_context::{
     CompileEnvironmentKey, CursorSummary, DatabaseSnapshotIdentity, EffectiveSettings,
     ExecutionResources, PreparedStatementSummary, QueryResources, RuntimeLimits,
     SessionMetadataRows, StatementCancelReason, StatementCancellation, StatementContext,
-    StatementEnvironment, StatementInput, StatementOptions, StatementSource, StatementView,
+    StatementEnvironment, StatementInput, StatementOptions, StatementSource, StatementTrace,
+    StatementTraceSnapshot, StatementView,
 };
 use paro_execution::operators::graph::refresh_property_graph::{
     mark_property_graph_stale, refresh_property_graph_committed,
     schedule_property_graph_background_rebuild,
 };
+use paro_execution::query_executor::compiled::CompiledStatement;
 use paro_execution::query_executor::executor::Executor;
 use paro_instance::{DatabaseHandle, Instance};
+use paro_parser::ast::Statement;
 use paro_storage::metrics::storage_metrics;
 use paro_storage::transaction::write_buffer::transaction_write_buffer_memory_budget;
 use paro_transaction::{CommitAckPolicy, DatabaseId, IsolationLevel, ReadTrackingPolicy};
@@ -50,6 +54,7 @@ use std::ops::AsyncFnOnce;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const STARTUP_SERVER_ENCODING: &str = "UTF8";
 const STARTUP_CLIENT_ENCODING: &str = "UTF8";
@@ -59,6 +64,8 @@ const STARTUP_INTEGER_DATETIMES: &str = "on";
 const STARTUP_STANDARD_CONFORMING_STRINGS: &str = "on";
 const STARTUP_IS_SUPERUSER: &str = "on";
 const MAX_COPY_STDIN_MEMORY_LIMIT: usize = 1024 * 1024 * 1024;
+
+static NEXT_STATEMENT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Session-scoped state for a single client connection.
 pub struct Session {
@@ -76,6 +83,8 @@ pub struct Session {
     auth_policy: SessionAuthPolicy,
     /// Shared session-scoped metadata mirror for pg_settings / pg_prepared_statements / pg_cursors.
     pub session_metadata: Arc<SharedSessionMetadataState>,
+    /// Diagnostics visible only to this client session.
+    pub diagnostics: Arc<paro_context::SessionDiagnostics>,
     /// Data for the currently running transaction
     pub transaction: SessionTransaction,
     /// Highest durable-only async commit from this connection that later reads must observe.
@@ -90,6 +99,9 @@ pub struct Session {
     pub current_database: Arc<DatabaseHandle>,
     /// Per-query execution state owned by the currently running front-end statement.
     active_query: Option<ActiveQueryContext>,
+    /// Extended-protocol statements whose command completed but whose pipeline
+    /// still awaits Sync/ReadyForQuery (and, when applicable, implicit commit).
+    pending_protocol_traces: Vec<Arc<StatementTrace>>,
     /// Registered state manager for extensible session state
     registered_state: RegisteredStateManager,
     /// In-flight COPY FROM STDIN payload and queue-metadata memory waterline.
@@ -109,8 +121,25 @@ struct StatementScopeGuard<'a> {
 }
 
 impl<'a> StatementScopeGuard<'a> {
-    fn enter(session: &'a mut Session, query: &str) -> Result<Self> {
-        session.begin_statement_scope(query)?;
+    fn enter(
+        session: &'a mut Session,
+        query: &str,
+        statement_trace: Option<Arc<StatementTrace>>,
+    ) -> Result<Self> {
+        if let Err(error) = session.begin_statement_scope(query) {
+            if let Some(statement_trace) = statement_trace {
+                statement_trace.record_event("lifecycle", "statement_scope_rejected");
+                statement_trace.record_event("lifecycle", "statement_error");
+                session.publish_statement_trace(statement_trace.snapshot());
+            }
+            return Err(error);
+        }
+        if let Some(statement_trace) = statement_trace {
+            session
+                .active_query_mut()
+                .expect("statement scope must own an active query")
+                .set_statement_trace(statement_trace);
+        }
         let guard = Self {
             session,
             finished: false,
@@ -122,6 +151,13 @@ impl<'a> StatementScopeGuard<'a> {
             query,
             "statement scope started"
         );
+        if let Some(statement_trace) = guard
+            .session
+            .active_query()
+            .and_then(ActiveQueryContext::statement_trace)
+        {
+            statement_trace.record_event("lifecycle", "statement_scope_begin");
+        }
         Ok(guard)
     }
 
@@ -129,11 +165,11 @@ impl<'a> StatementScopeGuard<'a> {
         self.session
     }
 
-    fn finish(mut self, error: Option<&ParoError>) {
+    fn finish(mut self, error: Option<&ParoError>, publish_success: bool) {
         // Mark first so a panic in an extension callback cannot trigger a
         // second cleanup attempt while this guard unwinds.
         self.finished = true;
-        self.session.finish_statement_scope(error);
+        self.session.finish_statement_scope(error, publish_success);
     }
 }
 
@@ -247,6 +283,34 @@ impl Session {
         cancellation: StatementCancellation,
         input: StatementInput,
     ) -> Arc<StatementContext> {
+        self.freeze_statement_context_with_input_and_trace(options, cancellation, input, None)
+    }
+
+    /// Freeze a context for a protocol operation that started before an active
+    /// Execute scope existed (for example extended-protocol Parse). The trace
+    /// must travel with the immutable context so compiler events cannot be
+    /// mistaken for a later portal-only execution.
+    pub(crate) fn freeze_statement_context_with_trace(
+        &self,
+        options: StatementOptions,
+        cancellation: StatementCancellation,
+        statement_trace: Option<Arc<StatementTrace>>,
+    ) -> Arc<StatementContext> {
+        self.freeze_statement_context_with_input_and_trace(
+            options,
+            cancellation,
+            StatementInput::default(),
+            statement_trace,
+        )
+    }
+
+    fn freeze_statement_context_with_input_and_trace(
+        &self,
+        options: StatementOptions,
+        cancellation: StatementCancellation,
+        input: StatementInput,
+        statement_trace: Option<Arc<StatementTrace>>,
+    ) -> Arc<StatementContext> {
         let settings = Arc::new(EffectiveSettings::new(self.effective_settings.clone()));
         let runtime_tuning = self.instance.runtime_tuning().snapshot();
         let scheduler_threads = self.instance.get_scheduler().number_of_threads().max(1) as usize;
@@ -270,6 +334,7 @@ impl Session {
             rowset_scan_pushdown: settings.rowset_scan_pushdown(),
             parallel_scheduler: settings.parallel_scheduler(),
         };
+        let compile_resources = self.capture_compile_resources(scheduler_threads);
 
         let mut databases = self.instance.database_registry().get_databases();
         databases.sort_by(|left, right| left.name().cmp(right.name()));
@@ -506,6 +571,7 @@ impl Session {
                 databases,
             )),
             limits,
+            compile_resources,
             cancellation,
             services: Arc::new(QueryResources {
                 infra: Arc::new(ExecutionResources {
@@ -521,8 +587,16 @@ impl Session {
                 governance: paro_context::QueryResourceGovernance::default(),
                 connection_info: None,
             }),
+            graph_snapshots: Default::default(),
             graph_registry: self.instance.graph_manager().clone(),
             session_metadata: self.session_metadata.clone(),
+            diagnostics: self.diagnostics.clone(),
+            statement_trace: statement_trace.or_else(|| {
+                self.active_query
+                    .as_ref()
+                    .and_then(ActiveQueryContext::statement_trace)
+                    .cloned()
+            }),
         })
     }
 
@@ -547,7 +621,81 @@ impl Session {
     }
 
     pub fn compile_environment_key(&self) -> CompileEnvironmentKey {
-        self.freeze_query_context().compile_environment_key()
+        let registry = self.instance.database_registry();
+        let settings = EffectiveSettings::new(self.effective_settings.clone());
+        let threads = self.instance.get_scheduler().number_of_threads().max(1) as usize;
+        let limits = RuntimeLimits {
+            max_threads: settings.threads().unwrap_or(threads),
+            max_memory: settings
+                .memory_limit()
+                .unwrap_or(self.instance.runtime_tuning().snapshot().maximum_memory),
+            ..RuntimeLimits::default()
+        };
+        CompileEnvironmentKey::capture(
+            paro_context::CompileNamespace {
+                database: self.current_database.name(),
+                schema: self.current_schema(),
+                search_path: self.search_path().get(),
+            },
+            registry.visible_generation(),
+            registry
+                .get_databases()
+                .iter()
+                .map(|database| (database.id(), database.catalog().gc_epoch())),
+            &settings,
+            &limits,
+            self.capture_compile_resources(threads),
+        )
+    }
+
+    fn capture_compile_resources(
+        &self,
+        scheduler_threads: usize,
+    ) -> paro_context::CompileResources {
+        // Query quota, not free RSS or buffer-pool occupancy: reclaimable
+        // cache pages must not turn a warm compilation into a smaller grant.
+        // This observation reserves nothing; admission still verifies the
+        // query's actual fair share and acquires its execution lease.
+        // The pool envelope here is not divided by concurrent query demand.
+        paro_context::CompileResources::capture(
+            self.instance
+                .get_memory_arbitrator()
+                .available_for_queries(),
+            scheduler_threads,
+        )
+    }
+
+    pub(crate) fn reusable_instance_query_plan(
+        &self,
+        statement: &Statement,
+        parameter_types: &[LogicalType],
+        context: &StatementContext,
+    ) -> Option<CompiledStatement> {
+        self.instance.plan_cache().get_validated(
+            statement,
+            context.statement_format(),
+            parameter_types,
+            &context.compile_environment_key(),
+            &context.env,
+            |plan| plan.dynamic_dependencies_available(context),
+        )
+    }
+
+    pub(crate) fn publish_instance_query_plan(
+        &self,
+        statement: Statement,
+        parameter_types: Vec<LogicalType>,
+        context: &StatementContext,
+        plan: CompiledStatement,
+    ) {
+        self.instance.plan_cache().publish(
+            statement,
+            context.statement_format().map(str::to_owned),
+            parameter_types,
+            context.compile_environment_key(),
+            context.env.clone(),
+            plan,
+        );
     }
 
     /// Create a new session with a specific user name.
@@ -584,6 +732,7 @@ impl Session {
             state: SessionState::new(&default_db_name, &user_name),
             auth_policy: SessionAuthPolicy::from_env(),
             session_metadata: Arc::new(SharedSessionMetadataState::default()),
+            diagnostics: Arc::new(paro_context::SessionDiagnostics::default()),
             transaction: SessionTransaction::new(),
             async_commit_floor: AtomicU64::new(0),
             #[cfg(test)]
@@ -591,6 +740,7 @@ impl Session {
             execution_control,
             current_database,
             active_query: None,
+            pending_protocol_traces: Vec::new(),
             registered_state: RegisteredStateManager::new(),
             copy_stdin_inflight_memory_limit: default_copy_stdin_inflight_memory_limit,
             session_memory_budget: Arc::new(SessionMemoryBudget::new(
@@ -878,10 +1028,146 @@ impl Session {
     where
         F: AsyncFnOnce(&mut Session) -> Result<T>,
     {
-        let mut scope = StatementScopeGuard::enter(self, query)?;
+        let trace = self.new_statement_trace(query, 0, Instant::now());
+        self.run_in_statement_scope_with_trace(query, trace, operation)
+            .await
+    }
+
+    pub(crate) async fn run_in_statement_scope_with_trace<T, F>(
+        &mut self,
+        query: &str,
+        statement_trace: Option<Arc<StatementTrace>>,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: AsyncFnOnce(&mut Session) -> Result<T>,
+    {
+        let mut scope = StatementScopeGuard::enter(self, query, statement_trace)?;
         let result = operation(scope.session()).await;
-        scope.finish(result.as_ref().err());
+        scope.finish(result.as_ref().err(), true);
         result
+    }
+
+    /// Run a protocol operation whose successful scope return is not yet the
+    /// terminal statement event (for example a portal suspended after a page).
+    /// Errors still publish immediately; the caller publishes the terminal
+    /// snapshot once the final page/command-complete boundary is known.
+    pub(crate) async fn run_in_statement_scope_with_trace_and_publish<T, F>(
+        &mut self,
+        query: &str,
+        statement_trace: Option<Arc<StatementTrace>>,
+        publish_success: bool,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: AsyncFnOnce(&mut Session) -> Result<T>,
+    {
+        let mut scope = StatementScopeGuard::enter(self, query, statement_trace)?;
+        let result = operation(scope.session()).await;
+        scope.finish(result.as_ref().err(), publish_success);
+        result
+    }
+
+    pub(crate) fn new_statement_trace(
+        &self,
+        query: &str,
+        statement_index: usize,
+        started_at: Instant,
+    ) -> Option<Arc<StatementTrace>> {
+        StatementTrace::enabled().then(|| {
+            Arc::new(StatementTrace::new(
+                NEXT_STATEMENT_TRACE_ID.fetch_add(1, Ordering::Relaxed),
+                statement_index,
+                query,
+                started_at,
+            ))
+        })
+    }
+
+    pub(crate) fn publish_statement_trace(&self, trace: StatementTraceSnapshot) {
+        self.diagnostics.publish_statement_trace(trace.clone());
+        let trace_sample_id = std::env::var("PARO_STATEMENT_TRACE_SAMPLE").unwrap_or_default();
+        for event in trace.events {
+            tracing::info!(
+                target: targets::STATEMENT_TRACE,
+                process_id = std::process::id(),
+                session_id = self.id,
+                trace_sample_id = %trace_sample_id,
+                schema_version = trace.schema_version,
+                statement_id = trace.statement_id,
+                operation_id = trace.statement_id,
+                statement_index = trace.statement_index,
+                query_len = trace.query_len,
+                query_fingerprint = trace.query_fingerprint,
+                sequence = event.sequence,
+                phase = %event.phase,
+                event = %event.event,
+                elapsed_us = event.elapsed_us,
+                duration_us = event.duration_us.unwrap_or(0),
+                has_duration = event.duration_us.is_some(),
+                value = event.value.unwrap_or(0),
+                has_value = event.value.is_some(),
+                "statement trace event"
+            );
+        }
+    }
+
+    /// Record the bounded cache decision for every statement. This is the
+    /// normal receipt channel, not a statement-event trace, so trace-off
+    /// execution retains a small compile/admission association without
+    /// changing the target plan or forcing a diagnostic capture.
+    pub(crate) fn record_statement_cache_decision(
+        &self,
+        query_fingerprint: u64,
+        cache_hit: bool,
+    ) -> Option<u64> {
+        self.diagnostics
+            .publish_statement_cache_decision(query_fingerprint, cache_hit)
+    }
+
+    pub(crate) fn finish_statement_cache_decision(&self, decision_id: u64) {
+        self.diagnostics
+            .finish_statement_cache_decision(decision_id);
+    }
+
+    /// Hold an extended-protocol trace until Sync has completed the pipeline.
+    /// CommandComplete is not the client-visible completion boundary: the
+    /// connection may still commit its implicit transaction and send
+    /// ReadyForQuery.
+    pub(crate) fn defer_protocol_statement_trace(&mut self, trace: Arc<StatementTrace>) {
+        self.pending_protocol_traces.push(trace);
+    }
+
+    /// Close all extended-protocol traces at the pipeline boundary. The commit
+    /// result is deliberately passed in so a failed commit becomes an error
+    /// terminal state instead of publishing a false successful sample.
+    pub fn finish_protocol_statement_traces(
+        &mut self,
+        commit_result: Result<()>,
+        implicit_commit: bool,
+    ) -> Result<()> {
+        let traces = std::mem::take(&mut self.pending_protocol_traces);
+        match commit_result {
+            Ok(()) => {
+                for trace in traces {
+                    if implicit_commit {
+                        trace.record_event("transaction", "implicit_commit_published");
+                    }
+                    trace.record_event("protocol", "ready_for_query_queued");
+                    trace.record_event("lifecycle", "statement_complete");
+                    self.publish_statement_trace(trace.snapshot());
+                }
+                Ok(())
+            }
+            Err(error) => {
+                for trace in traces {
+                    trace.record_event("transaction", "implicit_commit_error");
+                    trace.record_event("lifecycle", "statement_error");
+                    self.publish_statement_trace(trace.snapshot());
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Creates the active statement state. Callers must use
@@ -906,12 +1192,22 @@ impl Session {
     }
 
     /// Finishes active statement state after `run_in_statement_scope`'s operation.
-    fn finish_statement_scope(&mut self, error: Option<&ParoError>) {
+    fn finish_statement_scope(&mut self, error: Option<&ParoError>, publish_success: bool) {
         let ctx = self
             .active_query
             .take()
             .expect("statement scope completion requires an active statement");
         let elapsed = ctx.elapsed();
+        if let Some(statement_trace) = ctx.statement_trace().cloned() {
+            statement_trace.record_event("lifecycle", "statement_scope_return");
+            if error.is_some() {
+                statement_trace.record_event("lifecycle", "statement_error");
+                self.publish_statement_trace(statement_trace.snapshot());
+            } else if publish_success {
+                statement_trace.record_event("lifecycle", "statement_complete");
+                self.publish_statement_trace(statement_trace.snapshot());
+            }
+        }
         self.execution_control.finish_statement(ctx.control());
         self.registered_state.notify_query_end(error);
         tracing::trace!(
@@ -930,6 +1226,10 @@ impl Session {
             return;
         };
         let elapsed = ctx.elapsed();
+        if let Some(statement_trace) = ctx.statement_trace().cloned() {
+            statement_trace.record_event("lifecycle", "statement_aborted");
+            self.publish_statement_trace(statement_trace.snapshot());
+        }
         self.execution_control.finish_statement(ctx.control());
 
         let error = paro_error::internal("statement scope ended before producing a result");
@@ -1842,6 +2142,177 @@ mod tests {
 
         assert_eq!(context.time.transaction_started_at(), None);
         assert_eq!(context.time.transaction_timestamp_micros(), None);
+    }
+
+    #[test]
+    fn live_compile_environment_matches_a_frozen_statement() {
+        let instance = Instance::new_in_memory();
+        instance.create_database("analytics").unwrap();
+        let mut session = Session::new(1, instance);
+        session
+            .set_session_setting("threads", Value::Integer(2))
+            .unwrap();
+
+        let live = session.compile_environment_key();
+        let frozen = session.freeze_query_context().compile_environment_key();
+
+        assert_eq!(live, frozen);
+    }
+
+    #[test]
+    fn resource_contract_cache_isolates_frozen_expectations() {
+        let instance = Instance::new_in_memory();
+        let mut session = Session::new(1, instance.clone());
+        session
+            .set_session_setting("threads", Value::Integer(1))
+            .unwrap();
+        session
+            .set_session_setting("memory_limit", Value::BigInt(64 << 20))
+            .unwrap();
+        let arbitrator = instance.get_memory_arbitrator();
+        arbitrator.set_buffer_pool_limit(64 << 20);
+        arbitrator.set_shared_cache_floor(0);
+        let statement = paro_parser::parse_one("SELECT 42").unwrap().stmt;
+        let full = session.freeze_query_context();
+        let full_key = full.compile_environment_key();
+        assert_eq!(full_key.expected_grant.unwrap().index, 0);
+        let full_plan = paro_compiler::compile_statement(full.clone(), statement.clone()).unwrap();
+        let paro_execution::pipeline::StatementProgram::Physical(artifact) = full_plan.program()
+        else {
+            panic!("expected immutable artifact")
+        };
+        assert_eq!(
+            artifact.grant.id.0 as usize,
+            full_key.expected_grant.unwrap().index
+        );
+        session.publish_instance_query_plan(statement.clone(), vec![], &full, full_plan.clone());
+        assert!(session
+            .reusable_instance_query_plan(&statement, &[], &full)
+            .unwrap()
+            .shares_image_with(&full_plan));
+
+        // A real quota change, not free RSS or reclaimable page occupancy.
+        arbitrator.set_system_reserve_bytes(40 << 20);
+        let limited = session.freeze_query_context();
+        let limited_key = limited.compile_environment_key();
+        assert_eq!(limited_key.expected_grant.unwrap().index, 0);
+        assert_ne!(limited_key, full_key);
+        assert_eq!(
+            full.compile_environment_key(),
+            full_key,
+            "a frozen statement must not re-sample live availability"
+        );
+        assert_eq!(session.compile_environment_key(), limited_key);
+        assert!(session
+            .reusable_instance_query_plan(&statement, &[], &limited)
+            .is_none());
+        let limited_plan =
+            paro_compiler::compile_statement(limited.clone(), statement.clone()).unwrap();
+        let paro_execution::pipeline::StatementProgram::Physical(artifact) = limited_plan.program()
+        else {
+            panic!("expected immutable artifact")
+        };
+        assert_eq!(
+            artifact.grant.id.0 as usize,
+            limited_key.expected_grant.unwrap().index
+        );
+        session.publish_instance_query_plan(
+            statement.clone(),
+            vec![],
+            &limited,
+            limited_plan.clone(),
+        );
+        assert!(!limited_plan.shares_image_with(&full_plan));
+        assert!(session
+            .reusable_instance_query_plan(&statement, &[], &limited)
+            .unwrap()
+            .shares_image_with(&limited_plan));
+        assert!(session
+            .reusable_instance_query_plan(&statement, &[], &full)
+            .unwrap()
+            .shares_image_with(&full_plan));
+        arbitrator.set_system_reserve_bytes(0);
+        assert_eq!(session.compile_environment_key(), full_key);
+    }
+
+    #[test]
+    fn compiled_plan_rejects_reduced_dop_without_relabeling_and_executes_with_its_contract() {
+        use paro_execution::pipeline::StatementProgram;
+        use paro_execution::query_executor::{compiled::ExecutionRequest, executor::Executor};
+
+        let instance = Instance::new_in_memory();
+        instance.set_threads(4).unwrap();
+        let mut session = Session::new(1, instance.clone());
+        session
+            .set_session_setting("threads", Value::Integer(4))
+            .unwrap();
+        session
+            .set_session_setting("memory_limit", Value::BigInt(64 << 20))
+            .unwrap();
+        instance
+            .get_memory_arbitrator()
+            .set_buffer_pool_limit(64 << 20);
+        instance.get_memory_arbitrator().set_shared_cache_floor(0);
+        let full = session.freeze_query_context();
+        let statement = paro_parser::parse_one(
+            "SELECT x FROM (VALUES (3), (1), (3), (NULL)) AS t(x) ORDER BY x NULLS LAST",
+        )
+        .unwrap()
+        .stmt;
+        let compiled = paro_compiler::compile_statement(full.clone(), statement).unwrap();
+        let StatementProgram::Physical(artifact) = compiled.program() else {
+            panic!("expected artifact")
+        };
+        artifact.verify().unwrap();
+        let grant = artifact.grant;
+        assert!(
+            artifact
+                .admit(grant.hard_memory_bytes, 0, 0, |_| true)
+                .is_err(),
+            "zero available tasks is unavailable, not an implicit serial grant"
+        );
+        assert!(
+            artifact.admit(0, 4, 0, |_| true).is_err(),
+            "a sort cannot be admitted with no memory"
+        );
+        assert!(
+            artifact
+                .admit(grant.hard_memory_bytes, 1, 0, |_| true)
+                .is_err(),
+            "a four-task compiled contract cannot be relabeled as one task"
+        );
+        assert!(
+            artifact
+                .admit(grant.hard_memory_bytes, 4, 0, |_| false)
+                .is_err(),
+            "missing dependencies cannot be admitted"
+        );
+        let admitted = artifact
+            .admit(grant.hard_memory_bytes, 4, 0, |_| true)
+            .unwrap();
+        assert_eq!(admitted.resources.class, grant.id);
+        assert_eq!(admitted.physical_fingerprint, artifact.physical_fingerprint);
+        paro_planner::physical::PhysicalPlanVerifier::verify(&admitted.plan).unwrap();
+        let runtime = session.freeze_query_context();
+        let mut stream = Executor::new(runtime)
+            .execute(ExecutionRequest::unparameterized(compiled).unwrap())
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(chunk) = stream.fetch().unwrap() {
+            for row in 0..chunk.len() {
+                rows.push(chunk.column(0).unwrap().get_value(row));
+            }
+        }
+        assert_eq!(
+            rows,
+            vec![
+                Value::Integer(1),
+                Value::Integer(3),
+                Value::Integer(3),
+                Value::Null(LogicalType::Integer)
+            ],
+            "duplicates and NULL survive execution under the compiled resource contract"
+        );
     }
 
     #[test]

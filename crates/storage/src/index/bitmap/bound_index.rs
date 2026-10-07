@@ -16,7 +16,9 @@ use paro_common::vector::Vector;
 use roaring::RoaringBitmap;
 
 use crate::index::bound_index::BoundIndex;
-use crate::index::predicate::{compare_bytes, value_to_bytes, Predicate};
+use crate::index::predicate::{
+    compare_bytes, value_to_bytes, visit_fixed_membership_bytes, Predicate,
+};
 use crate::index::predicate_result::PredicateResult;
 use crate::index::{
     ColumnId, ExactOrdinalPosting, ExactRowSet, ExactScalarKey, Index, IndexAppendInfo,
@@ -315,6 +317,16 @@ impl BitmapIndex {
                     }
                 }
             }
+            Predicate::FixedIn { values, .. } => {
+                if !visit_fixed_membership_bytes(values, logical_type, |bytes| {
+                    let (ordinal, exact) = self.reader.seek_dictionary(bytes);
+                    if exact {
+                        accepted.insert(ordinal);
+                    }
+                }) {
+                    return None;
+                }
+            }
             Predicate::Range { lower, upper, .. } => {
                 let lower = value_to_bytes(lower, logical_type).ok()?;
                 let upper = value_to_bytes(upper, logical_type).ok()?;
@@ -326,8 +338,7 @@ impl BitmapIndex {
             Predicate::IsNotNull { .. } => {
                 accepted.insert_range(0, self.reader.num_values());
             }
-            Predicate::FixedIn { .. }
-            | Predicate::StringPrefix { .. }
+            Predicate::StringPrefix { .. }
             | Predicate::StringPrefixIn { .. }
             | Predicate::StringLike { .. }
             | Predicate::ColumnComparison { .. } => return None,
@@ -394,6 +405,31 @@ impl BitmapIndex {
             }
         }
 
+        if result.is_empty() {
+            PredicateResult::NoneMatch
+        } else {
+            PredicateResult::Bitmap(result)
+        }
+    }
+
+    fn evaluate_fixed_in(&self, values: &crate::index::FixedMembership) -> PredicateResult {
+        let Some(logical_type) = self.logical_type() else {
+            return PredicateResult::Unknown;
+        };
+        let mut result = RoaringBitmap::new();
+        let mut failed = false;
+        if !visit_fixed_membership_bytes(values, logical_type, |value| {
+            if failed {
+                return;
+            }
+            match self.reader.get_rows_for_value(value) {
+                Ok(bitmap) => result |= bitmap,
+                Err(_) => failed = true,
+            }
+        }) || failed
+        {
+            return PredicateResult::Unknown;
+        }
         if result.is_empty() {
             PredicateResult::NoneMatch
         } else {
@@ -697,11 +733,11 @@ impl BoundIndex for BitmapIndex {
             Predicate::Gt { value, .. } => self.evaluate_gt(value, false),
             Predicate::Ge { value, .. } => self.evaluate_gt(value, true),
             Predicate::In { values, .. } => self.evaluate_in(values),
+            Predicate::FixedIn { values, .. } => self.evaluate_fixed_in(values),
             Predicate::Range { lower, upper, .. } => self.evaluate_range(lower, upper),
             Predicate::IsNull { .. } => self.evaluate_is_null(),
             Predicate::IsNotNull { .. } => self.evaluate_is_not_null(),
-            Predicate::FixedIn { .. }
-            | Predicate::StringPrefix { .. }
+            Predicate::StringPrefix { .. }
             | Predicate::StringPrefixIn { .. }
             | Predicate::StringLike { .. }
             | Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
@@ -716,6 +752,7 @@ impl BoundIndex for BitmapIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::FixedMembership;
 
     #[test]
     fn test_bitmap_index_eval() {
@@ -805,6 +842,38 @@ mod tests {
         assert_eq!(
             row_set.materialize(),
             RoaringBitmap::from_iter([0_u32, 2, 4])
+        );
+    }
+
+    #[test]
+    fn fixed_membership_compiles_exact_bitmap_rows() {
+        let mut writer = BitmapIndexWriter::new();
+        for value in [1_i32, 2, 3, 2, 5] {
+            writer.add_value(&value.to_le_bytes());
+        }
+        let index = BitmapIndex::from_writer(
+            "bm",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Integer],
+            &writer,
+        )
+        .unwrap();
+        let predicate = Predicate::FixedIn {
+            column_id: 0,
+            values: FixedMembership::i32(vec![2, 5, 8]),
+        };
+
+        assert_eq!(
+            index.evaluate_predicate(&predicate),
+            PredicateResult::Bitmap(RoaringBitmap::from_iter([1_u32, 3, 4]))
+        );
+        let row_set = index
+            .compile_ordinal_row_set(&predicate)
+            .expect("fixed membership should compile to ordinal membership");
+        assert_eq!(
+            row_set.materialize(),
+            RoaringBitmap::from_iter([1_u32, 3, 4])
         );
     }
 }

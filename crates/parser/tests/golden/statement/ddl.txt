@@ -92,7 +92,7 @@ ShowCreateTable(
 
 
 ---------- FORMAT ------------
-"TabSeparatedWithNamesAndTypes"
+"tabseparatedwithnamesandtypes"
 ---------- Input ----------
 describe a;
 ---------- Output ---------
@@ -136,11 +136,11 @@ DescribeTable(
 
 
 ---------- FORMAT ------------
-"TabSeparatedWithNamesAndTypes"
+"tabseparatedwithnamesandtypes"
 ---------- Input ----------
 CREATE AGGREGATING INDEX idx1 AS SELECT SUM(a), b FROM t1 WHERE b > 3 GROUP BY b;
 ---------- Output ---------
-CREATE AGGREGATING INDEX idx1 AS SELECT SUM(a), b FROM t1 WHERE b > 3 GROUP BY b
+CREATE AGGREGATING INDEX idx1 AS SELECT sum(a), b FROM t1 WHERE b > 3 GROUP BY b
 ---------- AST ------------
 CreateAggregatingIndex(
     CreateAggregatingIndexStmt {
@@ -180,7 +180,7 @@ CreateAggregatingIndex(
                                         span: Some(
                                             40..43,
                                         ),
-                                        name: "SUM",
+                                        name: "sum",
                                         quote: None,
                                         ident_type: None,
                                     },
@@ -339,7 +339,7 @@ CreateAggregatingIndex(
 ---------- Input ----------
 CREATE OR REPLACE AGGREGATING INDEX idx1 AS SELECT SUM(a), b FROM t1 WHERE b > 3 GROUP BY b;
 ---------- Output ---------
-CREATE OR REPLACE AGGREGATING INDEX idx1 AS SELECT SUM(a), b FROM t1 WHERE b > 3 GROUP BY b
+CREATE OR REPLACE AGGREGATING INDEX idx1 AS SELECT sum(a), b FROM t1 WHERE b > 3 GROUP BY b
 ---------- AST ------------
 CreateAggregatingIndex(
     CreateAggregatingIndexStmt {
@@ -379,7 +379,7 @@ CreateAggregatingIndex(
                                         span: Some(
                                             51..54,
                                         ),
-                                        name: "SUM",
+                                        name: "sum",
                                         quote: None,
                                         ident_type: None,
                                     },
@@ -650,7 +650,7 @@ CreateIndex(
 ---------- Input ----------
 CREATE INDEX idx_fts ON documents USING GIN (to_tsvector('simple', content));
 ---------- Output ---------
-CREATE INDEX idx_fts ON documents USING GIN (to_tsvector('simple', content))
+CREATE INDEX idx_fts ON documents USING gin (to_tsvector('simple', content))
 ---------- AST ------------
 CreateIndex(
     CreateIndexStmt {
@@ -680,7 +680,7 @@ CreateIndex(
                 span: Some(
                     40..43,
                 ),
-                name: "GIN",
+                name: "gin",
                 quote: None,
                 ident_type: None,
             },
@@ -3467,7 +3467,7 @@ VariableShow(
 
 
 ---------- FORMAT ------------
-"TabSeparatedWithNamesAndTypes"
+"tabseparatedwithnamesandtypes"
 ---------- Input ----------
 show full views
 ---------- Output ---------
@@ -5533,7 +5533,7 @@ AlterTable(
 ---------- Input ----------
 COMMENT ON COLUMN t.C1 IS 'test'
 ---------- Output ---------
-ALTER TABLE t MODIFY COLUMN C1 COMMENT 'test'
+ALTER TABLE t MODIFY COLUMN c1 COMMENT 'test'
 ---------- AST ------------
 AlterTable(
     AlterTableStmt {
@@ -5567,7 +5567,7 @@ AlterTable(
                             span: Some(
                                 20..22,
                             ),
-                            name: "C1",
+                            name: "c1",
                             quote: None,
                             ident_type: None,
                         },
@@ -6038,7 +6038,7 @@ CREATE OR REPLACE DYNAMIC TABLE db.MyDynamic LIKE t
 AS
     SELECT * FROM t
 ---------- Output ---------
-CREATE OR REPLACE DYNAMIC TABLE db.MyDynamic LIKE t TARGET_LAG = 10 SECOND WAREHOUSE = 'MyWarehouse' REFRESH_MODE = FULL INITIALIZE = ON_CREATE comment = 'This is test dynamic table' AS SELECT * FROM t
+CREATE OR REPLACE DYNAMIC TABLE db.mydynamic LIKE t TARGET_LAG = 10 SECOND WAREHOUSE = 'MyWarehouse' REFRESH_MODE = FULL INITIALIZE = ON_CREATE comment = 'This is test dynamic table' AS SELECT * FROM t
 ---------- AST ------------
 CreateDynamicTable(
     CreateDynamicTableStmt {
@@ -6058,7 +6058,7 @@ CreateDynamicTable(
             span: Some(
                 35..44,
             ),
-            name: "MyDynamic",
+            name: "mydynamic",
             quote: None,
             ident_type: None,
         },
@@ -6164,7 +6164,7 @@ CREATE DYNAMIC TABLE IF NOT EXISTS db.MyDynamic (a int, b string)
 AS
     SELECT * FROM t
 ---------- Output ---------
-CREATE DYNAMIC TABLE IF NOT EXISTS db.MyDynamic (a Int32, b STRING) TARGET_LAG = 600 SECOND WAREHOUSE = 'MyWarehouse' REFRESH_MODE = INCREMENTAL INITIALIZE = ON_SCHEDULE comment = 'This is test dynamic table' AS SELECT * FROM t
+CREATE DYNAMIC TABLE IF NOT EXISTS db.mydynamic (a Int32, b STRING) TARGET_LAG = 600 SECOND WAREHOUSE = 'MyWarehouse' REFRESH_MODE = INCREMENTAL INITIALIZE = ON_SCHEDULE comment = 'This is test dynamic table' AS SELECT * FROM t
 ---------- AST ------------
 CreateDynamicTable(
     CreateDynamicTableStmt {
@@ -6184,7 +6184,7 @@ CreateDynamicTable(
             span: Some(
                 38..47,
             ),
-            name: "MyDynamic",
+            name: "mydynamic",
             quote: None,
             ident_type: None,
         },
@@ -6315,7 +6315,7 @@ CREATE DYNAMIC TABLE db.MyDynamic (a int, b string)
 AS
     SELECT c, d FROM t
 ---------- Output ---------
-CREATE DYNAMIC TABLE db.MyDynamic (a Int32, b STRING) TARGET_LAG = 36000 SECOND REFRESH_MODE = AUTO INITIALIZE = ON_CREATE comment = 'This is test dynamic table' storage_format = 'native' AS SELECT c, d FROM t
+CREATE DYNAMIC TABLE db.mydynamic (a Int32, b STRING) TARGET_LAG = 36000 SECOND REFRESH_MODE = AUTO INITIALIZE = ON_CREATE comment = 'This is test dynamic table' storage_format = 'native' AS SELECT c, d FROM t
 ---------- AST ------------
 CreateDynamicTable(
     CreateDynamicTableStmt {
@@ -6335,7 +6335,7 @@ CreateDynamicTable(
             span: Some(
                 24..33,
             ),
-            name: "MyDynamic",
+            name: "mydynamic",
             quote: None,
             ident_type: None,
         },
@@ -6496,7 +6496,7 @@ CREATE DYNAMIC TABLE IF NOT EXISTS MyDynamic (a int, b string)
 AS
     SELECT avg(a), d FROM t GROUP BY d
 ---------- Output ---------
-CREATE DYNAMIC TABLE IF NOT EXISTS MyDynamic (a Int32, b STRING) TARGET_LAG = 864000 SECOND REFRESH_MODE = AUTO INITIALIZE = ON_CREATE AS SELECT avg(a), d FROM t GROUP BY d
+CREATE DYNAMIC TABLE IF NOT EXISTS mydynamic (a Int32, b STRING) TARGET_LAG = 864000 SECOND REFRESH_MODE = AUTO INITIALIZE = ON_CREATE AS SELECT avg(a), d FROM t GROUP BY d
 ---------- AST ------------
 CreateDynamicTable(
     CreateDynamicTableStmt {
@@ -6507,7 +6507,7 @@ CreateDynamicTable(
             span: Some(
                 35..44,
             ),
-            name: "MyDynamic",
+            name: "mydynamic",
             quote: None,
             ident_type: None,
         },
@@ -6714,7 +6714,7 @@ CREATE DYNAMIC TABLE IF NOT EXISTS MyDynamic (a int, b string)
 AS
     SELECT avg(a), d FROM db.t GROUP BY d
 ---------- Output ---------
-CREATE DYNAMIC TABLE IF NOT EXISTS MyDynamic (a Int32, b STRING) TARGET_LAG = DOWNSTREAM REFRESH_MODE = INCREMENTAL INITIALIZE = ON_CREATE AS SELECT avg(a), d FROM db.t GROUP BY d
+CREATE DYNAMIC TABLE IF NOT EXISTS mydynamic (a Int32, b STRING) TARGET_LAG = DOWNSTREAM REFRESH_MODE = INCREMENTAL INITIALIZE = ON_CREATE AS SELECT avg(a), d FROM db.t GROUP BY d
 ---------- AST ------------
 CreateDynamicTable(
     CreateDynamicTableStmt {
@@ -6725,7 +6725,7 @@ CreateDynamicTable(
             span: Some(
                 35..44,
             ),
-            name: "MyDynamic",
+            name: "mydynamic",
             quote: None,
             ident_type: None,
         },
@@ -6934,12 +6934,12 @@ CreateDynamicTable(
 ---------- Input ----------
 CREATE TASK IF NOT EXISTS MyTask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 15 MINUTE SUSPEND_TASK_AFTER_NUM_FAILURES = 3 ERROR_INTEGRATION = 'notification_name' COMMENT = 'This is test task 1' DATABASE = 'target', TIMEZONE = 'America/Los Angeles' AS SELECT * FROM MyTable1
 ---------- Output ---------
-CREATE TASK IF NOT EXISTS MyTask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 900 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 3 ERROR_INTEGRATION = 'notification_name' COMMENTS = 'This is test task 1' database = 'target', timezone = 'America/Los Angeles' AS SELECT * FROM MyTable1
+CREATE TASK IF NOT EXISTS mytask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 900 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 3 ERROR_INTEGRATION = 'notification_name' COMMENTS = 'This is test task 1' database = 'target', timezone = 'America/Los Angeles' AS SELECT * FROM mytable1
 ---------- AST ------------
 CreateTask(
     CreateTaskStmt {
         create_option: CreateIfNotExists,
-        name: "MyTask1",
+        name: "mytask1",
         warehouse: Some(
             "MyWarehouse",
         ),
@@ -6965,7 +6965,7 @@ CreateTask(
         after: [],
         when_condition: None,
         sql: SingleStatement(
-            "SELECT * FROM MyTable1",
+            "SELECT * FROM mytable1",
         ),
     },
 )
@@ -6974,12 +6974,12 @@ CreateTask(
 ---------- Input ----------
 CREATE TASK IF NOT EXISTS MyTask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 15 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 3 COMMENT = 'This is test task 1' AS SELECT * FROM MyTable1
 ---------- Output ---------
-CREATE TASK IF NOT EXISTS MyTask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 15 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 3 COMMENTS = 'This is test task 1' AS SELECT * FROM MyTable1
+CREATE TASK IF NOT EXISTS mytask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 15 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 3 COMMENTS = 'This is test task 1' AS SELECT * FROM mytable1
 ---------- AST ------------
 CreateTask(
     CreateTaskStmt {
         create_option: CreateIfNotExists,
-        name: "MyTask1",
+        name: "mytask1",
         warehouse: Some(
             "MyWarehouse",
         ),
@@ -7000,7 +7000,7 @@ CreateTask(
         after: [],
         when_condition: None,
         sql: SingleStatement(
-            "SELECT * FROM MyTable1",
+            "SELECT * FROM mytable1",
         ),
     },
 )
@@ -7009,12 +7009,12 @@ CreateTask(
 ---------- Input ----------
 CREATE TASK IF NOT EXISTS MyTask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 1215 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 3 COMMENT = 'This is test task 1' AS SELECT * FROM MyTable1
 ---------- Output ---------
-CREATE TASK IF NOT EXISTS MyTask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 1215 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 3 COMMENTS = 'This is test task 1' AS SELECT * FROM MyTable1
+CREATE TASK IF NOT EXISTS mytask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 1215 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 3 COMMENTS = 'This is test task 1' AS SELECT * FROM mytable1
 ---------- AST ------------
 CreateTask(
     CreateTaskStmt {
         create_option: CreateIfNotExists,
-        name: "MyTask1",
+        name: "mytask1",
         warehouse: Some(
             "MyWarehouse",
         ),
@@ -7035,7 +7035,7 @@ CreateTask(
         after: [],
         when_condition: None,
         sql: SingleStatement(
-            "SELECT * FROM MyTable1",
+            "SELECT * FROM mytable1",
         ),
     },
 )
@@ -7044,12 +7044,12 @@ CreateTask(
 ---------- Input ----------
 CREATE TASK IF NOT EXISTS MyTask1 COMMENT = '123' SCHEDULE = 1215 SECOND WAREHOUSE = 'MyWarehouse' SUSPEND_TASK_AFTER_NUM_FAILURES = 3 AS SELECT * FROM MyTable1
 ---------- Output ---------
-CREATE TASK IF NOT EXISTS MyTask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 1215 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 3 COMMENTS = '123' AS SELECT * FROM MyTable1
+CREATE TASK IF NOT EXISTS mytask1 WAREHOUSE = 'MyWarehouse' SCHEDULE = 1215 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 3 COMMENTS = '123' AS SELECT * FROM mytable1
 ---------- AST ------------
 CreateTask(
     CreateTaskStmt {
         create_option: CreateIfNotExists,
-        name: "MyTask1",
+        name: "mytask1",
         warehouse: Some(
             "MyWarehouse",
         ),
@@ -7070,7 +7070,7 @@ CreateTask(
         after: [],
         when_condition: None,
         sql: SingleStatement(
-            "SELECT * FROM MyTable1",
+            "SELECT * FROM mytable1",
         ),
     },
 )
@@ -7079,12 +7079,12 @@ CreateTask(
 ---------- Input ----------
 CREATE TASK IF NOT EXISTS MyTask1 SCHEDULE = USING CRON '0 6 * * *' 'America/Los_Angeles' COMMENT = 'serverless + cron' AS insert into t (c1, c2) values (1, 2), (3, 4)
 ---------- Output ---------
-CREATE TASK IF NOT EXISTS MyTask1 SCHEDULE = USING CRON '0 6 * * *' 'America/Los_Angeles' COMMENTS = 'serverless + cron' AS INSERT INTO t (c1, c2) VALUES (1, 2), (3, 4)
+CREATE TASK IF NOT EXISTS mytask1 SCHEDULE = USING CRON '0 6 * * *' 'America/Los_Angeles' COMMENTS = 'serverless + cron' AS INSERT INTO t (c1, c2) VALUES (1, 2), (3, 4)
 ---------- AST ------------
 CreateTask(
     CreateTaskStmt {
         create_option: CreateIfNotExists,
-        name: "MyTask1",
+        name: "mytask1",
         warehouse: None,
         schedule_opts: Some(
             CronExpression(
@@ -7112,12 +7112,12 @@ CreateTask(
 ---------- Input ----------
 CREATE TASK IF NOT EXISTS MyTask1 SCHEDULE = USING CRON '0 12 * * *' AS COPY streams_test.paper_table FROM '/tmp/stream_stage.parquet' WITH (FORMAT parquet)
 ---------- Output ---------
-CREATE TASK IF NOT EXISTS MyTask1 SCHEDULE = USING CRON '0 12 * * *' AS COPY streams_test.paper_table FROM '/tmp/stream_stage.parquet' WITH (format 'parquet')
+CREATE TASK IF NOT EXISTS mytask1 SCHEDULE = USING CRON '0 12 * * *' AS COPY streams_test.paper_table FROM '/tmp/stream_stage.parquet' WITH (format 'parquet')
 ---------- AST ------------
 CreateTask(
     CreateTaskStmt {
         create_option: CreateIfNotExists,
-        name: "MyTask1",
+        name: "mytask1",
         warehouse: None,
         schedule_opts: Some(
             CronExpression(
@@ -7141,12 +7141,12 @@ CreateTask(
 ---------- Input ----------
 CREATE TASK IF NOT EXISTS MyTask1 SCHEDULE = USING CRON '0 13 * * *' AS COPY canadian_city_population TO '/tmp/canadian_city_population.parquet' WITH (FORMAT parquet)
 ---------- Output ---------
-CREATE TASK IF NOT EXISTS MyTask1 SCHEDULE = USING CRON '0 13 * * *' AS COPY canadian_city_population TO '/tmp/canadian_city_population.parquet' WITH (format 'parquet')
+CREATE TASK IF NOT EXISTS mytask1 SCHEDULE = USING CRON '0 13 * * *' AS COPY canadian_city_population TO '/tmp/canadian_city_population.parquet' WITH (format 'parquet')
 ---------- AST ------------
 CreateTask(
     CreateTaskStmt {
         create_option: CreateIfNotExists,
-        name: "MyTask1",
+        name: "mytask1",
         warehouse: None,
         schedule_opts: Some(
             CronExpression(
@@ -7170,12 +7170,12 @@ CreateTask(
 ---------- Input ----------
 CREATE TASK IF NOT EXISTS MyTask1 AFTER 'task2', 'task3' WHEN SYSTEM$GET_PREDECESSOR_RETURN_VALUE('task_name') != 'VALIDATION' AS VACUUM TABLE t
 ---------- Output ---------
-CREATE TASK IF NOT EXISTS MyTask1 AFTER 'task2', 'task3' WHEN SYSTEM$GET_PREDECESSOR_RETURN_VALUE('task_name') <> 'VALIDATION' AS VACUUM TABLE t 
+CREATE TASK IF NOT EXISTS mytask1 AFTER 'task2', 'task3' WHEN system$get_predecessor_return_value('task_name') <> 'VALIDATION' AS VACUUM TABLE t
 ---------- AST ------------
 CreateTask(
     CreateTaskStmt {
         create_option: CreateIfNotExists,
-        name: "MyTask1",
+        name: "mytask1",
         warehouse: None,
         schedule_opts: None,
         session_parameters: {},
@@ -7203,7 +7203,7 @@ CreateTask(
                             span: Some(
                                 62..97,
                             ),
-                            name: "SYSTEM$GET_PREDECESSOR_RETURN_VALUE",
+                            name: "system$get_predecessor_return_value",
                             quote: None,
                             ident_type: None,
                         },
@@ -7235,7 +7235,7 @@ CreateTask(
             },
         ),
         sql: SingleStatement(
-            "VACUUM TABLE t ",
+            "VACUUM TABLE t",
         ),
     },
 )
@@ -7244,12 +7244,12 @@ CreateTask(
 ---------- Input ----------
 CREATE TASK IF NOT EXISTS MyTask1 DATABASE = 'target', TIMEZONE = 'America/Los Angeles'  AS VACUUM TABLE t
 ---------- Output ---------
-CREATE TASK IF NOT EXISTS MyTask1 database = 'target', timezone = 'America/Los Angeles' AS VACUUM TABLE t 
+CREATE TASK IF NOT EXISTS mytask1 database = 'target', timezone = 'America/Los Angeles' AS VACUUM TABLE t
 ---------- AST ------------
 CreateTask(
     CreateTaskStmt {
         create_option: CreateIfNotExists,
-        name: "MyTask1",
+        name: "mytask1",
         warehouse: None,
         schedule_opts: None,
         session_parameters: {
@@ -7262,7 +7262,7 @@ CreateTask(
         after: [],
         when_condition: None,
         sql: SingleStatement(
-            "VACUUM TABLE t ",
+            "VACUUM TABLE t",
         ),
     },
 )
@@ -7271,12 +7271,12 @@ CreateTask(
 ---------- Input ----------
 ALTER TASK MyTask1 RESUME
 ---------- Output ---------
-ALTER TASK MyTask1 RESUME
+ALTER TASK mytask1 RESUME
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
         options: Resume,
     },
 )
@@ -7285,12 +7285,12 @@ AlterTask(
 ---------- Input ----------
 ALTER TASK MyTask1 SUSPEND
 ---------- Output ---------
-ALTER TASK MyTask1 SUSPEND
+ALTER TASK mytask1 SUSPEND
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
         options: Suspend,
     },
 )
@@ -7299,12 +7299,12 @@ AlterTask(
 ---------- Input ----------
 ALTER TASK MyTask1 ADD AFTER 'task2', 'task3'
 ---------- Output ---------
-ALTER TASK MyTask1 ADD AFTER 'task2', 'task3'
+ALTER TASK mytask1 ADD AFTER 'task2', 'task3'
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
         options: AddAfter(
             [
                 "task2",
@@ -7318,12 +7318,12 @@ AlterTask(
 ---------- Input ----------
 ALTER TASK MyTask1 REMOVE AFTER 'task2'
 ---------- Output ---------
-ALTER TASK MyTask1 REMOVE AFTER 'task2'
+ALTER TASK mytask1 REMOVE AFTER 'task2'
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
         options: RemoveAfter(
             [
                 "task2",
@@ -7336,12 +7336,12 @@ AlterTask(
 ---------- Input ----------
 ALTER TASK MyTask1 SET WAREHOUSE= 'MyWarehouse' SCHEDULE = USING CRON '0 6 * * *' 'America/Los_Angeles' COMMENT = 'serverless + cron'
 ---------- Output ---------
-ALTER TASK MyTask1 SET WAREHOUSE = 'MyWarehouse' SCHEDULE = USING CRON '0 6 * * *' 'America/Los_Angeles' COMMENT = 'serverless + cron'
+ALTER TASK mytask1 SET WAREHOUSE = 'MyWarehouse' SCHEDULE = USING CRON '0 6 * * *' 'America/Los_Angeles' COMMENT = 'serverless + cron'
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
         options: Set {
             warehouse: Some(
                 "MyWarehouse",
@@ -7368,12 +7368,12 @@ AlterTask(
 ---------- Input ----------
 ALTER TASK MyTask1 SET WAREHOUSE= 'MyWarehouse' SCHEDULE = 13 MINUTE SUSPEND_TASK_AFTER_NUM_FAILURES = 10 COMMENT = 'serverless + cron'
 ---------- Output ---------
-ALTER TASK MyTask1 SET WAREHOUSE = 'MyWarehouse' SCHEDULE = 780 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 10 COMMENT = 'serverless + cron'
+ALTER TASK mytask1 SET WAREHOUSE = 'MyWarehouse' SCHEDULE = 780 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 10 COMMENT = 'serverless + cron'
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
         options: Set {
             warehouse: Some(
                 "MyWarehouse",
@@ -7400,12 +7400,12 @@ AlterTask(
 ---------- Input ----------
 ALTER TASK MyTask1 SET SCHEDULE = 5 SECOND WAREHOUSE='MyWarehouse' SUSPEND_TASK_AFTER_NUM_FAILURES = 10 COMMENT = 'serverless + cron'
 ---------- Output ---------
-ALTER TASK MyTask1 SET WAREHOUSE = 'MyWarehouse' SCHEDULE = 5 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 10 COMMENT = 'serverless + cron'
+ALTER TASK mytask1 SET WAREHOUSE = 'MyWarehouse' SCHEDULE = 5 SECOND SUSPEND_TASK_AFTER_NUM_FAILURES = 10 COMMENT = 'serverless + cron'
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
         options: Set {
             warehouse: Some(
                 "MyWarehouse",
@@ -7432,12 +7432,12 @@ AlterTask(
 ---------- Input ----------
 ALTER TASK MyTask1 SET DATABASE='newDB', TIMEZONE='America/Los_Angeles'
 ---------- Output ---------
-ALTER TASK MyTask1 SET database = 'newDB', timezone = 'America/Los_Angeles'
+ALTER TASK mytask1 SET database = 'newDB', timezone = 'America/Los_Angeles'
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
         options: Set {
             warehouse: None,
             schedule: None,
@@ -7458,12 +7458,12 @@ AlterTask(
 ---------- Input ----------
 ALTER TASK MyTask1 SET ERROR_INTEGRATION = 'candidate_notifictaion'
 ---------- Output ---------
-ALTER TASK MyTask1 SET ERROR_INTEGRATION = 'candidate_notifictaion'
+ALTER TASK mytask1 SET ERROR_INTEGRATION = 'candidate_notifictaion'
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
         options: Set {
             warehouse: None,
             schedule: None,
@@ -7481,15 +7481,15 @@ AlterTask(
 ---------- Input ----------
 ALTER TASK MyTask2 MODIFY AS SELECT CURRENT_VERSION()
 ---------- Output ---------
-ALTER TASK MyTask2 MODIFY AS SELECT CURRENT_VERSION()
+ALTER TASK mytask2 MODIFY AS SELECT current_version()
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask2",
+        name: "mytask2",
         options: ModifyAs(
             SingleStatement(
-                "SELECT CURRENT_VERSION()",
+                "SELECT current_version()",
             ),
         ),
     },
@@ -7499,12 +7499,12 @@ AlterTask(
 ---------- Input ----------
 ALTER TASK MyTask1 MODIFY WHEN SYSTEM$GET_PREDECESSOR_RETURN_VALUE('task_name') != 'VALIDATION'
 ---------- Output ---------
-ALTER TASK MyTask1 MODIFY WHEN SYSTEM$GET_PREDECESSOR_RETURN_VALUE('task_name') <> 'VALIDATION'
+ALTER TASK mytask1 MODIFY WHEN system$get_predecessor_return_value('task_name') <> 'VALIDATION'
 ---------- AST ------------
 AlterTask(
     AlterTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
         options: ModifyWhen(
             BinaryOp {
                 span: Some(
@@ -7522,7 +7522,7 @@ AlterTask(
                             span: Some(
                                 31..66,
                             ),
-                            name: "SYSTEM$GET_PREDECESSOR_RETURN_VALUE",
+                            name: "system$get_predecessor_return_value",
                             quote: None,
                             ident_type: None,
                         },
@@ -7560,12 +7560,12 @@ AlterTask(
 ---------- Input ----------
 DROP TASK MyTask1
 ---------- Output ---------
-DROP TASK MyTask1
+DROP TASK mytask1
 ---------- AST ------------
 DropTask(
     DropTaskStmt {
         if_exists: false,
-        name: "MyTask1",
+        name: "mytask1",
     },
 )
 
@@ -7573,7 +7573,7 @@ DropTask(
 ---------- Input ----------
 EXECUTE TASK MyTask
 ---------- Output ---------
-EXECUTE TASK MyTask
+EXECUTE TASK mytask
 ---------- AST ------------
 ExecuteTask(
     ExecuteTaskStmt {
@@ -7581,7 +7581,7 @@ ExecuteTask(
             span: Some(
                 13..19,
             ),
-            name: "MyTask",
+            name: "mytask",
             quote: None,
             ident_type: None,
         },
@@ -7592,7 +7592,7 @@ ExecuteTask(
 ---------- Input ----------
 DESC TASK MyTask
 ---------- Output ---------
-DESCRIBE TASK MyTask
+DESCRIBE TASK mytask
 ---------- AST ------------
 DescribeTask(
     DescribeTaskStmt {
@@ -7600,7 +7600,7 @@ DescribeTask(
             span: Some(
                 10..16,
             ),
-            name: "MyTask",
+            name: "mytask",
             quote: None,
             ident_type: None,
         },
@@ -7720,7 +7720,7 @@ DescribeConnection(
 ---------- Input ----------
 SHOW CONNECTIONS;
 ---------- Output ---------
-SHOW CONNECTIONS
+SHOW connections
 ---------- AST ------------
 VariableShow(
     VariableShowStmt {
@@ -7729,7 +7729,7 @@ VariableShow(
                 span: Some(
                     5..16,
                 ),
-                name: "CONNECTIONS",
+                name: "connections",
                 quote: None,
                 ident_type: None,
             },
@@ -7741,12 +7741,12 @@ VariableShow(
 ---------- Input ----------
 CREATE PIPE IF NOT EXISTS MyPipe1 AUTO_INGEST = TRUE COMMENT = 'This is test pipe 1' AS COPY MyTable1 FROM '/tmp/MyStage1.csv' WITH (FORMAT csv)
 ---------- Output ---------
-CREATE PIPE IF NOT EXISTS MyPipe1 AUTO_INGEST = TRUE COMMENTS = 'This is test pipe 1' AS COPY MyTable1 FROM '/tmp/MyStage1.csv' WITH (format 'csv')
+CREATE PIPE IF NOT EXISTS mypipe1 AUTO_INGEST = TRUE COMMENTS = 'This is test pipe 1' AS COPY mytable1 FROM '/tmp/MyStage1.csv' WITH (format 'csv')
 ---------- AST ------------
 CreatePipe(
     CreatePipeStmt {
         if_not_exists: true,
-        name: "MyPipe1",
+        name: "mypipe1",
         auto_ingest: true,
         comments: "This is test pipe 1",
         copy_stmt: CopyStmt {
@@ -7758,7 +7758,7 @@ CreatePipe(
                         span: Some(
                             93..101,
                         ),
-                        name: "MyTable1",
+                        name: "mytable1",
                         quote: None,
                         ident_type: None,
                     },
@@ -7787,7 +7787,7 @@ CreatePipe(
 ---------- Input ----------
 CREATE PIPE pipe1 AS COPY db1.MyTable1 FROM '/tmp/mybucket/data.csv'
 ---------- Output ---------
-CREATE PIPE pipe1 AS COPY db1.MyTable1 FROM '/tmp/mybucket/data.csv'
+CREATE PIPE pipe1 AS COPY db1.mytable1 FROM '/tmp/mybucket/data.csv'
 ---------- AST ------------
 CreatePipe(
     CreatePipeStmt {
@@ -7813,7 +7813,7 @@ CreatePipe(
                         span: Some(
                             30..38,
                         ),
-                        name: "MyTable1",
+                        name: "mytable1",
                         quote: None,
                         ident_type: None,
                     },
@@ -7936,12 +7936,12 @@ DescribePipe(
 ---------- Input ----------
 CREATE NOTIFICATION INTEGRATION IF NOT EXISTS SampleNotification type = webhook enabled = true webhook = (url = 'https://example.com', method = 'GET', authorization_header = 'bearer auth')
 ---------- Output ---------
-CREATE NOTIFICATION INTEGRATION IF NOT EXISTS SampleNotification TYPE = webhook ENABLED = true WEBHOOK = ( URL = 'https://example.com' METHOD = 'GET' AUTHORIZATION_HEADER = 'bearer auth' )
+CREATE NOTIFICATION INTEGRATION IF NOT EXISTS samplenotification TYPE = webhook ENABLED = true WEBHOOK = ( URL = 'https://example.com' METHOD = 'GET' AUTHORIZATION_HEADER = 'bearer auth' )
 ---------- AST ------------
 CreateNotification(
     CreateNotificationStmt {
         if_not_exists: true,
-        name: "SampleNotification",
+        name: "samplenotification",
         notification_type: "webhook",
         enabled: true,
         webhook_opts: Some(
@@ -7965,12 +7965,12 @@ CreateNotification(
 ---------- Input ----------
 CREATE NOTIFICATION INTEGRATION SampleNotification type = webhook enabled = true webhook = (url = 'https://example.com') COMMENT = 'notify'
 ---------- Output ---------
-CREATE NOTIFICATION INTEGRATION SampleNotification TYPE = webhook ENABLED = true WEBHOOK = ( URL = 'https://example.com' ) COMMENTS = 'notify'
+CREATE NOTIFICATION INTEGRATION samplenotification TYPE = webhook ENABLED = true WEBHOOK = ( URL = 'https://example.com' ) COMMENTS = 'notify'
 ---------- AST ------------
 CreateNotification(
     CreateNotificationStmt {
         if_not_exists: false,
-        name: "SampleNotification",
+        name: "samplenotification",
         notification_type: "webhook",
         enabled: true,
         webhook_opts: Some(
@@ -7992,12 +7992,12 @@ CreateNotification(
 ---------- Input ----------
 ALTER NOTIFICATION INTEGRATION SampleNotification SET enabled = true
 ---------- Output ---------
-ALTER NOTIFICATION INTEGRATION SampleNotification SET ENABLED = true
+ALTER NOTIFICATION INTEGRATION samplenotification SET ENABLED = true
 ---------- AST ------------
 AlterNotification(
     AlterNotificationStmt {
         if_exists: false,
-        name: "SampleNotification",
+        name: "samplenotification",
         options: Set(
             AlterNotificationSetOptions {
                 enabled: Some(
@@ -8014,12 +8014,12 @@ AlterNotification(
 ---------- Input ----------
 ALTER NOTIFICATION INTEGRATION SampleNotification SET webhook = (url = 'https://example.com')
 ---------- Output ---------
-ALTER NOTIFICATION INTEGRATION SampleNotification SET  WEBHOOK = ( URL = 'https://example.com' )
+ALTER NOTIFICATION INTEGRATION samplenotification SET  WEBHOOK = ( URL = 'https://example.com' )
 ---------- AST ------------
 AlterNotification(
     AlterNotificationStmt {
         if_exists: false,
-        name: "SampleNotification",
+        name: "samplenotification",
         options: Set(
             AlterNotificationSetOptions {
                 enabled: None,
@@ -8042,12 +8042,12 @@ AlterNotification(
 ---------- Input ----------
 ALTER NOTIFICATION INTEGRATION SampleNotification SET comment = '1'
 ---------- Output ---------
-ALTER NOTIFICATION INTEGRATION SampleNotification SET  COMMENTS = '1'
+ALTER NOTIFICATION INTEGRATION samplenotification SET  COMMENTS = '1'
 ---------- AST ------------
 AlterNotification(
     AlterNotificationStmt {
         if_exists: false,
-        name: "SampleNotification",
+        name: "samplenotification",
         options: Set(
             AlterNotificationSetOptions {
                 enabled: None,
@@ -8064,12 +8064,12 @@ AlterNotification(
 ---------- Input ----------
 DROP NOTIFICATION INTEGRATION SampleNotification
 ---------- Output ---------
-DROP NOTIFICATION INTEGRATION SampleNotification
+DROP NOTIFICATION INTEGRATION samplenotification
 ---------- AST ------------
 DropNotification(
     DropNotificationStmt {
         if_exists: false,
-        name: "SampleNotification",
+        name: "samplenotification",
     },
 )
 
@@ -8077,11 +8077,11 @@ DropNotification(
 ---------- Input ----------
 DESC NOTIFICATION INTEGRATION SampleNotification
 ---------- Output ---------
-DESCRIBE NOTIFICATION INTEGRATION SampleNotification
+DESCRIBE NOTIFICATION INTEGRATION samplenotification
 ---------- AST ------------
 DescribeNotification(
     DescribeNotificationStmt {
-        name: "SampleNotification",
+        name: "samplenotification",
     },
 )
 
@@ -9170,7 +9170,7 @@ DropProcedure(
 ---------- Input ----------
 show PROCEDURES
 ---------- Output ---------
-SHOW PROCEDURES
+SHOW procedures
 ---------- AST ------------
 VariableShow(
     VariableShowStmt {
@@ -9179,7 +9179,7 @@ VariableShow(
                 span: Some(
                     5..15,
                 ),
-                name: "PROCEDURES",
+                name: "procedures",
                 quote: None,
                 ident_type: None,
             },
@@ -9566,7 +9566,7 @@ DescSequence {
 ---------- Input ----------
 SHOW SEQUENCES
 ---------- Output ---------
-SHOW SEQUENCES
+SHOW sequences
 ---------- AST ------------
 VariableShow(
     VariableShowStmt {
@@ -9575,7 +9575,7 @@ VariableShow(
                 span: Some(
                     5..14,
                 ),
-                name: "SEQUENCES",
+                name: "sequences",
                 quote: None,
                 ident_type: None,
             },

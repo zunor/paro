@@ -15,6 +15,7 @@ mod buffer_allocator;
 #[cfg(debug_assertions)]
 mod debug_info;
 mod default_allocator;
+mod process_metrics;
 
 pub use allocated_data::AllocatedData;
 pub use allocator::Allocator;
@@ -25,6 +26,10 @@ pub use buffer_allocator::{
     MemoryUsageSnapshot, MEMORY_TAG_COUNT,
 };
 pub use default_allocator::DefaultAllocator;
+pub use process_metrics::{
+    allocated_bytes_since, begin_allocation_metrics, thread_allocated_bytes,
+    AllocationMetricsGuard, MetricsSystemAllocator,
+};
 
 /// Create a default allocator.
 ///

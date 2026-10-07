@@ -592,9 +592,16 @@ impl SegmentIterator {
             let use_late_materialization = explicit_predicate_columns.is_some();
             let evaluator =
                 IndexEvaluator::for_segment(segment.predicate_indexes()?, segment.num_rows());
-            let needs_row_level_eval =
-                PredicateEvaluator::requires_row_level_predicate_eval(&evaluator, &tree);
-            let index_evaluation = evaluator.evaluate_with_proof(&tree);
+            let index_analysis = evaluator.analyze(&tree);
+            let needs_row_level_eval = index_analysis.requires_row_verification();
+            let predicate_evaluator = PredicateEvaluator::new(
+                segment,
+                tree,
+                &index_analysis,
+                self.prefetcher.clone(),
+                explicit_predicate_columns,
+            )?;
+            let index_evaluation = index_analysis.into_evaluation();
             let (candidates, guaranteed) = index_evaluation.into_parts();
             self.predicate_guaranteed = guaranteed;
             self.evaluated_selection = candidates;
@@ -607,13 +614,7 @@ impl SegmentIterator {
                 }
             }
             self.update_selection_tracker();
-            self.predicate_evaluator = PredicateEvaluator::new(
-                segment,
-                tree,
-                &evaluator,
-                self.prefetcher.clone(),
-                explicit_predicate_columns,
-            )?;
+            self.predicate_evaluator = predicate_evaluator;
             self.late_materialization = self.predicate_evaluator.as_ref().and_then(|evaluator| {
                 (use_late_materialization
                     || !evaluator.all_columns_projected(&self.column_iterators))
@@ -639,6 +640,13 @@ impl SegmentIterator {
     #[cfg(test)]
     pub(crate) fn uses_late_materialize(&self) -> bool {
         self.late_materialization.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reused_predicate_column_count(&self) -> usize {
+        self.late_materialization
+            .as_ref()
+            .map_or(0, |state| state.reused_predicate_columns.len())
     }
 
     #[cfg(test)]
@@ -1213,7 +1221,7 @@ impl SegmentIterator {
                         .expect("late materialization requires selection state")
                         .predicate_matches,
                 );
-                let rows_read = self
+                let (rows_read, reusable_batches) = self
                     .predicate_evaluator
                     .as_mut()
                     .expect("late materialization requires predicate evaluator")
@@ -1225,7 +1233,7 @@ impl SegmentIterator {
                         &mut self.predicate_stage_read_stats,
                     )?;
                 staged_matches = Some(matches);
-                (rows_read, Vec::new())
+                (rows_read, reusable_batches)
             } else {
                 self.predicate_evaluator
                     .as_mut()

@@ -246,7 +246,13 @@ impl ScalarFunction {
 }
 
 #[derive(Clone)]
-pub struct BoundScalarFunction {
+pub struct BoundScalarFunction(Arc<BoundScalarFunctionData>);
+
+/// Immutable binding storage shared by bound expressions, native scalar nodes
+/// and executable programs. A binder specialization detaches this one object;
+/// existing plans keep the exact kernel contract they captured.
+#[derive(Clone)]
+pub struct BoundScalarFunctionData {
     pub name: String,
     pub arguments: Vec<LogicalType>,
     pub return_type: LogicalType,
@@ -262,6 +268,21 @@ pub struct BoundScalarFunction {
     pub error_mode: FunctionErrorMode,
     pub dictionary_strategy: DictionaryStrategy,
 }
+
+impl std::ops::Deref for BoundScalarFunction {
+    type Target = BoundScalarFunctionData;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for BoundScalarFunction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<BoundScalarFunction>() <= 16);
 
 impl Debug for BoundScalarFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -286,7 +307,7 @@ impl Debug for BoundScalarFunction {
 
 impl From<ScalarFunction> for BoundScalarFunction {
     fn from(function: ScalarFunction) -> Self {
-        Self {
+        Self(Arc::new(BoundScalarFunctionData {
             name: function.name,
             arguments: function.arguments,
             return_type: function.return_type,
@@ -301,11 +322,17 @@ impl From<ScalarFunction> for BoundScalarFunction {
             bind_data: None,
             error_mode: FunctionErrorMode::CanError,
             dictionary_strategy: DictionaryStrategy::Materialize,
-        }
+        }))
     }
 }
 
 impl BoundScalarFunction {
+    /// A sufficient identity proof for two live immutable binding handles.
+    /// Independently bound equal kernels still need semantic comparison.
+    pub fn shares_binding_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn execute(
         &self,
         input: &Chunk,
@@ -581,6 +608,36 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
+    }
+
+    #[test]
+    fn bound_kernel_clones_share_storage_and_specialization_detaches() {
+        let original = BoundScalarFunction::from(ScalarFunction::new(
+            "shared_binding".into(),
+            vec![LogicalType::Integer],
+            LogicalType::Integer,
+            dummy_function,
+        ))
+        .with_bind_data(TestBindData { value: 3 });
+        let mut specialized = original.clone();
+        assert!(original.shares_binding_with(&specialized));
+        assert_eq!(original.arguments.as_ptr(), specialized.arguments.as_ptr());
+        specialized.arguments[0] = LogicalType::BigInt;
+        specialized = specialized.with_bind_data(TestBindData { value: 7 });
+        specialized.error_mode = FunctionErrorMode::Infallible;
+        assert!(!original.shares_binding_with(&specialized));
+        assert_eq!(original.arguments, [LogicalType::Integer]);
+        assert_eq!(specialized.arguments, [LogicalType::BigInt]);
+        assert_eq!(original.get_bind_data::<TestBindData>().unwrap().value, 3);
+        assert_eq!(
+            specialized.get_bind_data::<TestBindData>().unwrap().value,
+            7
+        );
+        assert_eq!(original.error_mode, FunctionErrorMode::CanError);
+        assert_eq!(
+            std::mem::size_of::<BoundScalarFunction>(),
+            std::mem::size_of::<usize>()
+        );
     }
 
     fn bind_with_constant(

@@ -12,16 +12,82 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Builder;
 
+#[cfg(feature = "alloc-metrics")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: paro_common::allocator::MetricsSystemAllocator =
+    paro_common::allocator::MetricsSystemAllocator;
+
 const DEFAULT_PAROD_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 const MIN_PAROD_WORKER_STACK_SIZE: usize = 1024 * 1024;
 const PAROD_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
+/// Minimum descriptors needed by a server before accepting workload connections.
+///
+/// This is deliberately a process-local startup contract, not a request to
+/// change the host-wide limit.  A fresh macOS shell commonly starts at 256,
+/// which is below the number of catalog/storage files plus listener and client
+/// sockets a normal instance can legitimately hold.
+const MIN_PAROD_OPEN_FILES: u64 = 4096;
 
 fn main() -> anyhow::Result<()> {
+    ensure_open_file_limit()?;
     Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(parod_worker_stack_size())
         .build()?
         .block_on(async_main())
+}
+
+#[cfg(unix)]
+fn ensure_open_file_limit() -> anyhow::Result<()> {
+    use std::mem::MaybeUninit;
+
+    let mut current = MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `getrlimit` initializes the supplied rlimit on success.
+    let get_result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, current.as_mut_ptr()) };
+    if get_result != 0 {
+        return Err(anyhow::anyhow!(
+            "failed to inspect RLIMIT_NOFILE: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the preceding successful getrlimit initialized `current`.
+    let mut limits = unsafe { current.assume_init() };
+    let original_soft = limits.rlim_cur;
+    let minimum = MIN_PAROD_OPEN_FILES as libc::rlim_t;
+    if limits.rlim_cur >= minimum {
+        return Ok(());
+    }
+
+    let target = minimum.min(limits.rlim_max);
+    if target <= limits.rlim_cur {
+        return Err(anyhow::anyhow!(
+            "open-file limit is too low for parod: soft={} hard={} required_at_least={}; \
+             raise the process hard limit before starting parod",
+            limits.rlim_cur,
+            limits.rlim_max,
+            MIN_PAROD_OPEN_FILES
+        ));
+    }
+    limits.rlim_cur = target;
+    // SAFETY: `limits` came from getrlimit and only its soft bound is raised,
+    // never above the inherited hard bound.
+    let set_result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) };
+    if set_result != 0 {
+        return Err(anyhow::anyhow!(
+            "unable to raise parod open-file limit from {} to {} (hard={}): {}; \
+             set the process limit before starting parod",
+            original_soft,
+            target,
+            limits.rlim_max,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_open_file_limit() -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn parod_worker_stack_size() -> usize {
@@ -50,6 +116,9 @@ async fn async_main() -> anyhow::Result<()> {
     let mut config = ConfigLoader::load_with_options(args.config.clone())?;
 
     args.apply_to(&mut config);
+
+    // Freeze what the server observed before any session can query it.
+    paro_context::initialize_diagnostic_environment();
 
     let log_manager = LogManager::init(config.logging.clone())
         .map_err(|e| anyhow::anyhow!("Failed to initialize logging: {}", e))?;

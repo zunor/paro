@@ -416,12 +416,21 @@ impl<'a> HnswSearchFilter<'a> {
 /// result contract: every admitted vector is scored and the graph is not
 /// consulted. It deliberately does not expose a numeric recall target because
 /// an approximate graph cannot prove such a probability for one query.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HnswSearchObjective {
-    #[default]
     CostOptimized,
     Exact,
+}
+
+impl Default for HnswSearchObjective {
+    /// SQL and typed APIs have an exact result contract unless the caller
+    /// explicitly opts into the definition-pinned approximate policy.  The
+    /// optimizer must never infer weaker semantics from index availability or
+    /// cost alone.
+    fn default() -> Self {
+        Self::Exact
+    }
 }
 
 /// Definition-pinned policy for crossing the lossy graph-routing boundary.

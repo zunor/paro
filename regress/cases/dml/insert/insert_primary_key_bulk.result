@@ -5,7 +5,7 @@ INSERT 0 100000
 
 SELECT COUNT(*), MIN(id), MAX(id)
 FROM dml_insert_primary_key_bulk_case;
-COUNT(*)	MIN(id)	MAX(id)
+COUNT(*)	min(id)	max(id)
 100000	1	100000
 
 SELECT id, v

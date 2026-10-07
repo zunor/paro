@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use paro_catalog::entry::CatalogEntryEnum;
 use paro_common::allocator::MemoryTag;
@@ -16,7 +17,8 @@ use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput
 use crate::physical::specs::RowFetchSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::state::{
-    RowFetchTableState, RowFetchTransformLocal, TransformGlobal, TransformLocal,
+    RowFetchTableBinding, RowFetchTableState, RowFetchTransformGlobal, RowFetchTransformLocal,
+    TransformGlobal, TransformLocal,
 };
 use crate::runtime::transform::{TransformFinishPoll, TransformFlushPoll, TransformPoll};
 use crate::runtime::{read_u64_from_vector, ExpressionEvalInput};
@@ -27,15 +29,7 @@ pub struct RowFetchTransformExec {
 }
 
 impl RowFetchTransformExec {
-    pub(crate) fn create_global(&self, _ctx: &mut PipelineInitContext) -> Result<TransformGlobal> {
-        Ok(TransformGlobal::Empty)
-    }
-
-    pub(crate) fn create_local(
-        &self,
-        ctx: &mut PipelineInitContext,
-        _global: &TransformGlobal,
-    ) -> Result<TransformLocal> {
+    pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<TransformGlobal> {
         let table_fetches = self
             .spec
             .mappings
@@ -59,17 +53,34 @@ impl RowFetchTransformExec {
                     .transaction
                     .read_tracker()
                     .record_table_read(TableId::new(storage.table_id()));
-                Ok(RowFetchTableState {
+                Ok(RowFetchTableBinding {
                     table_name: mapping.table_name.clone(),
                     rowid_col_idx: mapping.rowid_col_idx,
                     storage: storage.clone(),
                     storage_snapshot: ctx.query.storage_snapshot(storage)?,
-                    reader: None,
-                    rowids: Vec::new(),
                     column_ids: mapping.column_ids.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?
+            .into_boxed_slice();
+        Ok(TransformGlobal::RowFetch(Arc::new(
+            RowFetchTransformGlobal { table_fetches },
+        )))
+    }
+
+    pub(crate) fn create_local(
+        &self,
+        ctx: &mut PipelineInitContext,
+        global: &TransformGlobal,
+    ) -> Result<TransformLocal> {
+        let TransformGlobal::RowFetch(global) = global else {
+            return Err(paro_error::internal("row-fetch global state mismatch"));
+        };
+        let table_fetches = global
+            .table_fetches
+            .iter()
+            .map(RowFetchTableState::from_binding)
+            .collect::<Vec<_>>()
             .into_boxed_slice();
 
         let direct_project_columns = self.spec.projection.as_ref().and_then(|projection| {
@@ -169,9 +180,9 @@ impl RowFetchTransformExec {
             }
             let fetched = fetch
                 .reader
-                .as_ref()
+                .as_mut()
                 .expect("row-fetch reader initialized above")
-                .get_by_rowids(&fetch.rowids, &fetch.column_ids)?;
+                .get_by_rowids(&fetch.rowids)?;
             local.combined_columns.extend(
                 (0..fetched.column_count()).filter_map(|index| fetched.column(index).cloned()),
             );
@@ -183,21 +194,20 @@ impl RowFetchTransformExec {
                 self.spec.raw_output_types.len()
             )));
         }
-        let materialized = Chunk::try_from_arc_vectors_with_cardinality(
-            local.combined_columns.clone(),
-            input.size(),
-            output.allocator().clone(),
-        )?;
 
         let Some(projection) = self.spec.projection.as_ref() else {
-            *output = materialized;
+            *output = Chunk::try_from_arc_vectors_with_cardinality(
+                local.combined_columns.clone(),
+                input.size(),
+                output.allocator().clone(),
+            )?;
             return Ok(TransformPoll::Output);
         };
         if let Some(columns) = local.direct_project_columns.as_ref() {
             let columns = columns
                 .iter()
                 .map(|&index| {
-                    materialized.column(index).cloned().ok_or_else(|| {
+                    local.combined_columns.get(index).cloned().ok_or_else(|| {
                         paro_error::internal(format!(
                             "row-fetch fused projection column {index} is missing"
                         ))
@@ -211,6 +221,11 @@ impl RowFetchTransformExec {
             )?;
             return Ok(TransformPoll::Output);
         }
+        let materialized = Chunk::try_from_arc_vectors_with_cardinality(
+            local.combined_columns.clone(),
+            input.size(),
+            output.allocator().clone(),
+        )?;
         let mut projected = Chunk::try_initialize(
             &projection.output_types,
             input.size(),

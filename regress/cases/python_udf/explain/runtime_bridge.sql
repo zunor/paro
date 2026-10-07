@@ -16,7 +16,7 @@ SELECT py_explain(v)
 FROM (VALUES (1), (2)) AS t(v)
 ORDER BY 1;
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_routine_ids,explain_external_runtime
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_routine_ids,explain_external_runtime,explain_logical_ids
 EXPLAIN ANALYZE
 SELECT py_explain(v)
 FROM (VALUES (1), (2)) AS t(v)

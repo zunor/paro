@@ -517,7 +517,7 @@ def _check_inequality_join_guard() -> list[str]:
         "fill_classic_ie_join_offsets",
         "ClassicIeJoinOffsetSpec",
     ]
-    generator = _read("crates/execution/src/physical/generator/inequality_join_gate.rs")
+    generator = _read("crates/optimizer/src/physical/lower/inequality_join_gate.rs")
     required_state = [
         "SortRangeProbeOffsets",
         "SortRangeCandidateRange",
@@ -683,17 +683,17 @@ def _check_rowstore_boundary_guard() -> list[str]:
         "crates/execution/src/operators/join/hash/memory.rs",
         "crates/execution/src/pipeline/lowerer/breaker_lowering.rs",
         "crates/execution/src/pipeline/lowerer/pipeline_dispatch.rs",
-        "crates/execution/src/physical/specs/mod.rs",
-        "crates/execution/src/physical/specs/scan.rs",
-        "crates/execution/src/physical/specs/join.rs",
-        "crates/execution/src/physical/specs/aggregate.rs",
-        "crates/execution/src/physical/specs/sort.rs",
-        "crates/execution/src/physical/specs/window.rs",
-        "crates/execution/src/physical/specs/search.rs",
-        "crates/execution/src/physical/specs/graph.rs",
-        "crates/execution/src/physical/specs/dml.rs",
-        "crates/execution/src/physical/specs/external.rs",
-        "crates/execution/src/physical/specs/utility.rs",
+        "crates/planner/src/physical/specs/mod.rs",
+        "crates/planner/src/physical/specs/scan.rs",
+        "crates/planner/src/physical/specs/join.rs",
+        "crates/planner/src/physical/specs/aggregate.rs",
+        "crates/planner/src/physical/specs/sort.rs",
+        "crates/planner/src/physical/specs/window.rs",
+        "crates/planner/src/physical/specs/search.rs",
+        "crates/planner/src/physical/specs/graph.rs",
+        "crates/planner/src/physical/specs/dml.rs",
+        "crates/planner/src/physical/specs/external.rs",
+        "crates/planner/src/physical/specs/utility.rs",
     ]
     for rel in required_files:
         if not (REPO_ROOT / rel).exists():
@@ -702,8 +702,8 @@ def _check_rowstore_boundary_guard() -> list[str]:
 
 
 def _check_rowset_pushdown_consumption() -> list[str]:
-    specs = _read("crates/execution/src/physical/specs/scan.rs")
-    generator = _read("crates/execution/src/physical/generator/scan.rs")
+    specs = _read("crates/planner/src/physical/specs/scan.rs")
+    generator = _read("crates/optimizer/src/physical/lower/scan.rs")
     rowset = _read("crates/execution/src/operators/scan/rowset.rs")
     body = _struct_body(specs, "RowsetScanSpec")
     fields = set(re.findall(r"pub\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:", body))
@@ -767,7 +767,7 @@ def _check_scheduler_wiring_guard() -> list[str]:
 def _check_explain_profile_schema_guard() -> list[str]:
     profiler = _strip_test_sections(_read("crates/execution/src/explain/profiler.rs"))
     render = _strip_test_sections(_read("crates/execution/src/explain/analyze_render.rs"))
-    types = _strip_test_sections(_read("crates/execution/src/explain/types.rs"))
+    types = _strip_test_sections(_read("crates/planner/src/physical/explain/types.rs"))
     scheduler = _strip_test_sections(_read("crates/execution/src/runtime/scheduler.rs"))
     pipeline_driver = _strip_test_sections(
         _read("crates/execution/src/query_executor/pipeline_driver.rs")

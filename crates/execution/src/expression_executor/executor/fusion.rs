@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::Vector;
 use paro_function::scalar::operators::arithmetic::{
     try_execute_decimal_factor_chain, DecimalOperandSide,
@@ -13,8 +14,73 @@ use paro_function::scalar::operators::arithmetic::{
 
 use super::*;
 use crate::expression_executor::program::PhysicalDecimalFactorChain;
+use crate::expression_executor::program::PhysicalVarcharEqualityDispatch;
 
 impl ExpressionExecutor {
+    pub(super) fn try_execute_varchar_equality_dispatch(
+        dispatch: &PhysicalVarcharEqualityDispatch,
+        input: VectorKernelInput<'_>,
+        result: &mut Chunk,
+    ) -> Result<bool> {
+        if dispatch.outputs.len() != dispatch.constants.len() {
+            return Err(paro_error::internal(
+                "VARCHAR equality dispatch descriptor length mismatch",
+            ));
+        }
+        let Some(source) = input.columns.column(dispatch.input_index) else {
+            return Ok(false);
+        };
+        if source.logical_type() != &LogicalType::Varchar {
+            return Ok(false);
+        }
+        for &output in dispatch.outputs.iter() {
+            let Some(column) = result.column(output) else {
+                return Ok(false);
+            };
+            if column.logical_type() != &LogicalType::Boolean
+                || column.vector_type() != paro_common::vector::VectorType::Flat
+            {
+                return Ok(false);
+            }
+        }
+
+        let mut output_data = Vec::with_capacity(dispatch.outputs.len());
+        for &output in dispatch.outputs.iter() {
+            let column = result
+                .column_mut(output)
+                .expect("validated equality dispatch output");
+            column.set_len(input.count);
+            column.validity_mut().set_all_valid(input.count);
+            let data = unsafe { column.flat_data_mut::<bool>() };
+            unsafe { std::ptr::write_bytes(data, 0, input.count) };
+            output_data.push(data);
+        }
+
+        let selected = input.selection.map(SelectionVector::as_slice);
+        for row in 0..input.count {
+            let source_row = selected.map_or(row, |selection| selection[row] as usize);
+            if source.is_null(source_row) {
+                for &output in dispatch.outputs.iter() {
+                    result
+                        .column_mut(output)
+                        .expect("validated equality dispatch output")
+                        .validity_mut()
+                        .set_null(row);
+                }
+                continue;
+            }
+            let value = unsafe { source.get_fixed::<StringView>(source_row) };
+            if let Some(output) = dispatch
+                .constants
+                .iter()
+                .position(|constant| *constant == value)
+            {
+                unsafe { *output_data[output].add(row) = true };
+            }
+        }
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_execute_decimal_factor_chain(
         chain: &PhysicalDecimalFactorChain,

@@ -53,12 +53,22 @@ FROM generate_series(1, 2048) AS generated(i);
 REFRESH VECTOR INDEX idx_indexed_items_emb ON indexed_items;
 SELECT index_name, index_type FROM paro_indexes()
 WHERE index_name = 'idx_indexed_items_emb';
+
+-- A session can opt the database workload into cost-optimized vector search;
+-- an explicit query hint remains the narrower override.
+SET vector_search_objective = 'cost_optimized';
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+RESET vector_search_objective;
+
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 
--- A scalar predicate must become part of VECTOR_SEARCH, not remain as a
--- relational FILTER above it. EXPLAIN also exposes the exact-vs-graph policy.
+-- A scalar predicate must be absorbed into the winning source implementation,
+-- not remain as a relational FILTER. The specialized vector provider and the
+-- generic scalar-index/late-fetch path remain costed alternatives.
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
 WHERE bucket = 3
@@ -76,9 +86,13 @@ ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 EXPLAIN SELECT id FROM indexed_items
 WHERE id <= 1024
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
-SELECT id FROM indexed_items
-WHERE id <= 1024
-ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+-- Every stored vector is equal, so validate the bounded result without making
+-- the SQL contract depend on an implementation-specific Top-K tie order.
+SELECT count(*) AS selected_rows FROM (
+    SELECT id FROM indexed_items
+    WHERE id <= 1024
+    ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2
+) AS selected;
 
 -- A cosine operator must not consume an L2 artifact. Metric mismatch is a
 -- capability miss and falls back to the exact relational plan.

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::binder::bind::expr::ExpressionBinder;
 use crate::binder::ir::BoundSelect;
 use crate::expression::Expression;
-use crate::operator::ColumnBinding;
+use crate::logical::operator::ColumnBinding;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_parser::ast::{ColumnRef, Expr};
@@ -149,7 +149,8 @@ impl<'a> HavingBinder<'a> {
                 return_type,
                 binding,
                 depth: 0,
-            },
+            }
+            .into(),
         ))
     }
 }

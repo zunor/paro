@@ -25,7 +25,7 @@ pub use collections::{
     PrecomputedHashBuildHasher,
 };
 pub use domain::{MemoryDomain, MEMORY_DOMAIN_COUNT};
-pub use error::{MemoryError, MemoryResult};
+pub use error::{MemoryError, MemoryResult, UncappedMemoryDemand};
 pub use grant_allocator::GrantAllocator;
 pub use grant_arena::GrantArena;
 pub use grant_buffer::{GrantAllocation, GrantBuffer};

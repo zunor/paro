@@ -198,15 +198,15 @@ fn bench_state() -> &'static BenchState {
 }
 
 fn reference_bigint(index: usize) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, LogicalType::BigInt))
+    Expression::Reference(ReferenceExpression::new(index, LogicalType::BigInt).into())
 }
 
 fn reference_i32(index: usize) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer))
+    Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer).into())
 }
 
 fn reference_bool(index: usize) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, LogicalType::Boolean))
+    Expression::Reference(ReferenceExpression::new(index, LogicalType::Boolean).into())
 }
 
 fn nullable_i32_vector(values: &[Option<i32>]) -> Vector {
@@ -280,20 +280,21 @@ fn abs_expr() -> Expression {
         LogicalType::BigInt,
         abs_function,
     );
-    Expression::Function(FunctionExpression::new(
-        function,
-        vec![reference_bigint(0)],
-        LogicalType::BigInt,
-    ))
+    Expression::Function(
+        FunctionExpression::new(function, vec![reference_bigint(0)], LogicalType::BigInt).into(),
+    )
 }
 
 fn cast_i32_to_i64_expr() -> Expression {
-    Expression::Cast(CastExpression::new(
-        reference_i32(0),
-        LogicalType::BigInt,
-        BoundCastInfo::fixed(numeric_casts::int32_to_int64),
-        false,
-    ))
+    Expression::Cast(
+        CastExpression::new(
+            reference_i32(0),
+            LogicalType::BigInt,
+            BoundCastInfo::fixed(numeric_casts::int32_to_int64),
+            false,
+        )
+        .into(),
+    )
 }
 
 fn not_expr() -> Expression {
@@ -303,11 +304,9 @@ fn not_expr() -> Expression {
         LogicalType::Boolean,
         not_function,
     );
-    Expression::Function(FunctionExpression::new(
-        function,
-        vec![reference_bool(0)],
-        LogicalType::Boolean,
-    ))
+    Expression::Function(
+        FunctionExpression::new(function, vec![reference_bool(0)], LogicalType::Boolean).into(),
+    )
 }
 
 fn add_expr() -> Expression {
@@ -317,19 +316,20 @@ fn add_expr() -> Expression {
         LogicalType::BigInt,
         add_function,
     );
-    Expression::Function(FunctionExpression::new(
-        function,
-        vec![reference_bigint(0), reference_bigint(1)],
-        LogicalType::BigInt,
-    ))
+    Expression::Function(
+        FunctionExpression::new(
+            function,
+            vec![reference_bigint(0), reference_bigint(1)],
+            LogicalType::BigInt,
+        )
+        .into(),
+    )
 }
 
 fn comparison_expr(comparison_type: ComparisonType) -> Expression {
-    Expression::Comparison(ComparisonExpression::new(
-        comparison_type,
-        reference_bigint(0),
-        reference_bigint(1),
-    ))
+    Expression::Comparison(
+        ComparisonExpression::new(comparison_type, reference_bigint(0), reference_bigint(1)).into(),
+    )
 }
 
 fn between_expr() -> Expression {
@@ -343,38 +343,50 @@ fn between_expr() -> Expression {
         LogicalType::Boolean,
         between_function,
     );
-    Expression::Function(FunctionExpression::new(
-        function,
-        vec![
-            reference_bigint(0),
-            reference_bigint(1),
-            reference_bigint(2),
-        ],
-        LogicalType::Boolean,
-    ))
+    Expression::Function(
+        FunctionExpression::new(
+            function,
+            vec![
+                reference_bigint(0),
+                reference_bigint(1),
+                reference_bigint(2),
+            ],
+            LogicalType::Boolean,
+        )
+        .into(),
+    )
 }
 
 fn is_null_expr() -> Expression {
-    Expression::Operator(OperatorExpression::new(
-        OperatorType::IsNull,
-        vec![reference_i32(0)],
-        LogicalType::Boolean,
-    ))
+    Expression::Operator(
+        OperatorExpression::new(
+            OperatorType::IsNull,
+            vec![reference_i32(0)],
+            LogicalType::Boolean,
+        )
+        .into(),
+    )
 }
 
 fn constant_i32(value: i32) -> Expression {
-    Expression::Constant(paro_planner::expression::ConstantExpression::new(
-        Value::Integer(value),
-        LogicalType::Integer,
-    ))
+    Expression::Constant(
+        paro_planner::expression::ConstantExpression::new(
+            Value::Integer(value),
+            LogicalType::Integer,
+        )
+        .into(),
+    )
 }
 
 fn coalesce_i32_expr() -> Expression {
-    Expression::Operator(OperatorExpression::new(
-        OperatorType::Coalesce,
-        vec![reference_i32(0), reference_i32(1), constant_i32(777)],
-        LogicalType::Integer,
-    ))
+    Expression::Operator(
+        OperatorExpression::new(
+            OperatorType::Coalesce,
+            vec![reference_i32(0), reference_i32(1), constant_i32(777)],
+            LogicalType::Integer,
+        )
+        .into(),
+    )
 }
 
 fn in_list_i32_expr(values: &[i32]) -> Expression {
@@ -383,11 +395,9 @@ fn in_list_i32_expr(values: &[i32]) -> Expression {
     for value in values {
         children.push(constant_i32(*value));
     }
-    Expression::Operator(OperatorExpression::new(
-        OperatorType::In,
-        children,
-        LogicalType::Boolean,
-    ))
+    Expression::Operator(
+        OperatorExpression::new(OperatorType::In, children, LogicalType::Boolean).into(),
+    )
 }
 
 #[divan::bench(sample_count = 10)]

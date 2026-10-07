@@ -6,8 +6,8 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  FILTER  (rows=2)
-    Filter: t.id IN (1, 2, 3, 4, 5)
-    ->  VALUES  (rows=3)
+        Filter: t.id IN (1, 2, 3, 4, 5)
+        ->  VALUES  (rows=3)
 
 SELECT id
 FROM (VALUES (1), (2), (6)) AS t(id)

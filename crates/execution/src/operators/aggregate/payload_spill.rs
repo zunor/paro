@@ -50,8 +50,23 @@ pub(crate) enum AggregateStateEncoding {
 /// The upper bound matches the aggregate table's radix implementation. A
 /// consumer can repartition a pathological partition later without changing
 /// the raw-payload format.
-pub(crate) fn aggregate_spill_radix_bits(parallelism: usize) -> usize {
-    parallelism.next_power_of_two().trailing_zeros().clamp(1, 4) as usize
+pub(crate) fn aggregate_spill_radix_bits(
+    parallelism: usize,
+    admitted_memory_bytes: usize,
+) -> usize {
+    let task_bits = parallelism.next_power_of_two().trailing_zeros().clamp(1, 4) as usize;
+    // External aggregation must be able to rebuild one partition inside the
+    // admitted lease. Low-memory variants therefore choose a finer immutable
+    // partitioning policy even when their DOP is one. Sixteen partitions keep
+    // metadata bounded while leaving at least three quarters of small leases
+    // available for tuple/state storage and migration scratch.
+    let memory_bits = match admitted_memory_bytes {
+        0..=8_388_608 => 4,
+        8_388_609..=33_554_432 => 3,
+        33_554_433..=134_217_728 => 2,
+        _ => 1,
+    };
+    task_bits.max(memory_bits)
 }
 
 impl AggregatePayloadSpillBuffer {
@@ -125,7 +140,15 @@ impl AggregatePayloadSpillBuffer {
     }
 
     pub(crate) fn seal(self) -> AggregateSpilledPayload {
+        self.seal_for_grouping(0)
+    }
+
+    /// Seal one payload stream whose radix hash belongs to a specific
+    /// grouping domain. Ordinary aggregates use domain zero; grouping-set
+    /// fallback writes one independently hashed stream per domain.
+    pub(crate) fn seal_for_grouping(self, grouping_idx: usize) -> AggregateSpilledPayload {
         AggregateSpilledPayload {
+            grouping_idx,
             format: self.format,
             rows: self.builder.seal(),
         }
@@ -206,6 +229,7 @@ impl AggregateStateSpillBuffer {
 
 #[derive(Debug)]
 pub(crate) struct AggregateSpilledPayload {
+    grouping_idx: usize,
     format: AggregatePayloadFormat,
     rows: RadixPartitionedRows,
 }
@@ -218,6 +242,11 @@ pub(crate) struct AggregateSpilledState {
 }
 
 impl AggregateSpilledPayload {
+    #[inline]
+    pub(crate) fn grouping_idx(&self) -> usize {
+        self.grouping_idx
+    }
+
     #[inline]
     pub(crate) fn partition_count(&self) -> usize {
         self.rows.partition_count()
@@ -240,6 +269,7 @@ impl AggregateSpilledPayload {
     /// atomic: a failed repartition leaves no second live directory published.
     pub(crate) fn into_repartitioned(self, radix_bits: usize) -> Result<Self> {
         Ok(Self {
+            grouping_idx: self.grouping_idx,
             format: self.format,
             rows: self.rows.into_repartitioned(radix_bits)?,
         })
@@ -426,20 +456,19 @@ mod tests {
     use crate::physical::specs::{AggregateSpec, GroupKeyEncoding};
 
     fn reference(index: usize, ty: LogicalType) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, ty))
+        Expression::Reference(ReferenceExpression::new(index, ty).into())
     }
 
     fn count_star_expression() -> Expression {
-        Expression::Aggregate(AggregateExpression::new(
-            get_count_star_function(),
-            vec![],
-            LogicalType::BigInt,
-        ))
+        Expression::Aggregate(
+            AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+        )
     }
 
     fn grouped_count_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 1,
+            initial_lookup_hash_key_count: 1,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([]),
@@ -454,6 +483,7 @@ mod tests {
             aggregate_orders: Box::new([Box::new([])]),
             post_reduction: None,
             having_filter: Box::new([]),
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
             perfect_hash: None,
             output_names: Box::new(["k".to_string(), "count".to_string()]),
             output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
@@ -463,6 +493,7 @@ mod tests {
     fn grouped_varchar_count_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 1,
+            initial_lookup_hash_key_count: 1,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([]),
@@ -477,6 +508,7 @@ mod tests {
             aggregate_orders: Box::new([Box::new([])]),
             post_reduction: None,
             having_filter: Box::new([]),
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
             perfect_hash: None,
             output_names: Box::new(["k".to_string(), "count".to_string()]),
             output_types: Box::new([LogicalType::Varchar, LogicalType::BigInt]),

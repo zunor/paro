@@ -3,9 +3,68 @@
 
 //! Evaluation properties used to guard semantics-changing rewrites.
 
-use paro_function::scalar::{FunctionErrorMode, FunctionSideEffects, FunctionStability};
+use std::sync::Arc;
+
+use paro_common::allocator::default_allocator;
+use paro_common::error::Result;
+use paro_common::runtime_value::Value;
+use paro_common::vector::Vector;
+use paro_function::scalar::cast::{CastContextDependency, CastExecCtx};
+use paro_function::scalar::{
+    FunctionErrorMode, FunctionExecContext, FunctionSideEffects, FunctionStability,
+};
 
 use super::{Expression, ExpressionIterator, WindowExpression};
+
+/// Evaluate a bound literal or compile-time cast without consulting session or
+/// runtime state. Expressions with runtime-dependent casts are not constants.
+pub fn evaluate_constant_expression(expression: &Expression) -> Result<Option<Value>> {
+    match expression {
+        Expression::Constant(constant) => Ok(Some(constant.value.clone())),
+        Expression::Cast(cast) => {
+            if cast.cast_info.context_dependency() == CastContextDependency::Runtime {
+                return Ok(None);
+            }
+            let Some(value) = evaluate_constant_expression(cast.child.as_ref())? else {
+                return Ok(None);
+            };
+            if value.is_null() {
+                return Ok(None);
+            }
+
+            let allocator = Arc::new(default_allocator());
+            let mut source = Vector::try_new(value.logical_type(), 1, allocator.clone())?;
+            source.set_count(1);
+            source.set_value(0, &value);
+            let mut result = Vector::try_new(cast.target_type.clone(), 1, allocator)?;
+            let ctx = CastExecCtx {
+                runtime: &ConstantEvaluationContext,
+                try_cast: cast.try_cast,
+                cast_data: cast.cast_info.cast_data.as_deref(),
+            };
+            cast.cast_info.execute(&source, &mut result, 1, &ctx)?;
+            let value = result.get_value(0);
+            Ok((!value.is_null()).then_some(value))
+        }
+        _ => Ok(None),
+    }
+}
+
+struct ConstantEvaluationContext;
+
+impl FunctionExecContext for ConstantEvaluationContext {
+    fn current_database(&self) -> Option<&str> {
+        None
+    }
+
+    fn current_schema(&self) -> Option<&str> {
+        None
+    }
+
+    fn current_user(&self) -> Option<&str> {
+        None
+    }
+}
 
 /// Properties that determine whether an expression may be moved or evaluated once for several
 /// structurally equal uses.
@@ -85,7 +144,29 @@ impl Expression {
 
     /// Compute the evaluation contract for this expression tree.
     pub fn evaluation_properties(&self) -> EvaluationProperties {
-        let mut properties = match self {
+        if let Some(properties) = self.evaluation_cache().get() {
+            return *properties;
+        }
+        ExpressionIterator::try_fold_post_order_cached(
+            self,
+            |node| node.evaluation_cache().get().copied(),
+            |node, children| {
+                let mut properties = node.local_evaluation_properties();
+                for child in children {
+                    properties.merge(*child);
+                }
+                let published = *node.evaluation_cache().get_or_init(|| properties);
+                debug_assert_eq!(published, properties);
+                Ok(published)
+            },
+        )
+        .expect("intrinsic scalar property derivation is infallible")
+    }
+
+    /// Intrinsic operator contract, excluding children. Native scalar DAGs
+    /// combine this with already-derived child facts exactly once per node.
+    pub fn local_evaluation_properties(&self) -> EvaluationProperties {
+        match self {
             Expression::Function(function) => EvaluationProperties {
                 stability: function.function.stability,
                 side_effects: function.function.side_effects,
@@ -101,13 +182,18 @@ impl Expression {
                 can_error: true,
                 ..EvaluationProperties::default()
             },
-            // Casts and the remaining composite expression kinds do not yet
-            // carry a bound totality contract. Keep them conservative rather
-            // than inferring safety from their children.
+            // Boolean composition and CASE add no failure mode of their own.
+            // A comparison is total only once binding has made all coercion
+            // explicit and both operands have the executor's one-type input
+            // contract. Casts and arithmetic operators do add failure modes
+            // and stay conservative until their bound implementations publish
+            // a more precise contract.
+            Expression::Conjunction(_) | Expression::Case(_) => EvaluationProperties::default(),
+            Expression::Comparison(comparison) => EvaluationProperties {
+                can_error: !comparison.has_bound_input_contract(),
+                ..EvaluationProperties::default()
+            },
             Expression::Cast(_)
-            | Expression::Conjunction(_)
-            | Expression::Case(_)
-            | Expression::Comparison(_)
             | Expression::Operator(_)
             | Expression::Aggregate(_)
             | Expression::Window(_) => EvaluationProperties {
@@ -115,12 +201,7 @@ impl Expression {
                 ..EvaluationProperties::default()
             },
             _ => EvaluationProperties::default(),
-        };
-
-        ExpressionIterator::enumerate_children(self, |child| {
-            properties.merge(child.evaluation_properties());
-        });
-        properties
+        }
     }
 }
 
@@ -178,7 +259,7 @@ mod tests {
                 .boundary
                 .placement = PlacementClass::External;
         }
-        Expression::Function(expression)
+        Expression::Function(expression.into())
     }
 
     fn infallible_call(children: Vec<Expression>) -> Expression {
@@ -193,6 +274,72 @@ mod tests {
         };
         function.function.error_mode = FunctionErrorMode::Infallible;
         expression
+    }
+
+    fn uncached_properties(expression: &Expression) -> EvaluationProperties {
+        let mut expected = EvaluationProperties::default();
+        ExpressionIterator::visit(expression, &mut |node| {
+            expected.merge(node.local_evaluation_properties());
+            super::super::ExpressionVisitDecision::Descend
+        });
+        expected
+    }
+
+    #[test]
+    fn cached_properties_survive_no_op_sharing_and_invalidate_the_changed_path() {
+        let original = infallible_call(vec![infallible_call(vec![]), infallible_call(vec![])]);
+        assert_eq!(
+            original.evaluation_properties(),
+            uncached_properties(&original)
+        );
+        let mut edited = original.clone();
+        let Expression::Function(parent) = &mut edited else {
+            unreachable!()
+        };
+        let Expression::Function(child) = &mut parent.children[0] else {
+            unreachable!()
+        };
+        child.function.error_mode = FunctionErrorMode::CanError;
+        assert!(edited.evaluation_cache().get().is_none());
+        let Expression::Function(parent) = &edited else {
+            unreachable!()
+        };
+        assert!(parent.children[0].evaluation_cache().get().is_none());
+        assert!(parent.children[1].evaluation_cache().get().is_some());
+        assert!(original.evaluation_properties().is_infallible());
+        assert!(!edited.evaluation_properties().is_infallible());
+        assert_eq!(edited.evaluation_properties(), uncached_properties(&edited));
+    }
+
+    #[test]
+    fn unique_node_mutation_invalidates_cached_intrinsic_metadata() {
+        let mut expression = infallible_call(vec![]);
+        assert!(expression.evaluation_properties().can_share_evaluation());
+        let Expression::Function(function) = &mut expression else {
+            unreachable!()
+        };
+        function.function.stability = FunctionStability::Volatile;
+        assert!(expression.evaluation_cache().get().is_none());
+        assert!(!expression.evaluation_properties().can_share_evaluation());
+        assert_eq!(
+            expression.evaluation_properties(),
+            uncached_properties(&expression)
+        );
+    }
+
+    #[test]
+    fn shared_dag_publishes_context_free_facts_for_every_owned_node() {
+        let mut expression = infallible_call(vec![]);
+        let mut nodes = vec![expression.clone()];
+        // Bounded even if a future change accidentally disables the cache.
+        for _ in 0..18 {
+            expression = infallible_call(vec![expression.clone(), expression]);
+            nodes.push(expression.clone());
+        }
+        assert!(expression.evaluation_properties().is_infallible());
+        assert!(nodes
+            .iter()
+            .all(|node| node.evaluation_cache().get().is_some()));
     }
 
     #[test]
@@ -257,5 +404,45 @@ mod tests {
         );
         let mixed = infallible_call(vec![fallible_leaf]);
         assert!(!mixed.evaluation_properties().is_infallible());
+    }
+
+    #[test]
+    fn primitive_comparison_is_total_when_its_children_are_total() {
+        let comparison = Expression::Comparison(
+            super::super::ComparisonExpression::new(
+                super::super::ComparisonType::Equal,
+                Expression::Constant(
+                    super::super::ConstantExpression::new(Value::Integer(1), LogicalType::Integer)
+                        .into(),
+                ),
+                Expression::Constant(
+                    super::super::ConstantExpression::new(Value::Integer(2), LogicalType::Integer)
+                        .into(),
+                ),
+            )
+            .into(),
+        );
+
+        assert!(comparison.evaluation_properties().is_infallible());
+    }
+
+    #[test]
+    fn comparison_without_bound_input_contract_is_not_total() {
+        let comparison = Expression::Comparison(
+            super::super::ComparisonExpression {
+                left: Box::new(Expression::Constant(
+                    super::super::ConstantExpression::new(Value::Integer(1), LogicalType::Integer)
+                        .into(),
+                )),
+                right: Box::new(Expression::Constant(
+                    super::super::ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt)
+                        .into(),
+                )),
+                comparison_type: super::super::ComparisonType::Equal,
+            }
+            .into(),
+        );
+
+        assert!(!comparison.evaluation_properties().is_infallible());
     }
 }

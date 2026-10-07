@@ -24,6 +24,7 @@ use super::aggregate_state::AggregateStateLayout;
 use super::distinct_state::DistinctAggregateState;
 use super::group_hash::GroupHashScratch;
 use super::group_key_codec::GroupKeyEncoder;
+use super::grouped_aggregate_hashtable::AggregateHashRuntimeStats;
 use super::ordered_helpers::OrderedAggregateCollector;
 use super::perfect_aggregate_hashtable::{
     FinalizedPerfectAggregateTable, PerfectAggregateHashTable, PerfectAggregateScanScratch,
@@ -51,6 +52,7 @@ pub struct HashAggregateEmitSourceGlobal {
     pub handle: Arc<AggregateHandle>,
     pub work: Mutex<Option<VecDeque<HashAggregateEmitWork>>>,
     pub work_count: AtomicUsize,
+    pub row_count: AtomicUsize,
 }
 
 impl HashAggregateEmitSourceGlobal {
@@ -60,6 +62,17 @@ impl HashAggregateEmitSourceGlobal {
 
     pub fn work_count(&self) -> usize {
         self.work_count.load(Ordering::Acquire)
+    }
+
+    /// Useful source parallelism is bounded by output vectors, not by radix
+    /// partition count. One worker can drain multiple work units dynamically.
+    pub fn parallel_work_count(&self) -> usize {
+        let work_count = self.work_count();
+        let row_vectors = self
+            .row_count
+            .load(Ordering::Acquire)
+            .div_ceil(paro_common::vector::VECTOR_SIZE);
+        work_count.min(row_vectors.max(1))
     }
 }
 
@@ -122,13 +135,19 @@ pub struct HashAggregateBuildSinkLocal {
     pub addresses: Vector,
     pub new_groups: SelectionVector,
     pub tables: Arc<Mutex<Vec<AggregateHashTable>>>,
+    /// Observations detached from tables that a memory reclaimer dismantled
+    /// before the local build reached its single merge-time publication point.
+    pub(crate) hash_runtime_stats: Arc<Mutex<AggregateHashRuntimeStats>>,
     pub(crate) local_build_reclaimer_name: Option<String>,
     pub(crate) local_payload_spill_reclaimer_name: Option<String>,
     pub(crate) local_state_spill_reclaimer_name: Option<String>,
     pub(crate) query_memory: Option<Arc<QueryMemoryPool>>,
     pub(crate) raw_payload_spill_enabled: bool,
     pub(crate) raw_payload_spill_requested: Arc<AtomicBool>,
-    pub(crate) payload_spill: Option<AggregatePayloadSpillBuffer>,
+    /// One independently partitioned raw-input stream per grouping domain.
+    /// A plain aggregate owns one entry; grouping sets cannot share a stream
+    /// because each domain hashes a different subset of the group columns.
+    pub(crate) payload_spills: Vec<Option<AggregatePayloadSpillBuffer>>,
     pub(crate) state_spill: Arc<Mutex<Option<AggregateStateSpillBuffer>>>,
     pub(crate) ordered_collectors: Vec<OrderedAggregateCollector>,
     pub(crate) modifier_memory: MemoryAccountingContext,

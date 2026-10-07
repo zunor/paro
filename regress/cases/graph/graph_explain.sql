@@ -71,14 +71,14 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 
 -- EX8: EXPLAIN ANALYZE 一跳模式
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
     MATCH (a:Person)-[k:Knows]->(b:Person)
     COLUMNS (a.name AS from_name, b.name AS to_name)
 ) gt;
 
 -- EX9: EXPLAIN ANALYZE ANY SHORTEST path
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
     MATCH ANY SHORTEST (a:Person)-[k:Knows]->{1,3}(b:Person)
     COLUMNS (a.name AS from_name, b.name AS to_name)
@@ -88,14 +88,14 @@ EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
 SET temp_directory = '/tmp/paro_regress_graph_spill';
 SET force_external = true;
 
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
     MATCH (a:Person)-[k:Knows]->{1,3}(b:Person)
     COLUMNS (a.name AS from_name, b.name AS to_name)
 ) gt;
 
 -- EX11: force_external should expose graph shortest path external status in EXPLAIN ANALYZE
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
     MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->{1,3}(b:Person)
     COLUMNS (a.name AS from_name, b.name AS to_name, path_length(p) AS hops)

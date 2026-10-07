@@ -116,6 +116,95 @@ impl<'a> TupleScatterSource<'a> {
         }
     }
 
+    /// Conservative bytes that may be appended to the table-owned varlen
+    /// heap while inserting this batch. Repeated values and rows that already
+    /// exist in the table deliberately remain counted: the result is a hard
+    /// transition upper bound, not an estimate.
+    pub(crate) fn out_of_line_bytes_upper_bound(
+        &self,
+        source_rows: Option<&[u32]>,
+    ) -> Result<usize> {
+        if source_rows.is_some_and(|rows| rows.iter().any(|row| *row as usize >= self.count)) {
+            return Err(paro_error::internal(
+                "tuple scatter transition row out of bounds",
+            ));
+        }
+        let mut bytes = 0usize;
+        let row_count = source_rows.map_or(self.count, <[u32]>::len);
+        // Fixed-width columns cannot allocate varlen storage. Visit columns
+        // before rows so a narrow integer key pays O(key width), not an empty
+        // O(batch rows * key width) admission scan on every update.
+        for column in &self.columns {
+            let ScatterColumn::Varlen { view, .. } = column else {
+                continue;
+            };
+            for position in 0..row_count {
+                let row_idx = source_rows.map_or(position, |rows| rows[position] as usize);
+                if !view.is_valid(row_idx) {
+                    continue;
+                }
+                let len = view.bytes(row_idx).len();
+                if len > VarlenRef::inline_capacity() {
+                    bytes = bytes.checked_add(len).ok_or_else(|| {
+                        paro_error::internal("aggregate varlen transition size overflow")
+                    })?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Copy a fixed-width key from the already prepared batch views. The
+    /// caller admits only integer layouts whose complete width fits `bytes`;
+    /// NULL is represented separately and its payload is always zero. This
+    /// shares selection/validity resolution with tuple insertion rather than
+    /// invoking recursive Vector getters again for every input row.
+    pub(crate) fn copy_fixed_key(&self, row_idx: usize, bytes: &mut [u8]) -> Result<u64> {
+        if row_idx >= self.count || self.columns.len() > u64::BITS as usize {
+            return Err(paro_error::internal("invalid compact group key row domain"));
+        }
+        bytes.fill(0);
+        let mut offset = 0;
+        let mut null_mask = 0;
+        for (index, column) in self.columns.iter().enumerate() {
+            let ScatterColumn::Fixed { view, width, .. } = column else {
+                return Err(paro_error::internal(
+                    "compact group key requires fixed columns",
+                ));
+            };
+            let target = bytes.get_mut(offset..offset + width).ok_or_else(|| {
+                paro_error::internal("compact group key exceeds its admitted width")
+            })?;
+            offset += width;
+            if !self.all_valid && !view.is_valid(row_idx) {
+                null_mask |= 1u64 << index;
+                continue;
+            }
+            match view.data() {
+                DataRef::Ptr(data) => {
+                    // SAFETY: prepare_scatter validated the type and logical
+                    // row domain; VectorView composed dictionary selections.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.add(view.physical_index(row_idx) * width),
+                            target.as_mut_ptr(),
+                            *width,
+                        );
+                    }
+                    #[cfg(target_endian = "big")]
+                    target.reverse();
+                }
+                DataRef::SequenceI64 { .. } => {
+                    let value = view.get_i64(row_idx).to_le_bytes();
+                    target.copy_from_slice(value.get(..*width).ok_or_else(|| {
+                        paro_error::internal("compact sequence key exceeds integer width")
+                    })?);
+                }
+            }
+        }
+        Ok(null_mask)
+    }
+
     fn scatter_columns<const ALL_VALID: bool>(
         &self,
         layout: &TupleLayout,

@@ -10,7 +10,7 @@ impl ResultHandler {
     #[inline]
     pub(super) fn fetch_completed_output(&mut self) -> Result<Option<&Chunk>> {
         if self.cancellation.is_cancelled() {
-            self.mark_closed();
+            self.mark_cancelled("execution cancelled before result delivery");
             self.cancellation.check()?;
             return Ok(None);
         }

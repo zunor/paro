@@ -22,6 +22,7 @@ pub use column_ref::bind_column_ref_from_column_ref;
 pub use dispatcher::{bind_expression, BindResult, BoundColumnReferenceInfo, ExpressionBinder};
 pub use index::IndexBinder;
 pub use literal::bind_literal;
+pub(crate) use operators::bind_bound_comparison;
 pub use operators::{
     bind_array, bind_between, bind_coalesce, bind_comparison, bind_conjunction, bind_in_list,
     bind_is_null, bind_like, bind_map_access, bind_not, bind_tuple, try_bind_comparison,

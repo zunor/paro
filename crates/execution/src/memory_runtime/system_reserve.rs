@@ -107,8 +107,19 @@ impl SystemReserve {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.arbitrator.add_system_reserve_bytes(bytes);
-                    return Ok(());
+                    let Err(available) = self.arbitrator.try_add_system_reserve_bytes(bytes) else {
+                        return Ok(());
+                    };
+                    let _ = self.used[idx].fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |current| Some(current.saturating_sub(bytes)),
+                    );
+                    return Err(MemoryError::quota_exhausted(
+                        MemoryDomain::Host,
+                        bytes,
+                        available,
+                    ));
                 }
                 Err(actual) => current = actual,
             }

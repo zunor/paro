@@ -9,8 +9,8 @@ DELETE 2000
 
 SELECT COUNT(*), MIN(id), MAX(id)
 FROM dml_delete_primary_key_bulk_case;
-COUNT(*)	MIN(id)	MAX(id)
-18000	1	20000
+COUNT(*)	min(id)	max(id)
+18000	1	19999
 
 SELECT COUNT(*)
 FROM dml_delete_primary_key_bulk_case

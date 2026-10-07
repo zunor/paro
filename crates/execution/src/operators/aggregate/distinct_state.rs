@@ -12,10 +12,13 @@ use paro_common::memory::MemoryAccountingContext;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
 
-use super::group_hash::GroupHashScratch;
-use super::grouped_aggregate_hashtable::GroupedAggregateHashTable;
-use super::grouped_aggregate_hashtable::HashTableCapacityHint;
-use super::radix_partitioned_aggregate_hashtable::{AggregateHTScanPosition, AggregateHashTable};
+use super::group_hash::{AggregateHashContract, GroupHashScratch};
+use super::grouped_aggregate_hashtable::{
+    AggregateHashRuntimeStats, GroupedAggregateHashTable, HashTableCapacityHint,
+};
+use super::radix_partitioned_aggregate_hashtable::{
+    AggregateHTScanPosition, AggregateHashTable, AggregateHashTableConfig, AggregateHashTableLayout,
+};
 
 /// Unique keys for one DISTINCT aggregate.
 ///
@@ -33,6 +36,23 @@ pub(crate) struct DistinctKeyTable {
     new_groups: SelectionVector,
 }
 
+/// Partition ownership plus observations detached from the original radix
+/// wrapper. The wrapper no longer exists after the split, so keeping the two
+/// together makes dropping its telemetry an explicit type-level omission.
+#[must_use = "DISTINCT partitions and runtime observations must be transferred together"]
+#[derive(Debug)]
+pub(crate) struct DistinctKeyTablePartitionBundle {
+    pub(crate) partitions: Vec<DistinctKeyTable>,
+    pub(crate) hash_runtime_stats: AggregateHashRuntimeStats,
+}
+
+#[must_use = "DISTINCT partition groups and runtime observations must be transferred together"]
+#[derive(Debug)]
+pub(crate) struct DistinctPartitionGroups {
+    pub(crate) groups: Vec<Vec<DistinctKeyTable>>,
+    pub(crate) hash_runtime_stats: AggregateHashRuntimeStats,
+}
+
 impl DistinctKeyTable {
     pub(crate) fn try_new(
         key_types: Vec<LogicalType>,
@@ -48,28 +68,22 @@ impl DistinctKeyTable {
                 key_types.len()
             )));
         }
-        let table = if parallelism <= 1 {
-            AggregateHashTable::new_flat_with_memory_capacity_hint(
-                key_types.clone(),
-                Vec::new(),
-                Vec::new(),
-                allocator.clone(),
-                memory,
-                capacity_hint,
-            )?
+        let layout = if parallelism <= 1 {
+            AggregateHashTableLayout::Flat
         } else {
             let partition_bits =
                 parallelism.next_power_of_two().trailing_zeros().clamp(1, 4) as usize;
-            AggregateHashTable::new_radix_with_memory_capacity_hint(
-                key_types.clone(),
-                Vec::new(),
-                Vec::new(),
-                partition_bits,
-                allocator.clone(),
-                memory,
-                capacity_hint,
-            )?
+            AggregateHashTableLayout::Radix { partition_bits }
         };
+        let hash_contract = AggregateHashContract::for_distinct(key_types.len(), group_key_count)?;
+        let table = AggregateHashTable::new_configured(
+            key_types.clone(),
+            Vec::new(),
+            Vec::new(),
+            allocator.clone(),
+            memory,
+            AggregateHashTableConfig::new(layout, hash_contract, capacity_hint),
+        )?;
         Self::from_table(key_types.into_boxed_slice(), group_key_count, table)
     }
 
@@ -101,6 +115,10 @@ impl DistinctKeyTable {
         self.table.allocator()
     }
 
+    pub(crate) fn take_hash_runtime_stats(&mut self) -> AggregateHashRuntimeStats {
+        self.table.take_hash_runtime_stats()
+    }
+
     pub(crate) fn insert(&mut self, keys: &Chunk) -> Result<()> {
         self.validate_keys(keys)?;
         if keys.is_empty() {
@@ -114,13 +132,12 @@ impl DistinctKeyTable {
             self.new_groups = SelectionVector::try_with_capacity(keys.size(), allocator)?;
         }
         self.new_groups.set_len(0);
-        let (lookup_hashes, partition_hashes) = self
+        let hashes = self
             .hash_scratch
-            .hash_with_partition_prefix(keys, self.group_key_count)?;
-        self.table.find_or_create_groups_partitioned(
+            .hash_distinct(keys, self.group_key_count)?;
+        self.table.find_or_create_distinct_groups(
             keys,
-            lookup_hashes,
-            partition_hashes,
+            hashes,
             &mut self.addresses,
             &mut self.new_groups,
         )?;
@@ -175,14 +192,19 @@ impl DistinctKeyTable {
     ///
     /// All fragments use the same high hash bits, so partitions with the same
     /// ordinal can be combined independently without re-partitioning.
-    pub(crate) fn into_partitions(self) -> Result<Vec<Self>> {
+    pub(crate) fn into_partitions(self) -> Result<DistinctKeyTablePartitionBundle> {
         let key_types = self.key_types;
         let group_key_count = self.group_key_count;
-        self.table
-            .into_scan_partitions()
+        let bundle = self.table.into_scan_partitions();
+        let partitions = bundle
+            .partitions
             .into_iter()
             .map(|table| Self::from_table(key_types.clone(), group_key_count, table))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(DistinctKeyTablePartitionBundle {
+            partitions,
+            hash_runtime_stats: bundle.hash_runtime_stats,
+        })
     }
 
     fn validate_keys(&self, keys: &Chunk) -> Result<()> {
@@ -298,11 +320,14 @@ impl DistinctAggregateState {
     pub(crate) fn take_partition_groups(
         &mut self,
         aggregate_idx: usize,
-    ) -> Result<Vec<Vec<DistinctKeyTable>>> {
+    ) -> Result<DistinctPartitionGroups> {
         let fragments = self.take_fragments(aggregate_idx)?;
         let mut partition_groups: Vec<Vec<DistinctKeyTable>> = Vec::new();
+        let mut hash_runtime_stats = AggregateHashRuntimeStats::default();
         for fragment in fragments {
-            let partitions = fragment.into_partitions()?;
+            let bundle = fragment.into_partitions()?;
+            hash_runtime_stats.merge(bundle.hash_runtime_stats);
+            let partitions = bundle.partitions;
             if partition_groups.is_empty() {
                 partition_groups = (0..partitions.len()).map(|_| Vec::new()).collect();
             } else if partition_groups.len() != partitions.len() {
@@ -316,7 +341,10 @@ impl DistinctAggregateState {
                 group.push(partition);
             }
         }
-        Ok(partition_groups)
+        Ok(DistinctPartitionGroups {
+            groups: partition_groups,
+            hash_runtime_stats,
+        })
     }
 
     fn take_fragments(&mut self, aggregate_idx: usize) -> Result<Vec<DistinctKeyTable>> {
@@ -412,12 +440,9 @@ mod tests {
         table.insert(&keys).expect("insert distinct keys");
 
         let mut group_partitions = HashMap::new();
-        for (partition_idx, mut partition) in table
-            .into_partitions()
-            .expect("split distinct partitions")
-            .into_iter()
-            .enumerate()
-        {
+        let bundle = table.into_partitions().expect("split distinct partitions");
+        assert!(bundle.hash_runtime_stats.max_radix_partition_skew_percent > 0);
+        for (partition_idx, mut partition) in bundle.partitions.into_iter().enumerate() {
             let mut output = Chunk::try_initialize(
                 &[LogicalType::Integer, LogicalType::BigInt],
                 128,

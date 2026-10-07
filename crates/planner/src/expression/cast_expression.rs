@@ -73,12 +73,9 @@ impl CastExpression {
 
         let cast_info = cast_functions.get_cast_function(&source_type, &target_type)?;
 
-        Ok(Expression::Cast(CastExpression::new(
-            expr,
-            target_type,
-            cast_info,
-            false,
-        )))
+        Ok(Expression::Cast(
+            CastExpression::new(expr, target_type, cast_info, false).into(),
+        ))
     }
 
     /// Add an explicit CAST or TRY_CAST.
@@ -107,11 +104,8 @@ impl CastExpression {
 
         let cast_info = cast_functions.get_cast_function(&source_type, &target_type)?;
 
-        Ok(Expression::Cast(CastExpression::new(
-            expr,
-            target_type,
-            cast_info,
-            try_cast,
-        )))
+        Ok(Expression::Cast(
+            CastExpression::new(expr, target_type, cast_info, try_cast).into(),
+        ))
     }
 }

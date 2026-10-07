@@ -6,6 +6,102 @@
 use super::*;
 
 impl PipelineLowerer<'_> {
+    pub(crate) fn attach_owned_hash_join_runtime_filters(
+        &self,
+        scan_node: PhysicalPlanNodeId,
+        rowset: &mut RowsetSourceSpec,
+    ) -> Result<()> {
+        for edge in self.plan.edges.iter().filter(|edge| {
+            edge.consumer == scan_node
+                && matches!(
+                    edge.kind,
+                    crate::physical::PhysicalEdgeKind::RuntimeFilter(_)
+                )
+        }) {
+            let crate::physical::PhysicalEdgeKind::RuntimeFilter(artifact) = edge.kind else {
+                unreachable!("filtered runtime-filter edge changed kind")
+            };
+            let handle = *self.runtime_filter_handles.get(&artifact).ok_or_else(|| {
+                paro_error::internal(
+                    "runtime-filter consumer was lowered before its build handle was registered",
+                )
+            })?;
+            let owner = *self.runtime_filter_owners.get(&artifact).ok_or_else(|| {
+                paro_error::internal("runtime-filter artifact has no registered physical owner")
+            })?;
+            let owner = self.plan.node(owner);
+            let PhysicalNodeKind::HashJoin(spec) = &owner.kind else {
+                return Err(paro_error::internal(
+                    "runtime-filter artifact owner is not a physical hash join",
+                ));
+            };
+            let [probe, build] = self.plan.child_ids(&owner.children) else {
+                return Err(paro_error::internal(
+                    "runtime-filter hash join owner has invalid children",
+                ));
+            };
+            if *build != edge.producer
+                || spec
+                    .runtime_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.artifact != artifact)
+            {
+                return Err(paro_error::internal(
+                    "runtime-filter edge disagrees with its registered physical owner",
+                ));
+            }
+            let runtime_filter = spec
+                .runtime_filter
+                .as_ref()
+                .expect("runtime-filter owner identity was checked above");
+            let covering_key = hash_join_runtime_filter_probe_candidate(spec);
+            let mut installed = 0usize;
+            for (runtime_filter_key_index, &condition_index) in
+                runtime_filter.condition_indices.iter().enumerate()
+            {
+                let condition = spec.key_conditions.get(condition_index).ok_or_else(|| {
+                    paro_error::internal(
+                        "runtime-filter condition mapping references a missing join key",
+                    )
+                })?;
+                let Expression::Reference(reference) = &condition.left else {
+                    continue;
+                };
+                let Some(source_index) =
+                    trace_probe_reference_to_rowset(self.plan, *probe, reference.index, scan_node)
+                else {
+                    continue;
+                };
+                let Some(probe_column_id) = rowset.scan.column_projection.column_id(source_index)
+                else {
+                    continue;
+                };
+                let Ok(probe_column_id) = u32::try_from(probe_column_id) else {
+                    continue;
+                };
+                rowset.add_dynamic_runtime_filter(RowsetDynamicRuntimeFilterSpec {
+                    handle,
+                    artifact,
+                    runtime_filter_key_index,
+                    probe_column_id,
+                    application: if covering_key == Some(runtime_filter_key_index) {
+                        RuntimeFilterApplication::ProbeReplacementEligible
+                    } else {
+                        RuntimeFilterApplication::FilteringOnly
+                    },
+                });
+                installed += 1;
+            }
+            if installed == 0 {
+                return Err(paro_error::internal(
+                    "runtime-filter edge could not resolve a probe column at its rowset consumer",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn attach_hash_join_runtime_filters(
         &self,
         mut source: SourceSpec,
@@ -13,16 +109,22 @@ impl PipelineLowerer<'_> {
         handle: BreakerHandleId,
         spec: &HashJoinSpec,
     ) -> SourceSpec {
+        let Some(runtime_filter) = &spec.runtime_filter else {
+            return source;
+        };
         if !can_push_hash_join_runtime_filter(spec.join_type) {
             return source;
         }
         let SourceSpec::Rowset(rowset) = &mut source else {
             return source;
         };
-        for (build_key_index, condition) in spec.key_conditions.iter().enumerate() {
-            if condition.comparison != JoinComparisonType::Equal {
+        let covering_key = hash_join_runtime_filter_probe_candidate(spec);
+        for (runtime_filter_key_index, &condition_index) in
+            runtime_filter.condition_indices.iter().enumerate()
+        {
+            let Some(condition) = spec.key_conditions.get(condition_index) else {
                 continue;
-            }
+            };
             let Expression::Reference(reference) = &condition.left else {
                 continue;
             };
@@ -39,8 +141,14 @@ impl PipelineLowerer<'_> {
             };
             rowset.add_dynamic_runtime_filter(RowsetDynamicRuntimeFilterSpec {
                 handle,
-                build_key_index,
+                artifact: runtime_filter.artifact,
+                runtime_filter_key_index,
                 probe_column_id,
+                application: if covering_key == Some(runtime_filter_key_index) {
+                    RuntimeFilterApplication::ProbeReplacementEligible
+                } else {
+                    RuntimeFilterApplication::FilteringOnly
+                },
             });
         }
         source
@@ -116,7 +224,7 @@ impl PipelineLowerer<'_> {
         root: PhysicalPlanNodeId,
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
-    ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeDependency>)> {
+    ) -> Result<CollectedProbeChain> {
         let output = self.plan.node(root).output.clone();
         let handle = self.handles.register(
             BreakerHandleKind::Materialized,
@@ -133,16 +241,28 @@ impl PipelineLowerer<'_> {
         )?;
         self.handles.set_producer(handle, producer)?;
         let source = SourceSpec::Materialized(MaterializedSourceSpec { handle });
-        Ok((
+        Ok(CollectedProbeChain {
             source,
-            Vec::new(),
-            vec![PendingProbeDependency {
+            transforms: Vec::new(),
+            pending_builds: vec![PendingProbeDependency {
                 producer,
                 handle,
                 kind: DependencyKind::MaterializeBeforeRead,
             }],
-        ))
+            pending_replays: Vec::new(),
+        })
     }
+}
+
+fn trace_probe_reference_to_rowset(
+    plan: &PhysicalPlan,
+    node: PhysicalPlanNodeId,
+    output_index: usize,
+    target: PhysicalPlanNodeId,
+) -> Option<usize> {
+    paro_planner::physical::lineage::trace_rowset_lineage(plan, node, output_index)
+        .into_iter()
+        .find_map(|(scan, source_index)| (scan == target).then_some(source_index))
 }
 
 /// Return the source reference under an exact, monotonic representation cast.
@@ -202,6 +322,7 @@ fn exact_decimal_scalar_filter(probe: &LogicalType, build: &LogicalType) -> bool
     )
 }
 
+#[cfg(test)]
 fn can_push_hash_join_runtime_filter(join_type: JoinType) -> bool {
     matches!(
         join_type,
@@ -212,22 +333,31 @@ fn can_push_hash_join_runtime_filter(join_type: JoinType) -> bool {
 /// Trace a downstream join-key reference back to the rowset source.
 ///
 /// A chained inner/semi hash probe emits its projected left columns before
-/// any build payload, so a reference inside `left_projection` has exact
-/// lineage to the preceding transform. Other transforms are deliberate
-/// barriers: crossing one would require its own expression-lineage proof and
-/// could move a dynamic predicate across a limit or volatile expression.
+/// any build payload, and a passthrough projection preserves the referenced
+/// source column exactly. Other transforms are deliberate barriers: crossing
+/// one would require its own expression-lineage proof and could move a dynamic
+/// predicate across a limit or volatile expression.
 fn trace_probe_reference_to_source(
     mut reference_index: usize,
     transforms: &[TransformSpec],
 ) -> Option<usize> {
     for transform in transforms.iter().rev() {
-        let TransformSpec::HashJoinProbe(probe) = transform else {
-            return None;
-        };
-        if !matches!(probe.join_type, JoinType::Inner | JoinType::Semi) {
-            return None;
+        match transform {
+            TransformSpec::HashJoinProbe(probe) => {
+                if !matches!(probe.join_type, JoinType::Inner | JoinType::Semi) {
+                    return None;
+                }
+                reference_index = *probe.left_projection.get(reference_index)?;
+            }
+            TransformSpec::Project(project) => {
+                let Expression::Reference(reference) = project.expressions.get(reference_index)?
+                else {
+                    return None;
+                };
+                reference_index = reference.index;
+            }
+            _ => return None,
         }
-        reference_index = *probe.left_projection.get(reference_index)?;
     }
     Some(reference_index)
 }

@@ -1,7 +1,7 @@
-CREATE TABLE memory_dummy (x INT);
+CREATE TABLE memory_dummy (x INT, startup_memory VARCHAR);
 CREATE TABLE
 
-INSERT INTO memory_dummy VALUES (1);
+INSERT INTO memory_dummy VALUES (1, current_setting('memory_limit'));
 INSERT 0 1
 
 SELECT 1;
@@ -48,9 +48,10 @@ true
 SET memory_limit = DEFAULT;
 SET
 
-SELECT current_setting('memory_limit') FROM memory_dummy;
-current_setting('memory_limit')
-1073741824
+SELECT current_setting('memory_limit') = startup_memory AS restored_startup_envelope
+FROM memory_dummy;
+restored_startup_envelope
+true
 
 SET temp_directory = DEFAULT;
 SET

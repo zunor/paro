@@ -9,7 +9,7 @@ use super::ComparisonType;
 use super::Expression;
 use crate::binder::context::BindSnapshot;
 use crate::binder::CorrelatedColumnInfo;
-use crate::plan::PlannedStatement;
+use crate::logical::plan::PlannedStatement;
 use paro_common::types::LogicalType;
 use std::sync::Arc;
 

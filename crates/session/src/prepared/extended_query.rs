@@ -9,16 +9,20 @@ use paro_common::error::{self as paro_error, ParoError, Result};
 use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
 use paro_common::types::{logical_type_from_pg_oid, LogicalType};
-use paro_compiler::{compile_statement, compile_statement_with_parameter_types};
-use paro_context::{StatementCancellation, StatementContext, StatementOptions, StatementSource};
+use paro_compiler::compile_statement_with_parameter_types;
+use paro_context::{
+    statement_fingerprint, StatementCancellation, StatementContext, StatementOptions,
+    StatementSource, StatementTrace,
+};
 use paro_execution::query_executor::compiled::{
     CompiledStatement, ExecutionRequest, ResultColumnDesc,
 };
 use paro_execution::query_executor::executor::Executor;
-use paro_parser::ast::{Expr, Statement, VariableShowStmt};
+use paro_parser::ast::{ExplainOption, Expr, Statement, VariableShowStmt};
 use paro_parser::StatementVisitor;
 use paro_planner::binder::bind::type_name::bind_logical_type;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error};
 
 use crate::completion::StatementCompletion;
@@ -112,6 +116,16 @@ pub trait ExtendedQueryResponder: Send {
         schema: &[ResultColumnDesc],
         format_codes: &[FormatCode],
     ) -> Result<()>;
+    /// Send diagnostic bytes while transferring their lifetime owner to the
+    /// protocol transport. Returning from this method does not imply that
+    /// the connection buffer has drained the encoded bytes.
+    async fn send_diagnostic_chunk(
+        &mut self,
+        chunk: &Chunk,
+        schema: &[ResultColumnDesc],
+        format_codes: &[FormatCode],
+        owner: Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+    ) -> Result<()>;
     async fn send_command_complete(&mut self, completion: &StatementCompletion) -> Result<()>;
     async fn send_close_complete(&mut self) -> Result<()>;
     async fn send_no_data(&mut self) -> Result<()>;
@@ -163,6 +177,52 @@ async fn execute_parse<R: ExtendedQueryResponder>(
     message: ParseMessage,
     responder: &mut R,
 ) -> Result<()> {
+    let parse_started = Instant::now();
+    let statement_trace = session.new_statement_trace(&message.query, 0, parse_started);
+    if let Some(trace) = &statement_trace {
+        trace.record_event("protocol", "parse_entry");
+    }
+    let result = execute_parse_inner(session, message, responder, statement_trace.clone()).await;
+    if let Some(trace) = statement_trace {
+        trace.record_span("protocol", "parse_operation", parse_started);
+        if result.is_err() {
+            trace.record_event("protocol", "parse_error");
+            trace.record_event("lifecycle", "statement_error");
+            session.publish_statement_trace(trace.snapshot());
+        }
+    }
+    result
+}
+
+async fn execute_parse_inner<R: ExtendedQueryResponder>(
+    session: &mut Session,
+    message: ParseMessage,
+    responder: &mut R,
+    statement_trace: Option<Arc<StatementTrace>>,
+) -> Result<()> {
+    // The unnamed statement is replaced on every Parse, but an exact,
+    // parameter-free repeat does not need to rebuild even its immutable AST.
+    // Check the byte-identical SQL and full compile environment before
+    // entering the parser; parameterized statements retain the ordinary type
+    // resolution path below.
+    if let Some(entry) = reusable_parameter_free_unnamed_entry(session, &message) {
+        let mut entry = entry;
+        entry.statement_trace = statement_trace.clone();
+        if let Some(trace) = &statement_trace {
+            trace.record_event("compile", "plan_cache_hit");
+            trace.record_event("protocol", "parse_reused_image");
+        }
+        let replaced = session.state.set_unnamed_prepared_statement(entry);
+        finish_statement_decision(session, replaced);
+        let result = responder.send_parse_complete().await;
+        if result.is_ok() {
+            if let Some(trace) = &statement_trace {
+                trace.record_event("protocol", "parse_complete_sent");
+            }
+        }
+        return result;
+    }
+
     let statements = paro_parser::parse(&message.query)
         .map_err(|error| paro_error::from_parser(error.to_string()))?;
     if statements.len() != 1 {
@@ -191,8 +251,8 @@ async fn execute_parse<R: ExtendedQueryResponder>(
             reusable_unnamed_parse_artifacts(session, &message.query, &raw_stmt, &parameter_types)
         })
         .flatten();
-    let (result_schema, generic_plan) = if is_client_copy(&raw_stmt) {
-        (Vec::new(), None)
+    let (result_schema, generic_plan, compile_decision_id) = if is_client_copy(&raw_stmt) {
+        (Vec::new(), None, None)
     } else if let Some(artifacts) = reusable_unnamed {
         artifacts
     } else {
@@ -202,6 +262,7 @@ async fn execute_parse<R: ExtendedQueryResponder>(
             &raw_stmt,
             &route,
             &message.type_oids,
+            statement_trace.clone(),
         )?
     };
 
@@ -213,7 +274,9 @@ async fn execute_parse<R: ExtendedQueryResponder>(
         result_schema,
         generic_plan,
         generic_plan_uses: 0,
+        compile_decision_id,
         source: PreparedStatementSource::Protocol,
+        statement_trace: statement_trace.clone(),
     };
 
     let is_named_statement = message.name.is_some();
@@ -227,14 +290,61 @@ async fn execute_parse<R: ExtendedQueryResponder>(
             session.state.add_prepared_statement(entry);
         }
         None => {
-            session.state.set_unnamed_prepared_statement(entry);
+            let replaced = session.state.set_unnamed_prepared_statement(entry);
+            finish_statement_decision(session, replaced);
         }
     }
 
     if is_named_statement {
         session.refresh_prepared_statement_metadata();
     }
-    responder.send_parse_complete().await
+    let result = responder.send_parse_complete().await;
+    if result.is_ok() {
+        if let Some(trace) = &statement_trace {
+            trace.record_event("protocol", "parse_complete_sent");
+        }
+    }
+    result
+}
+
+fn reusable_parameter_free_unnamed_entry(
+    session: &Session,
+    message: &ParseMessage,
+) -> Option<PreparedStatementEntry> {
+    if message.name.is_some() || !message.type_oids.is_empty() {
+        return None;
+    }
+    let previous = reusable_unnamed_statement_image(session, &message.query)?;
+    if !previous.parameter_types.is_empty() {
+        return None;
+    }
+    let mut entry = previous.clone();
+    entry.generic_plan_uses = 0;
+    debug!(
+        target: targets::QUERY,
+        sql_bytes = message.query.len(),
+        "Repeated parameter-free unnamed Parse reused immutable statement image"
+    );
+    Some(entry)
+}
+
+/// Return the one immutable unnamed statement image that is legal to reuse.
+///
+/// Parsing a byte-identical SQL string is deterministic: parse behavior has no
+/// session input. Binding and planning do, so the canonical compile-environment
+/// key is checked here before either the pre-parse or post-parse reuse path can
+/// observe the image. More-specific callers may additionally constrain
+/// parameter types or compare the parsed AST, but cannot weaken this guard.
+fn reusable_unnamed_statement_image<'a>(
+    session: &'a Session,
+    sql: &str,
+) -> Option<&'a PreparedStatementEntry> {
+    let previous = session.state.unnamed_prepared_statement()?;
+    let plan = previous.generic_plan.as_ref()?;
+    (previous.source == PreparedStatementSource::Protocol
+        && previous.source_sql.as_ref() == sql
+        && plan.compile_environment() == &session.compile_environment_key())
+        .then_some(previous)
 }
 
 /// Reuse the immutable image behind a repeated unnamed Parse.
@@ -250,24 +360,26 @@ fn reusable_unnamed_parse_artifacts(
     sql: &str,
     stmt: &Statement,
     parameter_types: &[Option<LogicalType>],
-) -> Option<(Vec<ResultColumnDesc>, Option<CompiledStatement>)> {
-    let previous = session.state.unnamed_prepared_statement()?;
-    if previous.source != PreparedStatementSource::Protocol
-        || previous.source_sql.as_ref() != sql
-        || previous.raw_stmt.as_ref() != stmt
-        || previous.parameter_types != parameter_types
-    {
+) -> Option<(
+    Vec<ResultColumnDesc>,
+    Option<CompiledStatement>,
+    Option<u64>,
+)> {
+    let previous = reusable_unnamed_statement_image(session, sql)?;
+    if previous.raw_stmt.as_ref() != stmt || previous.parameter_types != parameter_types {
         return None;
     }
     let plan = previous.generic_plan.as_ref()?;
-    (plan.compile_environment() == &session.compile_environment_key()).then(|| {
-        debug!(
-            target: targets::QUERY,
-            sql_bytes = sql.len(),
-            "Repeated unnamed Parse reused immutable generic plan"
-        );
-        (previous.result_schema.clone(), Some(plan.clone()))
-    })
+    debug!(
+        target: targets::QUERY,
+        sql_bytes = sql.len(),
+        "Repeated unnamed Parse reused immutable generic plan"
+    );
+    Some((
+        previous.result_schema.clone(),
+        Some(plan.clone()),
+        previous.compile_decision_id,
+    ))
 }
 
 async fn execute_bind<R: ExtendedQueryResponder>(
@@ -275,9 +387,42 @@ async fn execute_bind<R: ExtendedQueryResponder>(
     message: BindMessage,
     responder: &mut R,
 ) -> Result<()> {
+    let statement = statement_entry(session, message.statement_name.as_deref())?.clone();
+    let statement_trace = take_statement_trace(session, message.statement_name.as_deref())
+        .or_else(|| session.new_statement_trace(statement.source_sql.as_ref(), 0, Instant::now()));
+    if let Some(trace) = &statement_trace {
+        trace.record_event("protocol", "bind_entry");
+        if statement.statement_trace.is_none() {
+            trace.record_event("compile", "prepared_image_reused");
+        }
+    }
+    let result = execute_bind_inner(
+        session,
+        message,
+        responder,
+        statement,
+        statement_trace.clone(),
+    )
+    .await;
+    if result.is_err() {
+        if let Some(trace) = statement_trace {
+            trace.record_event("protocol", "bind_error");
+            trace.record_event("lifecycle", "statement_error");
+            session.publish_statement_trace(trace.snapshot());
+        }
+    }
+    result
+}
+
+async fn execute_bind_inner<R: ExtendedQueryResponder>(
+    session: &mut Session,
+    message: BindMessage,
+    responder: &mut R,
+    statement: PreparedStatementEntry,
+    statement_trace: Option<Arc<StatementTrace>>,
+) -> Result<()> {
     let is_named_statement = message.statement_name.is_some();
     let is_named_portal = message.portal_name.is_some();
-    let statement = statement_entry(session, message.statement_name.as_deref())?.clone();
     let parameter_env = decode_bind_parameters(
         &statement.parameter_types,
         &message.parameter_format_codes,
@@ -303,11 +448,57 @@ async fn execute_bind<R: ExtendedQueryResponder>(
             stmt: Box::new(statement.raw_stmt.as_ref().clone()),
             parameter_env: parameter_env.clone(),
         },
+        StatementClass::Query if compile_explain_parts(&statement.raw_stmt).is_some() => {
+            let (target, options) =
+                compile_explain_parts(&statement.raw_stmt).expect("compile EXPLAIN guard checked");
+            let parameter_types = parameter_env
+                .logical_types()
+                .into_iter()
+                .map(|ty| ty.unwrap_or(LogicalType::Unknown))
+                .collect::<Vec<_>>();
+            if parameter_types
+                .iter()
+                .any(|ty| matches!(ty, LogicalType::Unknown))
+            {
+                return Err(paro_error::protocol_violation(
+                    "EXPLAIN (COMPILE) requires known parameter types",
+                ));
+            }
+            if !matches!(target, Statement::Query(_)) {
+                return Err(paro_error::not_supported(
+                    "EXPLAIN (COMPILE) supports query/CTE targets only",
+                ));
+            }
+            PortalKind::CompileExplain {
+                target: Box::new(target.clone()),
+                options: options.to_vec(),
+                parameter_env: parameter_env.clone(),
+            }
+        }
         StatementClass::Query => {
-            let plan = select_protocol_query_plan(session, &statement, &parameter_env)?;
-            let execution = ExecutionRequest::from_typed_env(plan.clone(), &parameter_env)?;
-            cached_query_plan = Some(plan);
-            PortalKind::Query(execution)
+            let planned = select_protocol_query_plan(
+                session,
+                &statement,
+                &parameter_env,
+                statement_trace.clone(),
+            )?;
+            let execution =
+                match ExecutionRequest::from_typed_env(planned.plan.clone(), &parameter_env) {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        if let Some(decision_id) = planned.statement_decision_id {
+                            session.finish_statement_cache_decision(decision_id);
+                        }
+                        return Err(error);
+                    }
+                };
+            let execution = if let Some(id) = planned.statement_decision_id {
+                execution.with_statement_decision_id(id)
+            } else {
+                execution
+            };
+            cached_query_plan = Some(planned.plan);
+            PortalKind::Query(Box::new(execution))
         }
     };
 
@@ -346,6 +537,7 @@ async fn execute_bind<R: ExtendedQueryResponder>(
         completion: None,
         created_generation: 0,
         transaction_owned: session.has_active_transaction(),
+        statement_trace: statement_trace.clone(),
     };
 
     match message.portal_name {
@@ -374,7 +566,13 @@ async fn execute_bind<R: ExtendedQueryResponder>(
     if is_named_portal {
         session.refresh_cursor_metadata();
     }
-    responder.send_bind_complete().await
+    let result = responder.send_bind_complete().await;
+    if result.is_ok() {
+        if let Some(trace) = &statement_trace {
+            trace.record_event("protocol", "bind_complete_sent");
+        }
+    }
+    result
 }
 
 async fn execute_describe<R: ExtendedQueryResponder>(
@@ -416,44 +614,84 @@ async fn execute_portal<R: ExtendedQueryResponder>(
     responder: &mut R,
 ) -> Result<()> {
     let mut portal = portal_entry(session, message.name.as_deref())?.clone();
+    let statement_trace = portal
+        .statement_trace
+        .take()
+        .or_else(|| session.new_statement_trace(portal.source_sql.as_ref(), 0, Instant::now()));
+    if let Some(trace) = &statement_trace {
+        trace.record_event("protocol", "execute_entry");
+        trace.record_value(
+            "protocol",
+            "portal_max_rows",
+            message.max_rows.max(0) as u64,
+        );
+    }
 
     if session.is_transaction_failed() && !is_allowed_in_failed_transaction(&portal.raw_stmt) {
-        return Err(paro_error::transaction_aborted());
+        let error = paro_error::transaction_aborted();
+        if let Some(trace) = statement_trace {
+            trace.record_event("protocol", "execute_rejected");
+            trace.record_event("lifecycle", "statement_error");
+            session.publish_statement_trace(trace.snapshot());
+        }
+        return Err(error);
     }
 
     let query_str = portal.source_sql.clone();
     let portal_kind = portal.kind.clone();
+    let trace_for_scope = statement_trace.clone();
     let result = session
-        .run_in_statement_scope(&query_str, async |session| {
-            if should_begin_implicit_transaction_for_portal(session, &portal_kind) {
-                session.begin_implicit_transaction_block()?;
-            }
+        .run_in_statement_scope_with_trace_and_publish(
+            &query_str,
+            trace_for_scope,
+            false,
+            async |session| {
+                if should_begin_implicit_transaction_for_portal(session, &portal_kind) {
+                    session.begin_implicit_transaction_block()?;
+                }
 
-            match portal_kind {
-                PortalKind::Query(execution) => {
-                    execute_query_portal(session, &mut portal, execution, &message, responder).await
-                }
-                PortalKind::Materialized => Err(paro_error::internal(
-                    "materialized cursor cannot enter extended query execution".to_string(),
-                )),
-                PortalKind::Utility(cmd) => {
-                    execute_utility_portal(session, &mut portal, *cmd, responder).await
-                }
-                PortalKind::ClientCopy {
-                    stmt,
-                    parameter_env,
-                } => {
-                    execute_client_copy_portal(
-                        session,
-                        &mut portal,
-                        *stmt,
+                match portal_kind {
+                    PortalKind::Query(execution) => {
+                        execute_query_portal(session, &mut portal, *execution, &message, responder)
+                            .await
+                    }
+                    PortalKind::CompileExplain {
+                        target,
+                        options,
                         parameter_env,
-                        responder,
-                    )
-                    .await
+                    } => {
+                        execute_compile_explain_portal(
+                            session,
+                            &mut portal,
+                            *target,
+                            options,
+                            parameter_env,
+                            responder,
+                        )
+                        .await
+                    }
+                    PortalKind::Materialized => Err(paro_error::internal(
+                        "materialized cursor cannot enter extended query execution".to_string(),
+                    )),
+                    PortalKind::Utility(cmd) => {
+                        execute_utility_portal(session, &mut portal, *cmd, responder).await
+                    }
+                    PortalKind::ClientCopy {
+                        stmt,
+                        parameter_env,
+                    } => {
+                        execute_client_copy_portal(
+                            session,
+                            &mut portal,
+                            *stmt,
+                            parameter_env,
+                            responder,
+                        )
+                        .await
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
 
     match &result {
@@ -461,8 +699,17 @@ async fn execute_portal<R: ExtendedQueryResponder>(
             if !completion.is_transaction_control() {
                 session.command_counter_increment();
             }
+            if let Some(trace) = &statement_trace {
+                trace.record_event("protocol", "portal_complete");
+                session.defer_protocol_statement_trace(trace.clone());
+            }
         }
-        Ok(PortalProgress::Suspended) => {}
+        Ok(PortalProgress::Suspended) => {
+            if let Some(trace) = &statement_trace {
+                trace.record_event("protocol", "portal_suspended");
+            }
+            portal.statement_trace = statement_trace;
+        }
         Err(_) => {}
     }
 
@@ -486,12 +733,14 @@ async fn execute_close<R: ExtendedQueryResponder>(
     match target {
         CloseTarget::Statement(name) => match name.as_deref() {
             Some(name) => {
-                let _ = session.state.remove_prepared_statement(name);
+                let removed = session.state.remove_prepared_statement(name);
+                finish_statement_decision(session, removed);
                 refresh_prepared = true;
                 refresh_cursors = true;
             }
             None => {
-                let _ = session.state.remove_unnamed_prepared_statement();
+                let removed = session.state.remove_unnamed_prepared_statement();
+                finish_statement_decision(session, removed);
             }
         },
         CloseTarget::Portal(name) => match name.as_deref() {
@@ -520,34 +769,70 @@ fn build_parse_artifacts(
     stmt: &Statement,
     route: &FrontendRoute,
     type_oids: &[u32],
-) -> Result<(Vec<ResultColumnDesc>, Option<CompiledStatement>)> {
+    statement_trace: Option<Arc<StatementTrace>>,
+) -> Result<(
+    Vec<ResultColumnDesc>,
+    Option<CompiledStatement>,
+    Option<u64>,
+)> {
     match route {
+        FrontendRoute::Query(_) if compile_explain_parts(stmt).is_some() => {
+            // COMPILE is deliberately not run during Parse.  The statement
+            // entry only exposes the diagnostic row schema; actual binding,
+            // compilation, admission and optional ANALYZE happen at Execute.
+            let _ = resolve_parse_parameter_types(stmt, type_oids)?;
+            Ok((compile_explain_result_schema(), None, None))
+        }
         FrontendRoute::Query(_) => {
             let parameter_types = resolve_parse_parameter_types(stmt, type_oids)?;
-            let snapshot = session.freeze_statement_context(
+            let snapshot = session.freeze_statement_context_with_trace(
                 StatementOptions {
                     source: StatementSource::ExtendedQuery,
                     ..StatementOptions::default()
                 },
                 session.compile_scope_cancellation(),
+                statement_trace.clone(),
             );
+            let share_across_sessions = !session.transaction.has_active_transaction();
             if parameter_types.is_empty() {
-                let compiled = compile_statement(snapshot, stmt.clone())?;
-                Ok((compiled.result_schema().to_vec(), Some(compiled)))
+                let planned = build_query_plan(
+                    session,
+                    snapshot,
+                    stmt.clone(),
+                    &[],
+                    share_across_sessions,
+                    statement_fingerprint(sql),
+                )?;
+                Ok((
+                    planned.plan.result_schema().to_vec(),
+                    Some(planned.plan),
+                    planned.statement_decision_id,
+                ))
             } else {
                 let parameter_types = parameter_types
                     .iter()
                     .map(|ty| ty.clone().unwrap_or(LogicalType::Unknown))
                     .collect::<Vec<_>>();
-                let compiled = build_query_plan(snapshot, stmt.clone(), &parameter_types)?;
+                let planned = build_query_plan(
+                    session,
+                    snapshot,
+                    stmt.clone(),
+                    &parameter_types,
+                    share_across_sessions,
+                    statement_fingerprint(sql),
+                )?;
                 let generic_plan = parameter_types
                     .iter()
                     .all(|ty| !matches!(ty, LogicalType::Unknown))
-                    .then_some(compiled.clone());
-                Ok((compiled.result_schema().to_vec(), generic_plan))
+                    .then_some(planned.plan.clone());
+                Ok((
+                    planned.plan.result_schema().to_vec(),
+                    generic_plan,
+                    planned.statement_decision_id,
+                ))
             }
         }
-        FrontendRoute::Utility(cmd) => Ok((utility_result_schema(cmd), None)),
+        FrontendRoute::Utility(cmd) => Ok((utility_result_schema(cmd), None, None)),
         FrontendRoute::Prepared(_) => Err(paro_error::not_supported(format!(
             "extended query Parse does not support statement \"{sql}\"",
         ))),
@@ -561,19 +846,129 @@ fn utility_result_schema(cmd: &crate::dispatch::UtilityCommand) -> Vec<ResultCol
     }
 }
 
+fn compile_explain_parts(stmt: &Statement) -> Option<(&Statement, &[ExplainOption])> {
+    let Statement::Explain {
+        options: (_, options),
+        query,
+        ..
+    } = stmt
+    else {
+        return None;
+    };
+    options
+        .contains(&ExplainOption::Compile)
+        .then_some((query.as_ref(), options.as_slice()))
+}
+
+fn compile_explain_result_schema() -> Vec<ResultColumnDesc> {
+    vec![ResultColumnDesc::new("QUERY PLAN", LogicalType::Varchar)]
+}
+
+struct PlannedQuery {
+    plan: CompiledStatement,
+    statement_decision_id: Option<u64>,
+}
+
 fn build_query_plan(
+    session: &Session,
     snapshot: Arc<StatementContext>,
     stmt: Statement,
     parameter_types: &[LogicalType],
-) -> Result<CompiledStatement> {
-    compile_statement_with_parameter_types(snapshot, stmt, parameter_types)
+    share_across_sessions: bool,
+    cache_query_fingerprint: u64,
+) -> Result<PlannedQuery> {
+    let statement_trace = snapshot.statement_trace();
+    if share_across_sessions {
+        if let Some(plan) =
+            session.reusable_instance_query_plan(&stmt, parameter_types, snapshot.as_ref())
+        {
+            let statement_decision_id =
+                session.record_statement_cache_decision(cache_query_fingerprint, true);
+            if let Some(decision_id) = statement_decision_id {
+                snapshot
+                    .diagnostics
+                    .publish_statement_artifact(decision_id, plan.artifact_identity());
+                if let Some(receipt) = plan.compile_receipt() {
+                    snapshot
+                        .diagnostics
+                        .publish_compile_receipt(decision_id, receipt);
+                } else if let Some(work) = plan.compile_work() {
+                    snapshot.diagnostics.publish_compile_work(decision_id, work);
+                }
+                // A cache lookup is a terminal compile decision.  The
+                // immutable source receipt remains in bounded history and is
+                // referenced by later executions; it must not occupy an
+                // active slot until the portal happens to Execute.
+                session.finish_statement_cache_decision(decision_id);
+            }
+            if let Some(trace) = &statement_trace {
+                trace.record_event("compile", "plan_cache_hit");
+            }
+            return Ok(PlannedQuery {
+                plan,
+                statement_decision_id,
+            });
+        }
+    }
+    let statement_decision_id = share_across_sessions
+        .then(|| session.record_statement_cache_decision(cache_query_fingerprint, false))
+        .flatten();
+    if let Some(trace) = &statement_trace {
+        trace.record_event("compile", "plan_cache_miss");
+        trace.record_event("compile", "compiler_call_entry");
+    }
+    let compiled =
+        compile_statement_with_parameter_types(snapshot.clone(), stmt.clone(), parameter_types);
+    if let Some(trace) = &statement_trace {
+        trace.record_event("compile", "compiler_call_return");
+    }
+    let plan = match compiled {
+        Ok(plan) => plan,
+        Err(error) => {
+            if let Some(decision_id) = statement_decision_id {
+                session.finish_statement_cache_decision(decision_id);
+            }
+            return Err(error);
+        }
+    };
+    if let Some(decision_id) = statement_decision_id {
+        snapshot
+            .diagnostics
+            .publish_statement_artifact(decision_id, plan.artifact_identity());
+        if let Some(receipt) = plan.compile_receipt() {
+            snapshot
+                .diagnostics
+                .publish_compile_receipt(decision_id, receipt);
+        } else if let Some(work) = plan.compile_work() {
+            snapshot.diagnostics.publish_compile_work(decision_id, work);
+        }
+        // Compilation owns this decision.  Execution receipts refer back to
+        // the sealed history entry but do not keep the compile decision live.
+        session.finish_statement_cache_decision(decision_id);
+    }
+    if share_across_sessions {
+        session.publish_instance_query_plan(
+            stmt,
+            parameter_types.to_vec(),
+            snapshot.as_ref(),
+            plan.clone(),
+        );
+        if let Some(trace) = &statement_trace {
+            trace.record_event("compile", "plan_cache_publish");
+        }
+    }
+    Ok(PlannedQuery {
+        plan,
+        statement_decision_id,
+    })
 }
 
 fn select_protocol_query_plan(
     session: &Session,
     statement: &PreparedStatementEntry,
     parameter_env: &TypedParameterEnv,
-) -> Result<CompiledStatement> {
+    statement_trace: Option<Arc<StatementTrace>>,
+) -> Result<PlannedQuery> {
     let parameter_types = parameter_env
         .logical_types()
         .into_iter()
@@ -584,21 +979,31 @@ fn select_protocol_query_plan(
         if plan.compile_environment() == &compile_environment
             && plan.parameter_types() == parameter_types
         {
-            return Ok(plan.clone());
+            if let Some(trace) = &statement_trace {
+                trace.record_event("compile", "prepared_plan_cache_hit");
+            }
+            return Ok(PlannedQuery {
+                plan: plan.clone(),
+                statement_decision_id: statement.compile_decision_id,
+            });
         }
     }
 
-    let snapshot = session.freeze_statement_context(
+    let snapshot = session.freeze_statement_context_with_trace(
         StatementOptions {
             source: StatementSource::ExtendedQuery,
             ..StatementOptions::default()
         },
         session.compile_scope_cancellation(),
+        statement_trace,
     );
     build_query_plan(
+        session,
         snapshot,
         statement.raw_stmt.as_ref().clone(),
         &parameter_types,
+        !session.transaction.has_active_transaction(),
+        statement_fingerprint(statement.source_sql.as_ref()),
     )
 }
 
@@ -750,6 +1155,7 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
             return execute_non_row_query_portal(session, portal, None, execution, responder).await;
         }
     } else {
+        let snapshot_started = Instant::now();
         let snapshot = session.freeze_statement_context(
             StatementOptions {
                 source: StatementSource::ExtendedQuery,
@@ -759,8 +1165,11 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
                 .current_statement_cancellation()
                 .expect("portal execution requires an active statement scope"),
         );
-        let execution = revalidate_portal_execution(snapshot.clone(), portal, execution)?;
-        portal.kind = PortalKind::Query(execution.clone());
+        if let Some(trace) = active_statement_trace(session) {
+            trace.record_span("frontend", "statement_snapshot", snapshot_started);
+        }
+        let execution = revalidate_portal_execution(session, snapshot.clone(), portal, execution)?;
+        portal.kind = PortalKind::Query(Box::new(execution.clone()));
         if !execution.statement().is_query() {
             return execute_non_row_query_portal(
                 session,
@@ -772,15 +1181,54 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
             .await;
         }
         if message.max_rows <= 0 && matches!(portal.scroll_mode, ScrollMode::NoScroll) {
+            let execution_started = Instant::now();
+            let cold_work = paro_common::cold_work::Window::begin();
+            let cold_diagnostics = cold_work.as_ref().map(|_| snapshot.diagnostics.clone());
+            let cold_image = cold_work
+                .as_ref()
+                .map(|_| execution.statement().diagnostic_image_identity());
             let executor = Executor::new(snapshot);
             session.set_executor(executor);
             let mut stream = session.get_executor().execute(execution)?;
+            let execution_id = stream.execution_id();
             let mut row_count = 0usize;
+            let mut first_page = false;
+            let fetch_started = Instant::now();
             while let Some(chunk) = stream.fetch()? {
-                row_count = row_count.saturating_add(chunk.size());
+                let chunk_rows = chunk.size();
+                row_count = row_count.saturating_add(chunk_rows);
+                if !first_page {
+                    first_page = true;
+                    if let Some(trace) = active_statement_trace(session) {
+                        trace.record_span("execution", "first_page_ready", fetch_started);
+                    }
+                }
                 responder
                     .send_data_chunk(chunk, &portal.result_schema, &portal.result_formats)
                     .await?;
+                if let Some(trace) = active_statement_trace(session) {
+                    trace.record_value("protocol", "result_chunk_delivered", chunk_rows as u64);
+                }
+            }
+            if !first_page {
+                if let Some(trace) = active_statement_trace(session) {
+                    trace.record_span("execution", "first_page_empty", fetch_started);
+                }
+            }
+            if let Some(trace) = active_statement_trace(session) {
+                trace.record_span("execution", "fetch_drain", fetch_started);
+                trace.record_value("execution", "rows_returned", row_count as u64);
+                trace.record_span("execution", "portal_execution", execution_started);
+            }
+            if let (Some(execution_id), Some(window), Some(diagnostics)) =
+                (execution_id, cold_work, cold_diagnostics)
+            {
+                diagnostics.publish_execution_work(
+                    execution_id,
+                    statement_fingerprint(portal.source_sql.as_ref()),
+                    cold_image.unwrap(),
+                    window.finish(),
+                );
             }
             portal.execution_state = PortalExecutionState::Exhausted {
                 position: row_count as i64,
@@ -788,10 +1236,21 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
             portal.snapshot_retention = None;
             let completion = infer_statement_completion(&portal.raw_stmt, row_count);
             responder.send_command_complete(&completion).await?;
+            if let Some(trace) = active_statement_trace(session) {
+                trace.record_event("protocol", "command_complete_sent");
+            }
             return Ok(PortalProgress::Complete(completion));
         }
+        let materialization_started = Instant::now();
         let materialized =
             materialize_compiled_statement(session, snapshot.clone(), execution).await?;
+        if let Some(trace) = active_statement_trace(session) {
+            trace.record_span(
+                "execution",
+                "portal_materialization",
+                materialization_started,
+            );
+        }
         portal.execution_state = PortalExecutionState::Active(PortalCursor {
             position: -1,
             execution: ExecutionCursorHandle::materialized(materialized),
@@ -815,10 +1274,23 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
                 .map_err(paro_error::syntax)?;
             cursor.position = outcome.new_position;
 
+            let mut first_page = false;
             for chunk in &outcome.rows {
+                if !first_page {
+                    first_page = true;
+                    if let Some(trace) = active_statement_trace(session) {
+                        trace.record_event("execution", "first_page_ready");
+                    }
+                }
                 responder
                     .send_data_chunk(chunk, &portal.result_schema, &portal.result_formats)
                     .await?;
+                if let Some(trace) = active_statement_trace(session) {
+                    trace.record_value("protocol", "result_chunk_delivered", chunk.size() as u64);
+                }
+            }
+            if let Some(trace) = active_statement_trace(session) {
+                trace.record_value("execution", "rows_returned", outcome.moved_rows as u64);
             }
 
             if outcome.at_end {
@@ -827,15 +1299,24 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
                 };
                 let completion = infer_statement_completion(&portal.raw_stmt, outcome.moved_rows);
                 responder.send_command_complete(&completion).await?;
+                if let Some(trace) = active_statement_trace(session) {
+                    trace.record_event("protocol", "command_complete_sent");
+                }
                 Ok(PortalProgress::Complete(completion))
             } else {
                 responder.send_portal_suspended().await?;
+                if let Some(trace) = active_statement_trace(session) {
+                    trace.record_event("protocol", "portal_suspended");
+                }
                 Ok(PortalProgress::Suspended)
             }
         }
         PortalExecutionState::Exhausted { .. } => {
             let completion = infer_statement_completion(&portal.raw_stmt, 0);
             responder.send_command_complete(&completion).await?;
+            if let Some(trace) = active_statement_trace(session) {
+                trace.record_event("protocol", "command_complete_sent");
+            }
             Ok(PortalProgress::Complete(completion))
         }
         PortalExecutionState::Ready => Err(paro_error::internal(
@@ -847,24 +1328,41 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
 /// Paro acquires a portal's data snapshot at first Execute, rather than Bind.
 /// Revalidate against that same snapshot so catalog bindings cannot lag behind it.
 fn revalidate_portal_execution(
+    session: &Session,
     snapshot: Arc<StatementContext>,
     portal: &PortalEntry,
     execution: ExecutionRequest,
 ) -> Result<ExecutionRequest> {
-    if execution.statement().compile_environment() == &snapshot.compile_environment_key() {
+    if execution.statement().compile_environment() == &snapshot.compile_environment_key()
+        && execution
+            .statement()
+            .dynamic_dependencies_available(snapshot.as_ref())
+    {
         return Ok(execution);
     }
 
     let parameter_types = execution.statement().parameter_types().to_vec();
-    let plan = build_query_plan(snapshot, portal.raw_stmt.as_ref().clone(), &parameter_types)?;
-    if plan.result_schema() != portal.result_schema.as_ref() {
+    let planned = build_query_plan(
+        session,
+        snapshot,
+        portal.raw_stmt.as_ref().clone(),
+        &parameter_types,
+        false,
+        statement_fingerprint(portal.source_sql.as_ref()),
+    )?;
+    if planned.plan.result_schema() != portal.result_schema.as_ref() {
         return Err(ParoError::new(paro_error::ErrorData::new(
             paro_error::Severity::Error,
             paro_error::codes::feature::FEATURE_NOT_SUPPORTED,
             "cached plan must not change result type",
         )));
     }
-    execution.with_statement(plan)
+    let execution = execution.with_statement(planned.plan)?;
+    Ok(if let Some(id) = planned.statement_decision_id {
+        execution.with_statement_decision_id(id)
+    } else {
+        execution
+    })
 }
 
 async fn execute_non_row_query_portal<R: ExtendedQueryResponder>(
@@ -876,6 +1374,9 @@ async fn execute_non_row_query_portal<R: ExtendedQueryResponder>(
 ) -> Result<PortalProgress> {
     if let Some(completion) = portal.completion.clone() {
         responder.send_command_complete(&completion).await?;
+        if let Some(trace) = active_statement_trace(session) {
+            trace.record_event("protocol", "command_complete_sent");
+        }
         return Ok(PortalProgress::Complete(completion));
     }
 
@@ -887,6 +1388,9 @@ async fn execute_non_row_query_portal<R: ExtendedQueryResponder>(
     portal.execution_state = PortalExecutionState::Exhausted { position: 0 };
     portal.completion = Some(completion.clone());
     responder.send_command_complete(&completion).await?;
+    if let Some(trace) = active_statement_trace(session) {
+        trace.record_event("protocol", "command_complete_sent");
+    }
     Ok(PortalProgress::Complete(completion))
 }
 
@@ -898,6 +1402,9 @@ async fn execute_utility_portal<R: ExtendedQueryResponder>(
 ) -> Result<PortalProgress> {
     if let Some(completion) = portal.completion.clone() {
         responder.send_command_complete(&completion).await?;
+        if let Some(trace) = active_statement_trace(session) {
+            trace.record_event("protocol", "command_complete_sent");
+        }
         return Ok(PortalProgress::Complete(completion));
     }
 
@@ -913,6 +1420,9 @@ async fn execute_utility_portal<R: ExtendedQueryResponder>(
         .unwrap_or(StatementCompletion::Empty);
     portal.execution_state = PortalExecutionState::Exhausted { position: 0 };
     portal.completion = Some(completion.clone());
+    if let Some(trace) = active_statement_trace(session) {
+        trace.record_event("protocol", "command_complete_sent");
+    }
     Ok(PortalProgress::Complete(completion))
 }
 
@@ -1014,6 +1524,26 @@ fn statement_entry<'a>(
     }
 }
 
+fn take_statement_trace(session: &mut Session, name: Option<&str>) -> Option<Arc<StatementTrace>> {
+    match name {
+        Some(name) => session
+            .state
+            .get_prepared_statement_mut(name)
+            .and_then(|entry| entry.statement_trace.take()),
+        None => session
+            .state
+            .unnamed_prepared_statement_mut()
+            .and_then(|entry| entry.statement_trace.take()),
+    }
+}
+
+fn active_statement_trace(session: &Session) -> Option<Arc<StatementTrace>> {
+    session
+        .active_query()
+        .and_then(|query| query.statement_trace())
+        .cloned()
+}
+
 fn portal_entry<'a>(session: &'a Session, name: Option<&str>) -> Result<&'a PortalEntry> {
     match name {
         Some(name) => session
@@ -1042,6 +1572,12 @@ fn overwrite_portal_entry(session: &mut Session, name: Option<&str>, portal: Por
     }
 }
 
+fn finish_statement_decision(session: &Session, entry: Option<PreparedStatementEntry>) {
+    if let Some(decision_id) = entry.and_then(|entry| entry.compile_decision_id) {
+        session.finish_statement_cache_decision(decision_id);
+    }
+}
+
 fn named_or_unnamed_statement_entry_mut<'a>(
     session: &'a mut Session,
     name: Option<&str>,
@@ -1057,8 +1593,55 @@ fn should_begin_implicit_transaction_for_portal(session: &Session, kind: &Portal
         && session.is_auto_commit()
         && matches!(
             kind,
-            PortalKind::Query(_) | PortalKind::Materialized | PortalKind::ClientCopy { .. }
+            PortalKind::Query(_)
+                | PortalKind::CompileExplain { .. }
+                | PortalKind::Materialized
+                | PortalKind::ClientCopy { .. }
         )
+}
+
+async fn execute_compile_explain_portal<R: ExtendedQueryResponder>(
+    session: &mut Session,
+    portal: &mut PortalEntry,
+    target: Statement,
+    options: Vec<ExplainOption>,
+    parameter_env: TypedParameterEnv,
+    responder: &mut R,
+) -> Result<PortalProgress> {
+    if let Some(completion) = portal.completion.clone() {
+        responder.send_command_complete(&completion).await?;
+        if let Some(trace) = active_statement_trace(session) {
+            trace.record_event("protocol", "command_complete_sent");
+        }
+        return Ok(PortalProgress::Complete(completion));
+    }
+
+    let parameter_types = parameter_env
+        .logical_types()
+        .into_iter()
+        .map(|ty| ty.unwrap_or(LogicalType::Unknown))
+        .collect::<Vec<_>>();
+    let mut sink = ResponderSink::new(responder, &portal.result_schema, &portal.result_formats);
+    session
+        .execute_compile_explain_with_parameters(
+            target,
+            &options,
+            None,
+            &parameter_types,
+            Some(&parameter_env),
+            &mut sink,
+        )
+        .await?;
+    let completion = sink
+        .last_completion()
+        .cloned()
+        .unwrap_or(StatementCompletion::Explain);
+    portal.execution_state = PortalExecutionState::Exhausted { position: 1 };
+    portal.completion = Some(completion.clone());
+    if let Some(trace) = active_statement_trace(session) {
+        trace.record_event("protocol", "command_complete_sent");
+    }
+    Ok(PortalProgress::Complete(completion))
 }
 
 async fn execute_client_copy_portal<R: ExtendedQueryResponder>(
@@ -1070,6 +1653,9 @@ async fn execute_client_copy_portal<R: ExtendedQueryResponder>(
 ) -> Result<PortalProgress> {
     if let Some(completion) = portal.completion.clone() {
         responder.send_command_complete(&completion).await?;
+        if let Some(trace) = active_statement_trace(session) {
+            trace.record_event("protocol", "command_complete_sent");
+        }
         return Ok(PortalProgress::Complete(completion));
     }
 
@@ -1122,6 +1708,9 @@ async fn execute_client_copy_portal<R: ExtendedQueryResponder>(
     portal.execution_state = PortalExecutionState::Exhausted { position: 0 };
     portal.completion = Some(completion.clone());
     responder.send_command_complete(&completion).await?;
+    if let Some(trace) = active_statement_trace(session) {
+        trace.record_event("protocol", "command_complete_sent");
+    }
     Ok(PortalProgress::Complete(completion))
 }
 
@@ -1180,6 +1769,16 @@ impl<R: ExtendedQueryResponder> crate::result::sink::ResultSink for ResponderSin
             .await
     }
 
+    async fn push_diagnostic_chunk(
+        &mut self,
+        chunk: &Chunk,
+        owner: std::sync::Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+    ) -> Result<()> {
+        self.responder
+            .send_diagnostic_chunk(chunk, self.schema, self.format_codes, owner)
+            .await
+    }
+
     async fn finish_result(&mut self, completion: &StatementCompletion) -> Result<()> {
         self.completion = Some(completion.clone());
         self.responder.send_command_complete(completion).await
@@ -1189,6 +1788,8 @@ impl<R: ExtendedQueryResponder> crate::result::sink::ResultSink for ResponderSin
         self.responder.send_error(err).await
     }
 }
+
+impl<R: ExtendedQueryResponder> crate::ProtocolResultSink for ResponderSink<'_, R> {}
 
 fn describe_variable_show(stmt: &VariableShowStmt) -> Vec<ResultColumnDesc> {
     crate::utility::settings::describe_variable_show(stmt)
@@ -1202,6 +1803,7 @@ mod tests {
     use async_trait::async_trait;
     use paro_common::runtime_value::Value;
     use paro_common::types::pg_oid::{INT4OID, NUMERICOID};
+    use paro_context::ExecutionTerminal;
     use tokio_util::bytes::Bytes;
 
     #[derive(Default)]
@@ -1260,6 +1862,17 @@ mod tests {
                 self.rows.push(row);
             }
             Ok(())
+        }
+
+        async fn send_diagnostic_chunk(
+            &mut self,
+            chunk: &Chunk,
+            schema: &[ResultColumnDesc],
+            format_codes: &[FormatCode],
+            owner: Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+        ) -> Result<()> {
+            let _ = owner;
+            self.send_data_chunk(chunk, schema, format_codes).await
         }
 
         async fn send_command_complete(&mut self, completion: &StatementCompletion) -> Result<()> {
@@ -1587,6 +2200,91 @@ mod tests {
         .unwrap();
 
         assert_eq!(responder.rows, vec![vec!["42".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn extended_compile_explain_binds_describes_and_executes_once() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut responder = TestResponder::default();
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Parse(ParseMessage {
+                name: Some("compile_stmt".to_string()),
+                query: "EXPLAIN (COMPILE, ANALYZE, FORMAT JSON) SELECT $1::INT + 1".to_string(),
+                type_oids: vec![INT4OID],
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        let statement = statement_entry(&session, Some("compile_stmt")).unwrap();
+        assert_eq!(statement.result_schema.len(), 1);
+        assert_eq!(statement.result_schema[0].name, "QUERY PLAN");
+        assert!(
+            statement.generic_plan.is_none(),
+            "Parse must not compile the target"
+        );
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Describe(DescribeTarget::Statement(Some(
+                "compile_stmt".to_string(),
+            ))),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+        assert!(responder.events.iter().any(|event| event == "row_desc:1"));
+        assert!(
+            responder.rows.is_empty(),
+            "Describe must not execute the target"
+        );
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Bind(BindMessage {
+                portal_name: Some("compile_portal".to_string()),
+                statement_name: Some("compile_stmt".to_string()),
+                parameter_format_codes: Vec::new(),
+                parameters: vec![Some(b"41".to_vec())],
+                result_column_format_codes: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            portal_entry(&session, Some("compile_portal")).unwrap().kind,
+            PortalKind::CompileExplain { .. }
+        ));
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Execute(ExecutePortalMessage {
+                name: Some("compile_portal".to_string()),
+                max_rows: 0,
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(responder.rows.len(), 1);
+        assert_eq!(
+            responder
+                .events
+                .iter()
+                .filter(|event| event.starts_with("complete:EXPLAIN"))
+                .count(),
+            1
+        );
+        let receipts = session.diagnostics.execution_receipts_snapshot();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].terminal, ExecutionTerminal::Completed);
+        assert!(receipts[0].actual_class.is_some());
     }
 
     #[tokio::test]
@@ -2416,7 +3114,7 @@ mod tests {
             .message()
             .contains("binary parameter format not supported"));
 
-        let err = execute_extended_query_message(
+        execute_extended_query_message(
             &mut session,
             ExtendedQueryMessage::Bind(BindMessage {
                 portal_name: Some("p2".to_string()),
@@ -2428,8 +3126,16 @@ mod tests {
             &mut responder,
         )
         .await
-        .unwrap_err();
-        assert!(err.message().contains("binary result format not supported"));
+        .unwrap();
+        assert_eq!(
+            session
+                .state
+                .get_portal("p2")
+                .expect("numeric binary portal")
+                .result_formats
+                .as_ref(),
+            [FormatCode::Binary]
+        );
     }
 
     #[tokio::test]
@@ -2453,6 +3159,11 @@ mod tests {
             .unnamed_prepared_statement()
             .and_then(|statement| statement.generic_plan.clone())
             .expect("first unnamed Parse compiles a generic plan");
+        let first_ast = session
+            .state
+            .unnamed_prepared_statement()
+            .map(|statement| statement.raw_stmt.clone())
+            .expect("first unnamed Parse retains its AST");
 
         execute_extended_query_message(&mut session, parse(), &mut responder)
             .await
@@ -2463,6 +3174,14 @@ mod tests {
             .and_then(|statement| statement.generic_plan.clone())
             .expect("repeated unnamed Parse keeps a generic plan");
         assert!(second.shares_image_with(&first));
+        assert!(Arc::ptr_eq(
+            &first_ast,
+            &session
+                .state
+                .unnamed_prepared_statement()
+                .expect("repeated unnamed Parse retains its entry")
+                .raw_stmt
+        ));
 
         session.config.set_setting("threads", Value::Integer(2));
         crate::utility::settings::reconcile_effective_settings(&mut session).unwrap();
@@ -2522,40 +3241,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_simple_query_reuses_only_the_same_compile_environment() {
+    async fn query_plan_cache_is_instance_wide_and_environment_exact() {
         let instance = paro_instance::Instance::new_in_memory();
-        let mut session = Session::new(1, instance);
+        let mut session = Session::new(1, instance.clone());
+        session
+            .config
+            .set_setting("optimizer_verify", Value::Boolean(true));
+        crate::utility::settings::reconcile_effective_settings(&mut session).unwrap();
 
         let mut first_sink = CollectingSink::new();
         exec_simple_ok(&mut session, &mut first_sink, "SELECT 1").await;
-        let statement = paro_parser::parse("SELECT 1")
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
-            .stmt;
-        let first = session
-            .state
-            .reusable_simple_query_plan(&statement, None, &session.compile_environment_key())
-            .expect("first Simple Query publishes a reusable plan");
+        let after_first = instance.plan_cache().metrics();
+        assert_eq!(after_first.entries, 1);
+        assert_eq!(after_first.hits, 0);
+        assert_eq!(after_first.misses, 1);
 
         let mut second_sink = CollectingSink::new();
         exec_simple_ok(&mut session, &mut second_sink, "SELECT 1").await;
-        let second = session
-            .state
-            .reusable_simple_query_plan(&statement, None, &session.compile_environment_key())
-            .expect("repeated Simple Query retains a reusable plan");
-        assert!(second.shares_image_with(&first));
+        assert_eq!(instance.plan_cache().metrics().hits, 1);
+
+        let mut peer = Session::new(2, instance.clone());
+        peer.config
+            .set_setting("optimizer_verify", Value::Boolean(true));
+        crate::utility::settings::reconcile_effective_settings(&mut peer).unwrap();
+        assert_eq!(session.effective_settings(), peer.effective_settings());
+        assert_eq!(
+            session.compile_environment_key(),
+            peer.compile_environment_key()
+        );
+        assert_eq!(
+            session.freeze_query_context().env,
+            peer.freeze_query_context().env
+        );
+        let mut peer_sink = CollectingSink::new();
+        exec_simple_ok(&mut peer, &mut peer_sink, "SELECT 1").await;
+        let after_peer = instance.plan_cache().metrics();
+        assert_eq!(after_peer.hits, 2, "{after_peer:?}");
+
+        let mut unverified_peer = Session::new(3, instance.clone());
+        unverified_peer
+            .config
+            .set_setting("optimizer_verify", Value::Boolean(false));
+        crate::utility::settings::reconcile_effective_settings(&mut unverified_peer).unwrap();
+        assert_eq!(
+            session.compile_environment_key(),
+            unverified_peer.compile_environment_key(),
+            "verification observes a compiled image and cannot change its identity"
+        );
+        let mut unverified_sink = CollectingSink::new();
+        exec_simple_ok(&mut unverified_peer, &mut unverified_sink, "SELECT 1").await;
+        assert_eq!(instance.plan_cache().metrics().hits, 3);
 
         session.config.set_setting("threads", Value::Integer(2));
         crate::utility::settings::reconcile_effective_settings(&mut session).unwrap();
         let mut changed_sink = CollectingSink::new();
         exec_simple_ok(&mut session, &mut changed_sink, "SELECT 1").await;
-        let changed = session
-            .state
-            .reusable_simple_query_plan(&statement, None, &session.compile_environment_key())
-            .expect("changed environment publishes a replacement plan");
-        assert!(!changed.shares_image_with(&second));
+        let changed = instance.plan_cache().metrics();
+        assert_eq!(changed.hits, 3);
+        assert_eq!(changed.misses, 2);
+        assert_eq!(changed.entries, 2);
     }
 
     #[tokio::test]

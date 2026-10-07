@@ -390,6 +390,8 @@ const fn binary_affix(op: &BinaryOperator) -> Affix {
         BinaryOperator::Like(_) => Affix::Infix(Precedence(20), Associativity::Left),
         BinaryOperator::LikeAny(_) => Affix::Infix(Precedence(20), Associativity::Left),
         BinaryOperator::NotLike(_) => Affix::Infix(Precedence(20), Associativity::Left),
+        BinaryOperator::ILike => Affix::Infix(Precedence(20), Associativity::Left),
+        BinaryOperator::NotILike => Affix::Infix(Precedence(20), Associativity::Left),
         BinaryOperator::Regexp => Affix::Infix(Precedence(20), Associativity::Left),
         BinaryOperator::NotRegexp => Affix::Infix(Precedence(20), Associativity::Left),
         BinaryOperator::RLike => Affix::Infix(Precedence(20), Associativity::Left),
@@ -1689,6 +1691,7 @@ pub fn expr_element(i: Input) -> IResult<WithSpan<ExprElement>> {
         .parse(i),
         IN => with_span!(rule!(#in_list | #in_subquery)).parse(i),
         LIKE => with_span!(rule!(#like_subquery | #binary_op)).parse(i),
+        ILIKE => with_span!(rule!(#binary_op)).parse(i),
         EXISTS => with_span!(exists).parse(i),
         BETWEEN => with_span!(between).parse(i),
         CAST | TRY_CAST => with_span!(cast).parse(i),
@@ -1893,9 +1896,13 @@ pub fn binary_op(i: Input) -> IResult<BinaryOperator> {
                     return_op(i, 1, BinaryOperator::Like(None))
                 };
             }
+            ILIKE => return return_op(i, 1, BinaryOperator::ILike),
             NOT => match i.tokens.get(1).map(|first| first.kind) {
                 Some(LIKE) => {
                     return return_op(i, 2, BinaryOperator::NotLike(None));
+                }
+                Some(ILIKE) => {
+                    return return_op(i, 2, BinaryOperator::NotILike);
                 }
                 Some(REGEXP) => {
                     return return_op(i, 2, BinaryOperator::NotRegexp);
@@ -1916,7 +1923,7 @@ pub fn binary_op(i: Input) -> IResult<BinaryOperator> {
     Err(nom::Err::Error(Error::from_error_kind(
         i,
         ErrorKind::Other(
-            "expecting `IS`, `IN`, `LIKE`, `EXISTS`, `BETWEEN`, `+`, `-`, `*`, `/`, `//`, `DIV`, `%`, `||`, `<=>`, `<+>`, `<->`, `<#>`, `>`, `<`, `>=`, `<=`, `=`, `<>`, `!=`, `^`, `AND`, `OR`, `XOR`, `NOT`, `REGEXP`, `RLIKE`, `SOUNDS`, or more ...",
+            "expecting `IS`, `IN`, `LIKE`, `ILIKE`, `EXISTS`, `BETWEEN`, `+`, `-`, `*`, `/`, `//`, `DIV`, `%`, `||`, `<=>`, `<+>`, `<->`, `<#>`, `>`, `<`, `>=`, `<=`, `=`, `<>`, `!=`, `^`, `AND`, `OR`, `XOR`, `NOT`, `REGEXP`, `RLIKE`, `SOUNDS`, or more ...",
         ),
     )))
 }
@@ -2245,9 +2252,15 @@ pub fn type_name(i: Input) -> IResult<TypeName> {
     let ty_date = value(TypeName::Date, rule! { DATE });
     let ty_time = value(TypeName::Time, rule! { TIME });
     let ty_interval = value(TypeName::Interval, rule! { INTERVAL });
-    let ty_datetime = map(
-        rule! { ( DATETIME | TIMESTAMP ) ~ ( "(" ~ ^#literal_u64 ~ ^")" )? },
-        |(_, _)| TypeName::Timestamp,
+    let ty_datetime = value(
+        TypeName::Timestamp,
+        alt((
+            value((), rule! { TIMESTAMP ~ WITHOUT ~ TIME ~ ZONE }),
+            value(
+                (),
+                rule! { ( DATETIME | TIMESTAMP ) ~ ( "(" ~ ^#literal_u64 ~ ^")" )? },
+            ),
+        )),
     );
     let ty_binary = value(
         TypeName::Binary,

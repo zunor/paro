@@ -3,7 +3,7 @@
 
 use crate::binder::Binder;
 use crate::expression::{ConstantExpression, ExpressionIterator, WindowExpression};
-use crate::operator::{Join, LogicalOperator};
+use crate::logical::operator::{Join, LogicalOperator};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -211,6 +211,7 @@ impl<'a> RecursiveSubqueryPlanner<'a> {
             | LogicalOperator::FullTextFilterScan(_)
             | LogicalOperator::ExpressionGet(_) => Ok(false),
             LogicalOperator::Get(_)
+            | LogicalOperator::SubplanRef(_)
             | LogicalOperator::Alter(_)
             | LogicalOperator::CreateTable(_)
             | LogicalOperator::CreateRoutine(_)
@@ -258,10 +259,13 @@ impl<'a> RecursiveSubqueryPlanner<'a> {
             LogicalOperator::Join(Join::Any(any)) => {
                 let mut condition = std::mem::replace(
                     &mut any.condition,
-                    crate::expression::Expression::Constant(ConstantExpression {
-                        value: Value::Boolean(true),
-                        return_type: LogicalType::Boolean,
-                    }),
+                    crate::expression::Expression::Constant(
+                        ConstantExpression {
+                            value: Value::Boolean(true),
+                            return_type: LogicalType::Boolean,
+                        }
+                        .into(),
+                    ),
                 );
                 let mut found = false;
                 found |= self

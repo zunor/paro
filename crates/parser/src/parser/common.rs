@@ -219,7 +219,11 @@ fn plain_identifier(
             },
             |token| Identifier {
                 span: transform_span(std::slice::from_ref(token)),
-                name: token.text().to_string(),
+                // SQL identifiers are case-insensitive unless delimited.
+                // Canonicalize at the parser boundary so every catalog and
+                // lexical-scope lookup receives the same identity. Quoted
+                // identifiers take the separate path below and retain case.
+                name: token.text().to_ascii_lowercase(),
                 quote: None,
                 ident_type: IdentifierType::None,
             },

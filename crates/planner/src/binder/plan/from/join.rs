@@ -8,7 +8,7 @@ use crate::binder::bind::from::join_utils::{
 use crate::binder::ir::BoundJoin;
 use crate::binder::plan::subquery::{flatten_dependent_join, RecursiveSubqueryPlanner};
 use crate::binder::Binder;
-use crate::operator::{
+use crate::logical::operator::{
     CrossProduct, DependentJoin, Filter, Join, JoinSide, JoinType, LogicalOperator,
 };
 use paro_common::error::{self as paro_error, Result};

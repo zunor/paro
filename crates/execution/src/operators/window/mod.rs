@@ -15,3 +15,5 @@ pub use partition_aggregate::{
     PartitionAggregateWindowBuildSinkExec, PartitionAggregateWindowEmitSourceExec,
 };
 pub use streaming::StreamingWindowTransformExec;
+
+mod finalize;

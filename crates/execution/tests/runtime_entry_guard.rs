@@ -41,8 +41,10 @@ fn typed_runtime_entry_has_no_legacy_hot_path() {
     );
     assert!(
         executor.contains("pub fn execute(&self, request: ExecutionRequest)")
-            && executor.contains("let (compiled, parameter_bindings) = request.into_parts()"),
-        "Executor must require an explicit plan-plus-bindings execution request"
+            && executor.contains(
+                "let (compiled, parameter_bindings, statement_decision_id) = request.into_parts()",
+            ),
+        "Executor must require an explicit plan, bindings, and statement identity request"
     );
     assert!(
         !executor.contains("CompiledExecutable::LegacyPhysicalPlan")
@@ -97,16 +99,22 @@ fn typed_runtime_entry_has_no_legacy_hot_path() {
 
     let compiler = read(workspace, "crates/compiler/src/compile.rs");
     assert!(
-        compiler.contains("fn compile_regular_statement(")
-            && compiler.contains(
-                "let arena_plan = match generate_typed_physical_plan(ctx, optimized_plan)"
-            )
-            && compiler.contains("fn generate_typed_physical_plan("),
-        "compiler must build the typed arena physical plan image"
+        compiler.contains("paro_optimizer::Optimizer::new")
+            && compiler.contains("paro_optimizer::OptimizedStatement::Physical(plan)")
+            && compiler.contains("StatementProgram::deferred_physical_plan"),
+        "compiler must receive the typed physical plan image from the optimizer"
     );
     assert!(
-        compiler.contains("StatementProgram::from_physical_plan"),
-        "compiler must lower into StatementProgram before execution"
+        !compiler.contains("PhysicalPlanBuilder")
+            && !compiler.contains("ColumnBindingResolver")
+            && !compiler.contains("generate_typed_physical_plan"),
+        "compiler must not make physical choices or repair logical bindings"
+    );
+    let program = read(&manifest, "src/pipeline/program.rs");
+    assert!(
+        program.contains("pub fn select_for_execution")
+            && program.contains("pub fn from_compiled_physical_plan"),
+        "execution must select a verified optimizer artifact before lowering"
     );
     assert!(
         !compiler.contains(".plan(&mut optimized_plan)"),

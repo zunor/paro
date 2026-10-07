@@ -158,15 +158,16 @@ fn critical_path_distance(graph: &PipelineGraph, pipeline: PipelineId) -> u32 {
 }
 
 fn pipeline_release_bytes(graph: &PipelineGraph, pipeline: PipelineId) -> usize {
+    // A consumer drains retained producer state. Its own blocking grant is
+    // memory it will allocate, not memory it can release by running now.
     graph
-        .pipeline(pipeline)
-        .map(|spec| {
-            if spec.properties.memory.class >= MemoryClass::Blocking {
-                spec.properties.memory.preferred_grant as usize
-            } else {
-                0
-            }
-        })
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.consumer == pipeline)
+        .filter_map(|dependency| graph.pipeline(dependency.producer))
+        .filter(|producer| producer.properties.memory.class >= MemoryClass::Blocking)
+        .map(|producer| producer.properties.memory.preferred_grant as usize)
+        .max()
         .unwrap_or(0)
 }
 
@@ -214,6 +215,48 @@ impl<T: Eq> Ord for ReadyEntry<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_priority_belongs_to_consumer_of_blocking_state() {
+        use crate::physical::{properties::PipelineProperties, specs::EmptyResultSpec, RowType};
+        use crate::pipeline::graph::{
+            ClientResultSpec, DependencyKind, PipelineDependency, PipelineRoot, PipelineSpec,
+            SinkSharing, SinkSpec, SourceSpec,
+        };
+        use crate::pipeline::handles::BreakerHandleCatalog;
+
+        let mut producer_properties = PipelineProperties::default();
+        producer_properties.memory.class = MemoryClass::Blocking;
+        producer_properties.memory.preferred_grant = 16 * 1024 * 1024;
+        let graph = PipelineGraph {
+            pipelines: [producer_properties, PipelineProperties::default()]
+                .into_iter()
+                .enumerate()
+                .map(|(index, properties)| PipelineSpec {
+                    id: PipelineId::new(index),
+                    source: SourceSpec::Empty(EmptyResultSpec),
+                    transforms: Vec::new(),
+                    sink: SinkSpec::ClientResult(ClientResultSpec),
+                    sink_sharing: SinkSharing::Exclusive,
+                    properties,
+                    output: RowType::new(Vec::new(), Vec::new()),
+                })
+                .collect(),
+            dependencies: vec![PipelineDependency {
+                producer: PipelineId::new(0),
+                consumer: PipelineId::new(1),
+                kind: DependencyKind::MaterializeBeforeRead,
+            }],
+            handles: BreakerHandleCatalog::default(),
+            control_regions: Vec::new(),
+            root: PipelineRoot::Pipeline(PipelineId::new(1)),
+        };
+        assert_eq!(pipeline_release_bytes(&graph, PipelineId::new(0)), 0);
+        assert_eq!(
+            pipeline_release_bytes(&graph, PipelineId::new(1)),
+            16 * 1024 * 1024
+        );
+    }
 
     #[test]
     fn memory_aware_policy_prioritizes_release_and_critical_path() {

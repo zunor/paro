@@ -23,9 +23,6 @@ use paro_common::vector::VECTOR_SIZE;
 use paro_context::test_support::TestStatementContextBuilder;
 use paro_execution::explain::profiler::{ExplainProfiler, OperatorProfiler};
 use paro_execution::memory_runtime::QueryMemoryPool;
-use paro_execution::physical::properties::PipelineProperties;
-use paro_execution::physical::row_type::RowType;
-use paro_execution::physical::specs::{ChunkScanSpec, FilterSpec, ProjectSpec};
 use paro_execution::pipeline::graph::{
     ClientResultSpec, HashJoinBuildSinkSpec, PipelineGraph, PipelineId, PipelineRoot, PipelineSpec,
     SinkSharing, SinkSpec, SourceSpec, TransformSpec,
@@ -44,7 +41,13 @@ use paro_execution::runtime::{
 };
 use paro_execution::thread_context::ThreadContext;
 use paro_planner::expression::{Expression, ReferenceExpression};
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{JoinCondition, JoinType};
+use paro_planner::physical::properties::PipelineProperties;
+use paro_planner::physical::row_type::RowType;
+use paro_planner::physical::specs::{ChunkScanSpec, FilterSpec, ProjectSpec, SpillExecutionPolicy};
+
+#[path = "support/runtime_filter_calibration.rs"]
+mod runtime_filter_calibration;
 
 const CHAIN_ITERS: usize = 256;
 const SCRATCH_ITERS: usize = 4096;
@@ -65,6 +68,7 @@ fn write_structured_results(path: &Path) {
     let sample_count = structured_sample_count();
     let selected = structured_bench_filter();
     let mut benches = Vec::new();
+    runtime_filter_calibration::collect(&selected, sample_count, &mut benches);
 
     if structured_bench_selected(&selected, "enum_dispatch_multi_transform_chain") {
         let mut state = TransformChainBench::new();
@@ -253,7 +257,7 @@ fn program_from_graph_pipeline(
 }
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, ty))
+    Expression::Reference(ReferenceExpression::new(index, ty).into())
 }
 
 fn row_type(names: &[&str], types: &[LogicalType]) -> RowType {
@@ -663,11 +667,22 @@ struct HashJoinBuildFinishBench {
     program: Arc<PipelineProgram>,
     handles: BreakerHandleCatalog,
     inputs: Box<[Chunk]>,
+    local_builders: usize,
+    filter_enabled: bool,
     profiler: OperatorProfiler,
 }
 
 impl HashJoinBuildFinishBench {
     fn new() -> Self {
+        Self::with_filter(None, 1, 1)
+    }
+
+    fn with_filter(
+        runtime_filter: Option<paro_planner::physical::HashJoinRuntimeFilterSpec>,
+        key_count: usize,
+        local_builders: usize,
+    ) -> Self {
+        let filter_enabled = runtime_filter.is_some();
         let query = query_context(QueryOutputPort::unbounded());
         let build_id = PipelineId::new(0);
         let build_row_type = row_type(
@@ -698,17 +713,22 @@ impl HashJoinBuildFinishBench {
                     join_type: JoinType::Inner,
                     build_keys_unique: false,
                     build_time_integer_index: None,
-                    key_conditions: vec![JoinCondition::equality(
-                        reference(0, LogicalType::Integer),
-                        reference(0, LogicalType::Integer),
-                    )]
-                    .into_boxed_slice(),
+                    runtime_filter: None,
+                    key_conditions: (0..key_count)
+                        .map(|key| {
+                            JoinCondition::equality(
+                                reference(key, LogicalType::Integer),
+                                reference(key, LogicalType::Integer),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    force_external: false,
+                    spill_policy: SpillExecutionPolicy::InMemory,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -719,7 +739,17 @@ impl HashJoinBuildFinishBench {
             control_regions: Vec::new(),
             root: PipelineRoot::Pipeline(build_id),
         };
-        let (program, handles) = program_from_graph_pipeline(&graph, build_id);
+        let (mut program, handles) = program_from_graph_pipeline(&graph, build_id);
+        // Isolate the production sink rather than inventing a rowset consumer
+        // for this build-only benchmark. No full SQL plan uses this fixture.
+        let sink = &mut Arc::get_mut(&mut program)
+            .expect("owned benchmark program")
+            .sink
+            .exec;
+        let paro_execution::runtime::SinkExec::HashJoinBuild(build) = sink else {
+            panic!("hash build benchmark must use the production sink");
+        };
+        build.runtime_filter = runtime_filter;
         Self {
             query,
             thread: ThreadContext::single_threaded(),
@@ -729,6 +759,8 @@ impl HashJoinBuildFinishBench {
             },
             program,
             handles,
+            local_builders,
+            filter_enabled,
             inputs: (0..JOIN_BUILD_CHUNKS)
                 .map(|idx| join_build_chunk((idx * VECTOR_SIZE) as i32))
                 .collect::<Vec<_>>()
@@ -796,29 +828,36 @@ impl HashJoinBuildFinishBench {
         .expect("input chunk should allocate");
         let mut checksum = 0usize;
 
-        for idx in 0..self.inputs.len() {
-            let template = &self.inputs[idx];
-            input.reference(divan::black_box(template));
-            checksum = checksum.wrapping_add(input.size());
-            let (data, memory) = task
-                .data_and_memory_mut()
-                .expect("hash join benchmark task must carry data-path state");
-            let mut ctx = self.call_context(&runtime, memory, &mut data.scratch.expression);
-            let poll = divan::black_box(&runtime.program.sink.exec)
-                .consume(&mut ctx, &runtime.sink_global, &mut data.sink, &mut input)
-                .expect("hash join build consume should run");
-            assert!(matches!(poll, SinkPoll::NeedMoreInput));
-        }
+        for local in 0..self.local_builders {
+            if local > 0 {
+                task = runtime
+                    .create_task_state(&self.query, bench_allocator())
+                    .expect("hash join build task should initialize");
+            }
+            for idx in (local..self.inputs.len()).step_by(self.local_builders) {
+                let template = &self.inputs[idx];
+                input.reference(divan::black_box(template));
+                checksum = checksum.wrapping_add(input.size());
+                let (data, memory) = task
+                    .data_and_memory_mut()
+                    .expect("hash join benchmark task must carry data-path state");
+                let mut ctx = self.call_context(&runtime, memory, &mut data.scratch.expression);
+                let poll = divan::black_box(&runtime.program.sink.exec)
+                    .consume(&mut ctx, &runtime.sink_global, &mut data.sink, &mut input)
+                    .expect("hash join build consume should run");
+                assert!(matches!(poll, SinkPoll::NeedMoreInput));
+            }
 
-        {
-            let (data, memory) = task
-                .data_and_memory_mut()
-                .expect("hash join benchmark task must carry data-path state");
-            let mut ctx = self.call_context(&runtime, memory, &mut data.scratch.expression);
-            let poll = divan::black_box(&runtime.program.sink.exec)
-                .merge_local(&mut ctx, &runtime.sink_global, &mut data.sink)
-                .expect("hash join build merge should run");
-            assert!(matches!(poll, MergePoll::Done));
+            {
+                let (data, memory) = task
+                    .data_and_memory_mut()
+                    .expect("hash join benchmark task must carry data-path state");
+                let mut ctx = self.call_context(&runtime, memory, &mut data.scratch.expression);
+                let poll = divan::black_box(&runtime.program.sink.exec)
+                    .merge_local(&mut ctx, &runtime.sink_global, &mut data.sink)
+                    .expect("hash join build merge should run");
+                assert!(matches!(poll, MergePoll::Done));
+            }
         }
         {
             let mut ctx = self.finish_context(&runtime, &task.memory);
@@ -843,6 +882,12 @@ impl HashJoinBuildFinishBench {
                 .expect("hash join build finish should run");
             assert!(matches!(poll, FinishPoll::Done));
         }
+
+        let paro_execution::runtime::SinkGlobal::HashJoinBuild(global) = &runtime.sink_global
+        else {
+            panic!("hash join benchmark must use the production build sink");
+        };
+        assert_eq!(global.handle.runtime_filter_ready(), self.filter_enabled);
 
         divan::black_box(checksum)
     }

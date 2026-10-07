@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::plan::PlanNodeId;
+use crate::logical::plan::PlanNodeId;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// Shared allocators that remain stable across nested binder scopes.

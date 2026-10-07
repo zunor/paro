@@ -46,7 +46,11 @@ impl TopNBuildSinkExec {
             self.spec.offset,
             topn_memory_context(ctx.query),
         );
-        handle.initialize(TopNRuntimeState { heap, boundary })?;
+        handle.initialize(TopNRuntimeState {
+            heap,
+            pending_heaps: Vec::new(),
+            boundary,
+        })?;
         Ok(SinkGlobal::TopNBuild(Arc::new(BreakerHandleGlobal {
             handle,
         })))
@@ -85,6 +89,14 @@ impl TopNBuildSinkExec {
             sort_chunk: Chunk::try_initialize(
                 order_types.as_ref(),
                 VECTOR_SIZE,
+                ctx.query.allocator(MemoryTag::BaseTable),
+            )?,
+            payload_chunk: Chunk::try_init_empty(
+                &self.spec.output_types,
+                ctx.query.allocator(MemoryTag::BaseTable),
+            )?,
+            payload_reset_chunk: Chunk::try_init_empty(
+                &self.spec.output_types,
                 ctx.query.allocator(MemoryTag::BaseTable),
             )?,
             order_types,
@@ -130,15 +142,21 @@ impl TopNBuildSinkExec {
             &mut local.sort_chunk,
         )?;
         local
-            .heap
-            .sink_with_sort_chunk(input, &local.sort_chunk, Some(&local.boundary))?;
+            .payload_chunk
+            .reference_columns(input, &self.spec.projection_map);
+        local.heap.sink_with_sort_chunk(
+            &local.payload_chunk,
+            &local.sort_chunk,
+            Some(&local.boundary),
+        )?;
+        local.payload_chunk.reference(&local.payload_reset_chunk);
         local.heap.reduce()?;
         Ok(SinkPoll::NeedMoreInput)
     }
 
     pub(crate) fn merge_local(
         &self,
-        _ctx: &mut OperatorCallContext,
+        ctx: &mut OperatorCallContext,
         global: &SinkGlobal,
         local: &mut SinkLocal,
     ) -> Result<MergePoll> {
@@ -150,9 +168,19 @@ impl TopNBuildSinkExec {
         let SinkLocal::TopNBuild(local) = local else {
             return Err(paro_error::internal("topn build sink local state mismatch"));
         };
+        let completed = std::mem::replace(
+            &mut local.heap,
+            TopNHeap::new_with_memory(
+                self.spec.output_types.to_vec(),
+                &self.spec.orders,
+                self.spec.limit,
+                self.spec.offset,
+                topn_memory_context(ctx.query),
+            ),
+        );
         global.handle.with_state_mut(|state| {
-            state.heap.combine(&mut local.heap)?;
-            state.heap.reduce()
+            state.pending_heaps.push(completed);
+            Ok(())
         })?;
         Ok(MergePoll::Done)
     }

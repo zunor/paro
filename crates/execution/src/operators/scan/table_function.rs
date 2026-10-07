@@ -172,12 +172,13 @@ pub(crate) fn populate_system_table_function_data(
         "paro_schemas" => populate_paro_schemas(global_state, ctx),
         "paro_tables" => populate_paro_tables(global_state, ctx),
         "paro_columns" => populate_paro_columns(global_state, ctx),
+        "paro_constraints" => populate_paro_constraints(global_state, ctx),
         "paro_views" => populate_paro_views(global_state, ctx),
         "paro_indexes" => populate_paro_indexes(global_state, ctx),
         "paro_pg_settings" => populate_paro_pg_settings(global_state, ctx),
         "paro_pg_prepared_statements" => populate_paro_pg_prepared_statements(global_state, ctx),
         "paro_pg_cursors" => populate_paro_pg_cursors(global_state, ctx),
-        "paro_optimizers" => populate_paro_optimizers(global_state),
+        "paro_optimizers" => populate_paro_optimizers(global_state, ctx),
         "paro_storage_info" => populate_paro_storage_info(global_state, ctx),
         "paro_wal_metrics" => populate_paro_wal_metrics(global_state, ctx),
         "paro_transaction_metrics" => populate_paro_transaction_metrics(global_state, ctx),
@@ -371,23 +372,37 @@ fn populate_paro_pg_settings(
         .as_any_mut()
         .downcast_mut::<ParoPgSettingsGlobalState>()
     {
-        populate_settings_data(
-            state,
-            provider
-                .current_settings()
-                .into_iter()
-                .map(|row| SettingRowData {
-                    name: row.name,
-                    setting: row.setting,
-                    unit: row.unit,
-                    category: row.category,
-                    short_desc: row.short_desc,
-                    source: row.source,
-                    vartype: row.vartype,
-                    context: row.context,
-                })
-                .collect(),
+        let mut rows: Vec<SettingRowData> = provider
+            .current_settings()
+            .into_iter()
+            .map(|row| SettingRowData {
+                name: row.name,
+                setting: row.setting,
+                unit: row.unit,
+                category: row.category,
+                short_desc: row.short_desc,
+                source: row.source,
+                vartype: row.vartype,
+                context: row.context,
+            })
+            .collect();
+        rows.extend(
+            paro_context::diagnostic_environment()
+                .iter()
+                .map(|setting| SettingRowData {
+                    name: format!("paro_diagnostic/{}", setting.name),
+                    setting: setting.value.as_deref().unwrap_or("<unset>").to_string(),
+                    unit: None,
+                    category: "Server Diagnostics".to_string(),
+                    short_desc: Some(
+                        "Effective process-start diagnostic environment (read-only)".to_string(),
+                    ),
+                    source: "server_startup".to_string(),
+                    vartype: "string".to_string(),
+                    context: "internal".to_string(),
+                }),
         );
+        populate_settings_data(state, rows);
     }
 }
 
@@ -542,6 +557,119 @@ fn populate_paro_tables(global_state: &mut dyn GlobalTableFunctionState, ctx: &S
         }
 
         populate_table_data(state, tables);
+    }
+}
+
+/// Populate paro_constraints() from the transaction-visible catalog.
+fn populate_paro_constraints(
+    global_state: &mut dyn GlobalTableFunctionState,
+    ctx: &StatementContext,
+) {
+    use paro_catalog::entry::{ConstraintType, TableCatalogEntry};
+    use paro_function::table::system::paro_constraints::{
+        populate_constraint_data, ConstraintData, ParoConstraintsGlobalState,
+    };
+
+    let Some(state) = global_state
+        .as_any_mut()
+        .downcast_mut::<ParoConstraintsGlobalState>()
+    else {
+        return;
+    };
+    let txn = ctx.catalog_txn_view();
+    let mut entries = Vec::new();
+    for database in ctx.databases.iter() {
+        let schema_names = {
+            use paro_catalog::catalog::Catalog;
+            database.catalog.list_schemas(&txn)
+        };
+        for schema_name in schema_names {
+            let Ok(schema) = database.catalog.get_schema(&txn, &schema_name) else {
+                continue;
+            };
+            for catalog_entry in schema
+                .collection(paro_catalog::entry::CatalogType::Table)
+                .expect("table collection")
+                .scan(txn.transaction_id, txn.start_time)
+            {
+                let paro_catalog::entry::CatalogEntryEnum::Table(table) = &*catalog_entry else {
+                    continue;
+                };
+                append_table_constraints(
+                    &mut entries,
+                    database.identity.name.as_ref(),
+                    &schema_name,
+                    table,
+                );
+            }
+        }
+    }
+    entries.sort_by(|left, right| {
+        (
+            &left.database_name,
+            &left.schema_name,
+            &left.table_name,
+            &left.constraint_name,
+        )
+            .cmp(&(
+                &right.database_name,
+                &right.schema_name,
+                &right.table_name,
+                &right.constraint_name,
+            ))
+            .then(left.ordinal_position.cmp(&right.ordinal_position))
+    });
+    populate_constraint_data(state, entries);
+
+    fn append_table_constraints(
+        output: &mut Vec<ConstraintData>,
+        database_name: &str,
+        schema_name: &str,
+        table: &TableCatalogEntry,
+    ) {
+        for (constraint_index, constraint) in table.constraints().iter().enumerate() {
+            let (constraint_type, generated_kind, enforced) = match constraint.constraint_type {
+                ConstraintType::PrimaryKey => ("PRIMARY KEY", "pkey", true),
+                ConstraintType::Unique => ("UNIQUE", "key", false),
+                ConstraintType::ForeignKey => ("FOREIGN KEY", "fkey", false),
+                ConstraintType::Check => ("CHECK", "check", false),
+                ConstraintType::NotNull => ("CHECK", "not_null", true),
+            };
+            let name = format!(
+                "{}_{}_{}",
+                table.base.base.name,
+                generated_kind,
+                constraint_index + 1
+            );
+            if constraint.columns.is_empty() {
+                output.push(ConstraintData {
+                    database_name: database_name.to_string(),
+                    schema_name: schema_name.to_string(),
+                    table_name: table.base.base.name.clone(),
+                    constraint_name: name,
+                    constraint_type: constraint_type.to_string(),
+                    enforced,
+                    column_name: None,
+                    ordinal_position: None,
+                });
+                continue;
+            }
+            for (position, column_index) in constraint.columns.iter().copied().enumerate() {
+                output.push(ConstraintData {
+                    database_name: database_name.to_string(),
+                    schema_name: schema_name.to_string(),
+                    table_name: table.base.base.name.clone(),
+                    constraint_name: name.clone(),
+                    constraint_type: constraint_type.to_string(),
+                    enforced,
+                    column_name: table
+                        .columns
+                        .get(column_index)
+                        .map(|column| column.name.clone()),
+                    ordinal_position: Some((position + 1) as i64),
+                });
+            }
+        }
     }
 }
 
@@ -920,7 +1048,10 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
     }
 }
 
-fn populate_paro_optimizers(global_state: &mut dyn GlobalTableFunctionState) {
+fn populate_paro_optimizers(
+    global_state: &mut dyn GlobalTableFunctionState,
+    ctx: &StatementContext,
+) {
     use paro_function::table::system::paro_optimizers::{
         populate_optimizer_data, OptimizerData, ParoOptimizersGlobalState,
     };
@@ -929,17 +1060,115 @@ fn populate_paro_optimizers(global_state: &mut dyn GlobalTableFunctionState) {
         .as_any_mut()
         .downcast_mut::<ParoOptimizersGlobalState>()
     {
-        let snapshot = paro_optimizer::profiler::latest_optimizer_profile_snapshot();
-        let entries = snapshot
-            .entries
+        let entries = ctx
+            .diagnostics
+            .optimizer_snapshot()
             .into_iter()
             .map(|entry| OptimizerData {
-                name: entry.optimizer_type.as_str().to_string(),
-                enabled: entry.enabled,
-                last_elapsed_us: entry.last_elapsed.as_micros().min(i64::MAX as u128) as i64,
-                invocation_count: entry.invocation_count.min(i64::MAX as u64) as i64,
+                name: entry.name,
+                kind: entry.kind,
+                last_elapsed_us: entry.last_elapsed_us,
+                metric_value: entry.metric_value,
+                metric_unit: entry.metric_unit.as_str().to_string(),
+                invocation_count: entry.invocation_count,
+                record_type: "metric".into(),
+                record_id: 0,
+                payload_json: None,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let mut entries = entries;
+        let receipt_capacity_exceeded = ctx.diagnostics.execution_receipt_capacity_exceeded();
+        if receipt_capacity_exceeded > 0 {
+            entries.push(OptimizerData {
+                name: "statement_execution_receipt_capacity_exceeded".into(),
+                kind: "capacity".into(),
+                last_elapsed_us: 0,
+                metric_value: i64::try_from(receipt_capacity_exceeded).unwrap_or(i64::MAX),
+                metric_unit: "count".into(),
+                invocation_count: 1,
+                record_type: "metric".into(),
+                record_id: 0,
+                payload_json: None,
+            });
+        }
+        let decision_capacity_exceeded = ctx.diagnostics.statement_decision_capacity_exceeded();
+        if decision_capacity_exceeded > 0 {
+            entries.push(OptimizerData {
+                name: "statement_cache_decision_capacity_exceeded".into(),
+                kind: "capacity".into(),
+                last_elapsed_us: 0,
+                metric_value: i64::try_from(decision_capacity_exceeded).unwrap_or(i64::MAX),
+                metric_unit: "count".into(),
+                invocation_count: 1,
+                record_type: "metric".into(),
+                record_id: 0,
+                payload_json: None,
+            });
+        }
+        for decision in ctx.diagnostics.statement_cache_snapshot() {
+            // One typed row is the machine contract.  The human metric columns
+            // are intentionally not used to reconstruct identity or enums.
+            entries.push(OptimizerData {
+                name: "statement_cache_decision".into(),
+                kind: "receipt".into(),
+                last_elapsed_us: 0,
+                metric_value: i64::from(decision.cache_hit),
+                metric_unit: "count".into(),
+                invocation_count: 1,
+                record_type: "statement_cache".into(),
+                record_id: decision.decision_id,
+                payload_json: Some(
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "decision_id": decision.decision_id,
+                        "query_fingerprint": decision.query_fingerprint,
+                        "occurrence": decision.occurrence,
+                        "cache_hit": decision.cache_hit,
+                        "artifact_identity": decision.artifact_identity,
+                        "compile_work": decision.compile_work,
+                        "compile_receipt": decision.compile_receipt,
+                    })
+                    .to_string(),
+                ),
+            });
+        }
+        for receipt in ctx.diagnostics.execution_receipts_snapshot() {
+            entries.push(OptimizerData {
+                name: "statement_execution_receipt".into(),
+                kind: "receipt".into(),
+                last_elapsed_us: 0,
+                metric_value: 0,
+                metric_unit: "receipt".into(),
+                invocation_count: 1,
+                record_type: "execution_receipt".into(),
+                record_id: receipt.execution_id.0,
+                payload_json: Some(
+                    serde_json::to_string(&receipt).unwrap_or_else(|_| "null".into()),
+                ),
+            });
+        }
+        for record in ctx.diagnostics.execution_work_snapshot() {
+            entries.push(OptimizerData {
+                name: "statement_execution_work".into(),
+                kind: "receipt".into(),
+                last_elapsed_us: 0,
+                metric_value: 0,
+                metric_unit: "receipt".into(),
+                invocation_count: 1,
+                record_type: "execution_work".into(),
+                record_id: record.execution_id,
+                payload_json: Some(
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "execution_id": record.execution_id,
+                        "query_fingerprint": record.query_fingerprint,
+                        "image_id": record.image_id,
+                        "metrics": record.snapshot.rows(),
+                    })
+                    .to_string(),
+                ),
+            });
+        }
         populate_optimizer_data(state, entries);
     }
 }
@@ -1016,7 +1245,7 @@ fn populate_paro_storage_info(
                         .null_count
                         .map(|value| value.min(i64::MAX as u64) as i64),
                     distinct_count: stats
-                        .map(|stats| stats.get_distinct_count().min(i64::MAX as usize) as i64),
+                        .map(|stats| stats.distinct_evidence().point.min(i64::MAX as u64) as i64),
                     min_value: base_stats
                         .and_then(|stats| stats.min_value())
                         .map(|value| value.to_string()),
@@ -2549,46 +2778,60 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use paro_context::test_support::TestStatementContextBuilder;
     use paro_function::table::system::paro_optimizers::ParoOptimizersGlobalState;
-    use paro_optimizer::optimizer_type::OptimizerType;
-    use paro_optimizer::profiler::{
-        publish_optimizer_profile_snapshot, OptimizerProfileSnapshot, OptimizerProfileSnapshotEntry,
+    use paro_optimizer::test_support::{
+        publish_optimizer_profile_snapshot, OptimizerComponent, OptimizerProfileSnapshot,
+        OptimizerProfileSnapshotEntry,
     };
 
     #[test]
-    fn populate_paro_optimizers_reads_latest_snapshot() {
-        publish_optimizer_profile_snapshot(OptimizerProfileSnapshot {
-            entries: vec![
-                OptimizerProfileSnapshotEntry {
-                    optimizer_type: OptimizerType::FilterPushdown,
-                    enabled: true,
-                    last_elapsed: Duration::from_micros(33),
-                    invocation_count: 5,
-                },
-                OptimizerProfileSnapshotEntry {
-                    optimizer_type: OptimizerType::JoinOrder,
-                    enabled: false,
-                    last_elapsed: Duration::from_micros(0),
-                    invocation_count: 0,
-                },
-            ],
-        });
+    fn populate_paro_optimizers_reads_the_current_sessions_snapshot() {
+        let ctx = TestStatementContextBuilder::minimal().build();
+        let other = TestStatementContextBuilder::minimal().build();
+        publish_optimizer_profile_snapshot(
+            ctx.diagnostics.as_ref(),
+            OptimizerProfileSnapshot {
+                entries: vec![
+                    OptimizerProfileSnapshotEntry {
+                        component: OptimizerComponent::SemanticNormalization,
+                        last_elapsed: Duration::from_micros(33),
+                        invocation_count: 5,
+                    },
+                    OptimizerProfileSnapshotEntry {
+                        component: OptimizerComponent::RegionOptimization,
+                        last_elapsed: Duration::from_micros(0),
+                        invocation_count: 0,
+                    },
+                ],
+            },
+        );
+        publish_optimizer_profile_snapshot(
+            other.diagnostics.as_ref(),
+            OptimizerProfileSnapshot {
+                entries: vec![OptimizerProfileSnapshotEntry {
+                    component: OptimizerComponent::PhysicalSelection,
+                    last_elapsed: Duration::from_micros(999),
+                    invocation_count: 77,
+                }],
+            },
+        );
 
         let mut state = ParoOptimizersGlobalState {
             entries: Vec::new(),
             offset: AtomicUsize::new(99),
         };
 
-        populate_paro_optimizers(&mut state);
+        populate_paro_optimizers(&mut state, ctx.as_ref());
 
         assert_eq!(state.offset.load(Ordering::Relaxed), 0);
         assert_eq!(state.entries.len(), 2);
-        assert_eq!(state.entries[0].name, "filter_pushdown");
-        assert!(state.entries[0].enabled);
+        assert_eq!(state.entries[0].name, "semantic_normalization");
+        assert_eq!(state.entries[0].kind, "frontend");
         assert_eq!(state.entries[0].last_elapsed_us, 33);
         assert_eq!(state.entries[0].invocation_count, 5);
-        assert_eq!(state.entries[1].name, "join_order");
-        assert!(!state.entries[1].enabled);
+        assert_eq!(state.entries[1].name, "region_optimization");
+        assert_eq!(state.entries[1].kind, "planning");
     }
 
     #[test]

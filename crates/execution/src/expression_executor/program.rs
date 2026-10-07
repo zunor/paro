@@ -30,8 +30,8 @@ mod identity;
 
 use fingerprint::ExpressionFingerprintCatalog;
 pub use fingerprint::{expression_fingerprint, expression_list_fingerprints};
-use fusion::compile_decimal_factor_chains;
-pub use fusion::PhysicalDecimalFactorChain;
+use fusion::{compile_decimal_factor_chains, compile_varchar_equality_dispatches};
+pub use fusion::{PhysicalDecimalFactorChain, PhysicalVarcharEqualityDispatch};
 use identity::{
     ExpressionIdentity, ExpressionIdentityRef, ExpressionIdentityRefMap, ExpressionIdentityRefSet,
 };
@@ -65,7 +65,7 @@ impl ExpressionProgramVersion {
             backend: ExpressionBackend::VectorTreeV1,
             physical_semantics_version: 1,
             visible_generation: env.visible_generation,
-            settings_fingerprint: env.settings_fingerprint,
+            settings_fingerprint: env.planning_settings_fingerprint,
         }
     }
 }
@@ -363,6 +363,7 @@ pub struct PhysicalExpressionProgram {
     roots: Vec<PhysicalExpression>,
     shared_nodes: Vec<PhysicalExpression>,
     decimal_factor_chains: Vec<PhysicalDecimalFactorChain>,
+    varchar_equality_dispatches: Vec<PhysicalVarcharEqualityDispatch>,
     scratch_layout: ExpressionScratchLayout,
     root_to_unique: Vec<usize>,
     root_first_output: Vec<usize>,
@@ -448,10 +449,13 @@ impl PhysicalExpressionProgram {
             &root_to_unique,
             &root_first_output,
         );
+        let varchar_equality_dispatches =
+            compile_varchar_equality_dispatches(&roots, &root_to_unique, &root_first_output);
         Self {
             roots,
             shared_nodes,
             decimal_factor_chains,
+            varchar_equality_dispatches,
             scratch_layout: ExpressionScratchLayout {
                 slots: compiler.scratch_slots.into_boxed_slice(),
             },
@@ -500,6 +504,11 @@ impl PhysicalExpressionProgram {
     #[inline]
     pub fn decimal_factor_chains(&self) -> &[PhysicalDecimalFactorChain] {
         &self.decimal_factor_chains
+    }
+
+    #[inline]
+    pub fn varchar_equality_dispatches(&self) -> &[PhysicalVarcharEqualityDispatch] {
+        &self.varchar_equality_dispatches
     }
 
     #[inline]
@@ -723,6 +732,9 @@ impl<'a> ProgramCompiler<'a> {
     fn compile_expression_inner(&mut self, expr: &'a Expression) -> CompiledExpr {
         match expr {
             Expression::Function(expr) => {
+                if let Some(fused) = self.try_compile_decimal_linear_fusion(expr) {
+                    return fused;
+                }
                 if let Some(fused) = self.try_compile_decimal_factor_product_fusion(expr) {
                     return fused;
                 }
@@ -865,6 +877,65 @@ impl<'a> ProgramCompiler<'a> {
                 );
             }
         }
+    }
+
+    fn try_compile_decimal_linear_fusion(
+        &mut self,
+        expr: &'a paro_planner::expression::FunctionExpression,
+    ) -> Option<CompiledExpr> {
+        use paro_function::scalar::operators::arithmetic::DecimalLinearBuilder;
+        if !DecimalLinearBuilder::accepts(&expr.function) || expr.children.len() != 2 {
+            return None;
+        }
+        // Iterative postorder: retain CSE boundaries and evaluate leaves in their
+        // original order. No recursive walk or logical plan mutation is needed.
+        let mut builder = DecimalLinearBuilder::default();
+        let mut inputs = Vec::new();
+        let mut results = Vec::new();
+        enum Work<'a> {
+            Visit(&'a Expression),
+            Combine(&'a BoundScalarFunction),
+        }
+        let mut stack = vec![Work::Combine(&expr.function)];
+        stack.extend(expr.children.iter().rev().map(Work::Visit));
+        while let Some(work) = stack.pop() {
+            match work {
+                Work::Combine(function) => {
+                    let right = results.pop()?;
+                    let left = results.pop()?;
+                    results.push(builder.binary(function, left, right)?);
+                }
+                Work::Visit(child) => {
+                    if let Expression::Function(nested) = child {
+                        if nested.children.len() == 2
+                            && DecimalLinearBuilder::accepts(&nested.function)
+                            && !self
+                                .shared_slots_by_identity
+                                .contains(self.fingerprints.identity(child))
+                        {
+                            stack.push(Work::Combine(&nested.function));
+                            stack.extend(nested.children.iter().rev().map(Work::Visit));
+                            continue;
+                        }
+                    }
+                    results.push(builder.input(child.return_type())?);
+                    inputs.push(child);
+                }
+            }
+        }
+        let function = builder.finish(results.pop()?)?;
+        let children = inputs
+            .into_iter()
+            .map(|input| self.compile_expression(input))
+            .collect::<Vec<_>>();
+        Some(CompiledExpr {
+            cse_safe: children.iter().all(|child| child.cse_safe),
+            expr: PhysicalExpression::Function(PhysicalFunctionExpression {
+                function,
+                children: children.into_iter().map(|child| child.expr).collect(),
+                return_type: expr.return_type.clone(),
+            }),
+        })
     }
 
     fn try_compile_decimal_factor_fusion(
@@ -1163,14 +1234,17 @@ mod tests {
     }
 
     fn reference(index: usize, ty: LogicalType) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, ty))
+        Expression::Reference(ReferenceExpression::new(index, ty).into())
     }
 
     fn integer_one() -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Integer(1),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Integer(1),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1210,11 +1284,58 @@ mod tests {
             collision_dispatch,
         ))
         .with_bind_data(CollidingBindData(id));
-        Expression::Function(FunctionExpression::new(
-            function,
-            vec![reference(0, LogicalType::Integer)],
-            LogicalType::Integer,
-        ))
+        Expression::Function(
+            FunctionExpression::new(
+                function,
+                vec![reference(0, LogicalType::Integer)],
+                LogicalType::Integer,
+            )
+            .into(),
+        )
+    }
+
+    #[test]
+    fn decimal_linear_tree_compiles_once_and_keeps_shared_boundary() {
+        fn binary(name: &str, left: Expression, right: Expression) -> Expression {
+            let function = bind_decimal(name, &[left.return_type(), right.return_type()]);
+            Expression::Function(
+                FunctionExpression::new(
+                    function.clone(),
+                    vec![left, right],
+                    function.return_type.clone(),
+                )
+                .into(),
+            )
+        }
+        let ty = LogicalType::Decimal {
+            precision: 7,
+            scale: 2,
+        };
+        let inner = binary("-", reference(0, ty.clone()), reference(1, ty.clone()));
+        let tree = binary(
+            "+",
+            binary("-", inner.clone(), reference(2, ty.clone())),
+            reference(3, ty),
+        );
+        let program = PhysicalExpressionProgram::compile(
+            std::slice::from_ref(&tree),
+            ExpressionProgramVersion::anonymous(),
+        );
+        let PhysicalExpression::Function(root) = program.root(0) else {
+            panic!("linear root");
+        };
+        assert_eq!(root.function.name, "decimal_linear_fusion");
+        assert_eq!(root.children.len(), 4);
+        let program = PhysicalExpressionProgram::compile(
+            &[inner, tree],
+            ExpressionProgramVersion::anonymous(),
+        );
+        let PhysicalExpression::Function(root) = program.root(1) else {
+            panic!("linear root");
+        };
+        assert_eq!(root.function.name, "decimal_linear_fusion");
+        assert_eq!(root.children.len(), 3);
+        assert!(matches!(root.children[0], PhysicalExpression::Shared(_)));
     }
 
     #[test]
@@ -1263,44 +1384,59 @@ mod tests {
             scale: 2,
         };
         let discount = bind_decimal("-", &[LogicalType::Integer, factor_type.clone()]);
-        let discount_expr = Expression::Function(FunctionExpression::new(
-            discount.clone(),
-            vec![integer_one(), reference(1, factor_type.clone())],
-            discount.return_type.clone(),
-        ));
+        let discount_expr = Expression::Function(
+            FunctionExpression::new(
+                discount.clone(),
+                vec![integer_one(), reference(1, factor_type.clone())],
+                discount.return_type.clone(),
+            )
+            .into(),
+        );
         let discounted_price =
             bind_decimal("*", &[price_type.clone(), discount.return_type.clone()]);
-        let discounted_price_expr = Expression::Function(FunctionExpression::new(
-            discounted_price.clone(),
-            vec![reference(0, price_type.clone()), discount_expr],
-            discounted_price.return_type.clone(),
-        ));
+        let discounted_price_expr = Expression::Function(
+            FunctionExpression::new(
+                discounted_price.clone(),
+                vec![reference(0, price_type.clone()), discount_expr],
+                discounted_price.return_type.clone(),
+            )
+            .into(),
+        );
 
         // Bind an equivalent producer independently. Semantic bind-data
         // fingerprints, rather than Arc identity, must still expose the common
         // subexpression used by the output root and the charge expression.
         let discount_for_charge = bind_decimal("-", &[LogicalType::Integer, factor_type.clone()]);
-        let discount_for_charge_expr = Expression::Function(FunctionExpression::new(
-            discount_for_charge.clone(),
-            vec![integer_one(), reference(1, factor_type.clone())],
-            discount_for_charge.return_type.clone(),
-        ));
+        let discount_for_charge_expr = Expression::Function(
+            FunctionExpression::new(
+                discount_for_charge.clone(),
+                vec![integer_one(), reference(1, factor_type.clone())],
+                discount_for_charge.return_type.clone(),
+            )
+            .into(),
+        );
         let discounted_price_for_charge = bind_decimal(
             "*",
             &[price_type.clone(), discount_for_charge.return_type.clone()],
         );
-        let discounted_price_for_charge_expr = Expression::Function(FunctionExpression::new(
-            discounted_price_for_charge.clone(),
-            vec![reference(0, price_type), discount_for_charge_expr],
-            discounted_price_for_charge.return_type.clone(),
-        ));
+        let discounted_price_for_charge_expr = Expression::Function(
+            FunctionExpression::new(
+                discounted_price_for_charge.clone(),
+                vec![reference(0, price_type), discount_for_charge_expr],
+                discounted_price_for_charge.return_type.clone(),
+            )
+            .into(),
+        );
 
         let tax = bind_decimal("+", &[factor_type.clone(), LogicalType::Integer]);
-        let tax_expr = Expression::Function(FunctionExpression::new(
-            tax.clone(),
-            vec![reference(2, factor_type), integer_one()],
-            tax.return_type.clone(),
-        ));
+        let tax_expr = Expression::Function(
+            FunctionExpression::new(
+                tax.clone(),
+                vec![reference(2, factor_type), integer_one()],
+                tax.return_type.clone(),
+            )
+            .into(),
+        );
         let charge = bind_decimal(
             "*",
             &[
@@ -1308,11 +1444,14 @@ mod tests {
                 tax.return_type.clone(),
             ],
         );
-        let charge_expr = Expression::Function(FunctionExpression::new(
-            charge.clone(),
-            vec![discounted_price_for_charge_expr, tax_expr],
-            charge.return_type.clone(),
-        ));
+        let charge_expr = Expression::Function(
+            FunctionExpression::new(
+                charge.clone(),
+                vec![discounted_price_for_charge_expr, tax_expr],
+                charge.return_type.clone(),
+            )
+            .into(),
+        );
 
         let program = PhysicalExpressionProgram::compile(
             &[discounted_price_expr, charge_expr],
@@ -1349,32 +1488,44 @@ mod tests {
             scale: 2,
         };
         let discount = bind_decimal("-", &[LogicalType::Integer, rate.clone()]);
-        let discount_expr = Expression::Function(FunctionExpression::new(
-            discount.clone(),
-            vec![integer_one(), reference(1, rate)],
-            discount.return_type.clone(),
-        ));
+        let discount_expr = Expression::Function(
+            FunctionExpression::new(
+                discount.clone(),
+                vec![integer_one(), reference(1, rate)],
+                discount.return_type.clone(),
+            )
+            .into(),
+        );
         let revenue = bind_decimal("*", &[money.clone(), discount.return_type.clone()]);
-        let revenue_expr = Expression::Function(FunctionExpression::new(
-            revenue.clone(),
-            vec![reference(0, money.clone()), discount_expr],
-            revenue.return_type.clone(),
-        ));
+        let revenue_expr = Expression::Function(
+            FunctionExpression::new(
+                revenue.clone(),
+                vec![reference(0, money.clone()), discount_expr],
+                revenue.return_type.clone(),
+            )
+            .into(),
+        );
         let cost = bind_decimal("*", &[money.clone(), money.clone()]);
-        let cost_expr = Expression::Function(FunctionExpression::new(
-            cost.clone(),
-            vec![reference(2, money.clone()), reference(3, money)],
-            cost.return_type.clone(),
-        ));
+        let cost_expr = Expression::Function(
+            FunctionExpression::new(
+                cost.clone(),
+                vec![reference(2, money.clone()), reference(3, money)],
+                cost.return_type.clone(),
+            )
+            .into(),
+        );
         let profit = bind_decimal(
             "-",
             &[revenue.return_type.clone(), cost.return_type.clone()],
         );
-        let profit_expr = Expression::Function(FunctionExpression::new(
-            profit.clone(),
-            vec![revenue_expr, cost_expr],
-            profit.return_type.clone(),
-        ));
+        let profit_expr = Expression::Function(
+            FunctionExpression::new(
+                profit.clone(),
+                vec![revenue_expr, cost_expr],
+                profit.return_type.clone(),
+            )
+            .into(),
+        );
 
         let program = PhysicalExpressionProgram::compile(
             &[profit_expr],

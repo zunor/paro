@@ -3,9 +3,9 @@
 
 //! Window breaker kernel for the role-specific runtime.
 //!
-//! Build sinks only retain input chunks on the per-chunk path. The blocking
-//! work happens during sink finish, which materializes immutable output chunks
-//! for the emit source to scan without touching the shared handle again.
+//! Build sinks hash partition columns into task-local radix row selections.
+//! Finish tasks sort and evaluate complete partition domains; publication
+//! restores global partition order for the emit source.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -13,8 +13,10 @@ use std::sync::Arc;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{AccountedVec, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
 use paro_common::vector::{Vector, VECTOR_SIZE};
+use paro_context::StatementCancellation;
 use paro_function::window::WindowFunctionType;
 use paro_planner::expression::{
     Expression, OrderByExpression, WindowExpression, WindowFrameBound, WindowInvocation,
@@ -23,11 +25,12 @@ use paro_planner::expression::{
 use crate::physical::specs::WindowSpec;
 
 mod frame;
+mod sort;
 #[cfg(test)]
 mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WindowRowKey {
+pub(crate) struct WindowRowKey {
     chunk_idx: usize,
     row_idx: usize,
 }
@@ -38,6 +41,7 @@ struct WindowPartition {
     end: usize,
 }
 
+#[cfg(test)]
 pub fn build_window_output_chunks(
     spec: &WindowSpec,
     input_chunks: &[Chunk],
@@ -66,7 +70,13 @@ pub fn build_window_output_chunks(
                 end: keys.len(),
             }]
         });
-    let mut output = WindowOutputBuilder::new(spec, input_chunks, &keys, allocator)?;
+    let mut output = WindowOutputBuilder::new(
+        spec,
+        input_chunks,
+        &keys,
+        allocator,
+        &StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
+    )?;
     for (expr_idx, expr) in spec.expressions.iter().enumerate() {
         write_expression_results(
             input_chunks,
@@ -80,7 +90,275 @@ pub fn build_window_output_chunks(
     output.finish()
 }
 
+fn window_metadata<T>(memory: &MemoryAccountingContext) -> Result<AccountedVec<T>> {
+    Ok(AccountedVec::new_with_accounting(
+        memory.grant()?,
+        memory.tag(),
+        memory.accounting_class(),
+    ))
+}
+
+fn partition_equality_matches_order(expr: &WindowExpression) -> bool {
+    expr.partitions
+        .iter()
+        .all(|p| partition_type_matches_order(p.return_type()))
+}
+
+fn partition_type_matches_order(ty: paro_common::types::LogicalType) -> bool {
+    matches!(
+        ty,
+        paro_common::types::LogicalType::Boolean
+            | paro_common::types::LogicalType::TinyInt
+            | paro_common::types::LogicalType::SmallInt
+            | paro_common::types::LogicalType::Integer
+            | paro_common::types::LogicalType::BigInt
+            | paro_common::types::LogicalType::HugeInt
+            | paro_common::types::LogicalType::UTinyInt
+            | paro_common::types::LogicalType::USmallInt
+            | paro_common::types::LogicalType::UInteger
+            | paro_common::types::LogicalType::UBigInt
+            | paro_common::types::LogicalType::UHugeInt
+            | paro_common::types::LogicalType::Varchar
+            | paro_common::types::LogicalType::Date
+            | paro_common::types::LogicalType::Timestamp
+            | paro_common::types::LogicalType::TimestampTz
+            | paro_common::types::LogicalType::Time
+    )
+}
+
+/// Hash only direct, order-compatible partition columns. Constants do not
+/// distinguish rows. Float/nested domains retain one complete stable sort.
+pub(crate) fn window_radix_columns(spec: &WindowSpec) -> Result<Vec<usize>> {
+    validate_window_spec(spec)?;
+    let Some(expr) = spec.expressions.get(sort_expression_index(spec)) else {
+        return Ok(vec![]);
+    };
+    if !partition_equality_matches_order(expr) {
+        return Ok(vec![]);
+    }
+    Ok(expr
+        .partitions
+        .iter()
+        .filter_map(expression_column)
+        .collect())
+}
+
+fn expression_column(expr: &Expression) -> Option<usize> {
+    match expr {
+        Expression::Reference(r) => Some(r.index),
+        Expression::ColumnRef(c) => Some(c.binding.column_index),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WindowWorkResult {
+    keys: AccountedVec<WindowRowKey>,
+    partitions: Vec<WindowPartition>,
+    chunks: Vec<Chunk>,
+}
+
+pub(crate) fn window_radix_keys(
+    chunks: &[Chunk],
+    routing: &[crate::runtime::breaker::radix::RadixRows],
+    partitions: std::ops::Range<usize>,
+    memory: &MemoryAccountingContext,
+    cancel: &StatementCancellation,
+) -> Result<AccountedVec<WindowRowKey>> {
+    let mut keys = window_metadata(memory)?;
+    let count = chunks
+        .iter()
+        .zip(routing)
+        .map(|(c, r)| {
+            partitions
+                .clone()
+                .map(|p| r.count(p, c.size()))
+                .sum::<usize>()
+        })
+        .sum();
+    keys.try_reserve(count)?;
+    for (chunk_idx, (chunk, route)) in chunks.iter().zip(routing).enumerate() {
+        cancel.check()?;
+        for row_idx in partitions.clone().flat_map(|p| route.rows(p, chunk.size())) {
+            keys.try_push(WindowRowKey { chunk_idx, row_idx })?;
+        }
+    }
+    Ok(keys)
+}
+
+/// Restore global partition order with bounded column-range copies. Only one
+/// descriptor per complete SQL partition is sorted on the coordinator.
+pub(crate) fn publish_window_work(
+    spec: &WindowSpec,
+    inputs: &[Chunk],
+    results: Vec<WindowWorkResult>,
+    allocator: Arc<dyn Allocator>,
+    memory: &MemoryAccountingContext,
+    cancel: &StatementCancellation,
+) -> Result<Vec<Chunk>> {
+    if results.len() == 1 {
+        return Ok(results.into_iter().next().unwrap().chunks);
+    }
+    let mut order = window_metadata(memory)?;
+    order.try_reserve(results.iter().map(|r| r.partitions.len()).sum())?;
+    for (task, result) in results.iter().enumerate() {
+        for &partition in &result.partitions {
+            order.try_push((task, partition))?;
+        }
+    }
+    if let Some(expr) = spec.expressions.get(sort_expression_index(spec)) {
+        order.sort_unstable_by(|(a, pa), (b, pb)| {
+            for p in &expr.partitions {
+                let cmp = compare_expression(
+                    inputs,
+                    &results[*a].keys[pa.start],
+                    &results[*b].keys[pb.start],
+                    p,
+                    true,
+                    false,
+                );
+                if cmp != Ordering::Equal {
+                    return cmp;
+                }
+            }
+            Ordering::Equal
+        });
+    }
+    let mut output = Vec::new();
+    let mut batch: Option<Chunk> = None;
+    let mut used = 0;
+    for &(task, partition) in order.iter() {
+        let mut row = partition.start;
+        while row < partition.end {
+            cancel.check()?;
+            if batch.is_none() {
+                batch = Some(Chunk::try_initialize(
+                    &spec.output_types,
+                    VECTOR_SIZE,
+                    allocator.clone(),
+                )?);
+            }
+            let source = &results[task].chunks[row / VECTOR_SIZE];
+            let offset = row % VECTOR_SIZE;
+            let count = (partition.end - row)
+                .min(source.size() - offset)
+                .min(VECTOR_SIZE - used);
+            let target = batch.as_mut().unwrap();
+            for col in 0..spec.output_types.len() {
+                target.column_mut(col).unwrap().try_copy_range(
+                    used,
+                    &source.data[col],
+                    offset,
+                    count,
+                )?;
+            }
+            row += count;
+            used += count;
+            if used == VECTOR_SIZE {
+                let mut full = batch.take().unwrap();
+                full.try_set_cardinality(used)?;
+                output.push(full);
+                used = 0;
+            }
+        }
+    }
+    if let Some(mut batch) = batch {
+        batch.try_set_cardinality(used)?;
+        output.push(batch);
+    }
+    Ok(output)
+}
+
+pub(crate) fn evaluate_window_work(
+    spec: &WindowSpec,
+    input_chunks: &[Chunk],
+    mut keys: AccountedVec<WindowRowKey>,
+    allocator: Arc<dyn Allocator>,
+    cancel: &StatementCancellation,
+) -> Result<WindowWorkResult> {
+    cancel.check()?;
+    if keys.is_empty() {
+        return Ok(WindowWorkResult {
+            keys,
+            partitions: vec![],
+            chunks: vec![],
+        });
+    }
+    if let Some(expr) = spec.expressions.get(sort_expression_index(spec)) {
+        if !sort::try_sort_encoded(input_chunks, &mut keys, expr, cancel)? {
+            let partition_ordered = partition_equality_matches_order(expr)
+                && keys.windows(2).all(|pair| {
+                    for partition in &expr.partitions {
+                        let cmp = compare_expression(
+                            input_chunks,
+                            &pair[0],
+                            &pair[1],
+                            partition,
+                            true,
+                            false,
+                        );
+                        if cmp != Ordering::Equal {
+                            return cmp == Ordering::Less;
+                        }
+                    }
+                    true
+                });
+            if partition_ordered {
+                // Hash grouping already establishes partition order. Comparing those
+                // equal keys again during every sort comparison is especially costly
+                // for strings; sort only ORDER BY inside each complete partition.
+                for partition in find_partitions(input_chunks, &keys, expr) {
+                    cancel.check()?;
+                    keys[partition.start..partition.end].sort_by(|left, right| {
+                        for order in &expr.orders {
+                            let cmp = compare_order_expression(input_chunks, left, right, order);
+                            if cmp != Ordering::Equal {
+                                return cmp;
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                }
+            } else {
+                keys.sort_by(|left, right| compare_window_order(input_chunks, left, right, expr));
+            }
+        }
+    }
+    cancel.check()?;
+    let partitions = spec
+        .expressions
+        .get(sort_expression_index(spec))
+        .map(|expr| find_partitions(input_chunks, &keys, expr))
+        .unwrap_or_else(|| {
+            vec![WindowPartition {
+                start: 0,
+                end: keys.len(),
+            }]
+        });
+    let mut output = WindowOutputBuilder::new(spec, input_chunks, &keys, allocator, cancel)?;
+    for (expr_idx, expr) in spec.expressions.iter().enumerate() {
+        for &partition in &partitions {
+            cancel.check()?;
+            write_partition_expression_results(
+                input_chunks,
+                &keys,
+                partition,
+                expr_idx,
+                expr,
+                &mut output,
+            )?;
+        }
+    }
+    cancel.check()?;
+    Ok(WindowWorkResult {
+        keys,
+        partitions,
+        chunks: output.finish()?,
+    })
+}
+
 struct WindowOutputBuilder {
+    cancel: StatementCancellation,
     input_width: usize,
     counts: Vec<usize>,
     vectors: Vec<Vec<Vector>>,
@@ -93,12 +371,14 @@ impl WindowOutputBuilder {
         chunks: &[Chunk],
         sorted_keys: &[WindowRowKey],
         allocator: Arc<dyn Allocator>,
+        cancel: &StatementCancellation,
     ) -> Result<Self> {
         let chunk_count = sorted_keys.len().div_ceil(VECTOR_SIZE);
         let mut counts = Vec::with_capacity(chunk_count);
         let mut vectors = Vec::with_capacity(chunk_count);
 
         for chunk_idx in 0..chunk_count {
+            cancel.check()?;
             let start = chunk_idx * VECTOR_SIZE;
             let count = (sorted_keys.len() - start).min(VECTOR_SIZE);
             counts.push(count);
@@ -119,6 +399,7 @@ impl WindowOutputBuilder {
         }
 
         Ok(Self {
+            cancel: cancel.clone(),
             input_width: spec.input_width,
             counts,
             vectors,
@@ -224,6 +505,7 @@ fn validate_direct_value_expression(expr: &Expression, context: &str) -> Result<
     }
 }
 
+#[cfg(test)]
 fn build_row_keys(chunks: &[Chunk]) -> Vec<WindowRowKey> {
     let row_count = chunks.iter().map(Chunk::size).sum();
     let mut keys = Vec::with_capacity(row_count);
@@ -289,32 +571,77 @@ fn compare_expression(
     ascending: bool,
     nulls_first: bool,
 ) -> Ordering {
-    let left = value_from_expr(chunks, left, expr);
-    let right = value_from_expr(chunks, right, expr);
-    match (left.is_null(), right.is_null()) {
-        (true, true) => Ordering::Equal,
+    if let Some(column) = expression_column(expr) {
+        let l = &chunks[left.chunk_idx].data[column];
+        let r = &chunks[right.chunk_idx].data[column];
+        return compare_vector_cells(l, left.row_idx, r, right.row_idx, ascending, nulls_first);
+    }
+    // A constant expression is equal at every input position.
+    Ordering::Equal
+}
+
+fn compare_vector_cells(
+    l: &Vector,
+    li: usize,
+    r: &Vector,
+    ri: usize,
+    ascending: bool,
+    nulls_first: bool,
+) -> Ordering {
+    match (l.is_null(li), r.is_null(ri)) {
+        (true, true) => return Ordering::Equal,
         (true, false) => {
-            if nulls_first {
+            return if nulls_first {
                 Ordering::Less
             } else {
                 Ordering::Greater
             }
         }
         (false, true) => {
-            if nulls_first {
+            return if nulls_first {
                 Ordering::Greater
             } else {
                 Ordering::Less
             }
         }
-        (false, false) => {
-            let cmp = left.partial_cmp(&right).unwrap_or(Ordering::Equal);
-            if ascending {
-                cmp
-            } else {
-                cmp.reverse()
-            }
-        }
+        _ => {}
+    }
+    use paro_common::types::LogicalType;
+    macro_rules! compare {
+        ($get:ident) => {
+            l.$get(li)
+                .partial_cmp(&r.$get(ri))
+                .unwrap_or(Ordering::Equal)
+        };
+    }
+    let cmp = match l.logical_type() {
+        LogicalType::Boolean => compare!(get_bool),
+        LogicalType::TinyInt => compare!(get_i8),
+        LogicalType::SmallInt => compare!(get_i16),
+        LogicalType::Integer | LogicalType::Date => compare!(get_i32),
+        LogicalType::BigInt
+        | LogicalType::Timestamp
+        | LogicalType::TimestampTz
+        | LogicalType::Time => compare!(get_i64),
+        LogicalType::Decimal { precision, .. } if *precision <= 18 => compare!(get_i64),
+        LogicalType::HugeInt | LogicalType::Decimal { .. } => compare!(get_i128),
+        LogicalType::UTinyInt => compare!(get_u8),
+        LogicalType::USmallInt => compare!(get_u16),
+        LogicalType::UInteger => compare!(get_u32),
+        LogicalType::UBigInt => compare!(get_u64),
+        LogicalType::UHugeInt | LogicalType::Uuid => compare!(get_u128),
+        LogicalType::Float => compare!(get_f32),
+        LogicalType::Double => compare!(get_f64),
+        LogicalType::Varchar => compare!(get_string),
+        _ => l
+            .get_value(li)
+            .partial_cmp(&r.get_value(ri))
+            .unwrap_or(Ordering::Equal),
+    };
+    if ascending {
+        cmp
+    } else {
+        cmp.reverse()
     }
 }
 
@@ -360,6 +687,9 @@ fn same_partition(
     partitions: &[Expression],
 ) -> bool {
     partitions.iter().all(|expr| {
+        if partition_type_matches_order(expr.return_type()) {
+            return compare_expression(chunks, left, right, expr, true, false) == Ordering::Equal;
+        }
         let left = value_from_expr(chunks, left, expr);
         let right = value_from_expr(chunks, right, expr);
         if left.is_null() || right.is_null() {
@@ -381,6 +711,7 @@ fn are_peers(
         .all(|order| compare_order_expression(chunks, left, right, order) == Ordering::Equal)
 }
 
+#[cfg(test)]
 fn write_expression_results(
     chunks: &[Chunk],
     sorted_keys: &[WindowRowKey],
@@ -410,6 +741,9 @@ fn write_partition_expression_results(
     match function.function_type {
         WindowFunctionType::RowNumber => {
             for absolute_idx in partition.start..partition.end {
+                if absolute_idx % VECTOR_SIZE == 0 {
+                    output.cancel.check()?;
+                }
                 let idx = absolute_idx - partition.start;
                 output.set_window_i64(expr_idx, absolute_idx, (idx + 1) as i64);
             }
@@ -417,6 +751,9 @@ fn write_partition_expression_results(
         WindowFunctionType::Rank => {
             let mut rank = 1i64;
             for idx in 0..partition_size {
+                if idx % VECTOR_SIZE == 0 {
+                    output.cancel.check()?;
+                }
                 if idx > 0 {
                     let prev = &sorted_keys[partition.start + idx - 1];
                     let current = &sorted_keys[partition.start + idx];
@@ -430,6 +767,9 @@ fn write_partition_expression_results(
         WindowFunctionType::DenseRank => {
             let mut rank = 1i64;
             for idx in 0..partition_size {
+                if idx % VECTOR_SIZE == 0 {
+                    output.cancel.check()?;
+                }
                 if idx > 0 {
                     let prev = &sorted_keys[partition.start + idx - 1];
                     let current = &sorted_keys[partition.start + idx];
@@ -443,12 +783,18 @@ fn write_partition_expression_results(
         WindowFunctionType::PercentRank => {
             if partition_size <= 1 {
                 for absolute_idx in partition.start..partition.end {
+                    if absolute_idx % VECTOR_SIZE == 0 {
+                        output.cancel.check()?;
+                    }
                     output.set_window_f64(expr_idx, absolute_idx, 0.0);
                 }
                 return Ok(());
             }
             let mut rank = 1i64;
             for idx in 0..partition_size {
+                if idx % VECTOR_SIZE == 0 {
+                    output.cancel.check()?;
+                }
                 if idx > 0 {
                     let prev = &sorted_keys[partition.start + idx - 1];
                     let current = &sorted_keys[partition.start + idx];
@@ -466,6 +812,9 @@ fn write_partition_expression_results(
         WindowFunctionType::CumeDist => {
             let mut peer_end = 0usize;
             for idx in 0..partition_size {
+                if idx % VECTOR_SIZE == 0 {
+                    output.cancel.check()?;
+                }
                 if idx >= peer_end {
                     peer_end = idx + 1;
                     while peer_end < partition_size {
@@ -489,11 +838,17 @@ fn write_partition_expression_results(
             else {
                 let null = Value::Null(expr.return_type());
                 for absolute_idx in partition.start..partition.end {
+                    if absolute_idx % VECTOR_SIZE == 0 {
+                        output.cancel.check()?;
+                    }
                     output.set_window_value(expr_idx, absolute_idx, &null);
                 }
                 return Ok(());
             };
             for absolute_idx in partition.start..partition.end {
+                if absolute_idx % VECTOR_SIZE == 0 {
+                    output.cancel.check()?;
+                }
                 let row = absolute_idx - partition.start;
                 output.set_window_i64(
                     expr_idx,
@@ -528,6 +883,9 @@ fn write_lead_lag(
     let values = frame::WindowValueIndex::build(chunks, sorted_keys, partition, expr)?;
 
     for absolute_idx in partition.start..partition.end {
+        if absolute_idx % VECTOR_SIZE == 0 {
+            output.cancel.check()?;
+        }
         let offset = if let Some(offset) = expr.arguments().get(1) {
             let value = value_from_expr(chunks, &sorted_keys[absolute_idx], offset);
             if value.is_null() {
@@ -578,17 +936,38 @@ fn write_aggregate_results(
             output.allocator.clone(),
         )?;
         for absolute_idx in partition.start..partition.end {
+            if absolute_idx % VECTOR_SIZE == 0 {
+                output.cancel.check()?;
+            }
             output.set_window_value(expr_idx, absolute_idx, &value);
         }
         return Ok(());
     }
 
-    // The generic sorted-window fallback deliberately favors one bound
-    // aggregate ABI over function-name-specific kernels. It recomputes each
-    // frame today; incremental state is a separate aggregate capability, not
-    // something the planner may infer from a display name.
     let frames = frame::WindowFrameIndex::build(chunks, sorted_keys, partition, expr)?;
+    if frames.is_append_only() {
+        return frame::visit_append_only_aggregate_frames(
+            chunks,
+            &sorted_keys[partition.start..partition.end],
+            (partition.start..partition.end).map(|row| frames.relative_range(row)),
+            expr,
+            output.allocator.clone(),
+            |row, value| {
+                if row % VECTOR_SIZE == 0 {
+                    output.cancel.check()?;
+                }
+                output.set_window_value(expr_idx, partition.start + row, &value);
+                Ok(())
+            },
+        );
+    }
+    // Moving/shrinking frames require removal or a range-query aggregate
+    // capability. Recompute them with the same bound kernel, not guessed
+    // inverses or function-name-specific arithmetic.
     for absolute_idx in partition.start..partition.end {
+        if absolute_idx % VECTOR_SIZE == 0 {
+            output.cancel.check()?;
+        }
         let relative = frames.relative_range(absolute_idx);
         let value = frame::aggregate_window_value(
             chunks,
@@ -613,6 +992,9 @@ fn write_frame_value_results(
     let frames = frame::WindowFrameIndex::build(chunks, sorted_keys, partition, expr)?;
     let values = frame::WindowValueIndex::build(chunks, sorted_keys, partition, expr)?;
     for absolute_idx in partition.start..partition.end {
+        if absolute_idx % VECTOR_SIZE == 0 {
+            output.cancel.check()?;
+        }
         let value = values.evaluate(
             chunks,
             sorted_keys,

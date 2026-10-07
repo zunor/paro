@@ -759,6 +759,21 @@ impl TableCatalogEntry {
         self.columns.iter().position(|c| c.name == name)
     }
 
+    /// A catalog guarantee, independent of observed data and ANALYZE state.
+    /// Primary-key columns are non-NULL even when their column definition
+    /// does not duplicate the table-level constraint.
+    pub fn column_is_declared_not_null(&self, column: usize) -> bool {
+        self.columns.get(column).is_some_and(|definition| {
+            definition.not_null
+                || self.constraints.iter().any(|constraint| {
+                    matches!(
+                        constraint.constraint_type,
+                        ConstraintType::NotNull | ConstraintType::PrimaryKey
+                    ) && constraint.columns.contains(&column)
+                })
+        })
+    }
+
     /// Add a column to the table
     ///
     pub fn add_column(&self, column: ColumnDefinition, timestamp: u64) -> Result<Self> {

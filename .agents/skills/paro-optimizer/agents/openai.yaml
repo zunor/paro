@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paro Optimizer"
+  short_description: "Design and diagnose the staged Paro optimizer"
+  default_prompt: "Use $paro-optimizer to locate the planning issue, change its owning stage, and validate semantics and plan quality."

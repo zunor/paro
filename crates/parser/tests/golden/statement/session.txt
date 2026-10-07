@@ -58,11 +58,11 @@ SetRole {
 ---------- Input ----------
 SET ROLE ROLE1;
 ---------- Output ---------
-SET ROLE 'ROLE1'
+SET ROLE 'role1'
 ---------- AST ------------
 SetRole {
     is_default: false,
-    role_name: "ROLE1",
+    role_name: "role1",
 }
 
 

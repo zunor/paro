@@ -20,16 +20,18 @@
 use crate::binder::ir::DistinctModifier;
 use crate::binder::ir::{BoundSelect, BoundValues, DistinctType};
 use crate::binder::Binder;
-use crate::expression::{Expression, ExpressionIterator, WindowExpression};
-use crate::operator::{
+use crate::expression::{
+    Expression, ExpressionIterator, SharedExpressionPayload, WindowExpression,
+};
+use crate::logical::operator::{
     Aggregate, ColumnBinding, Distinct, ExpressionGet, Filter, LogicalOperator, Projection,
 };
 use paro_common::error::{self as paro_error, Result};
 
 fn group_window_expressions(
-    expressions: Vec<(usize, WindowExpression)>,
-) -> Vec<Vec<(usize, WindowExpression)>> {
-    let mut groups: Vec<Vec<(usize, WindowExpression)>> = Vec::new();
+    expressions: Vec<(usize, SharedExpressionPayload<WindowExpression>)>,
+) -> Vec<Vec<(usize, SharedExpressionPayload<WindowExpression>)>> {
+    let mut groups: Vec<Vec<(usize, SharedExpressionPayload<WindowExpression>)>> = Vec::new();
     for (original_index, expression) in expressions {
         if let Some(group) = groups
             .iter_mut()
@@ -158,7 +160,7 @@ impl Binder {
                 node.aggregates.clone(),
                 node.grouping_functions.clone(),
             );
-            root = LogicalOperator::Aggregate(aggregate);
+            root = LogicalOperator::Aggregate(Box::new(aggregate));
         } else if !node.groups.grouping_sets.is_empty() {
             // =================================================================
             // Edge case: grouping sets but no groups or aggregates
@@ -216,7 +218,7 @@ impl Binder {
                 for (local_index, (original_index, expression)) in group.into_iter().enumerate() {
                     output_bindings[original_index] =
                         Some(ColumnBinding::new(window_index, local_index));
-                    expressions.push(expression);
+                    expressions.push(expression.into_inner());
                 }
                 planned_groups.push((window_index, expressions));
             }
@@ -243,8 +245,11 @@ impl Binder {
             // Each physical window runtime owns one partition/order layout. Stack groups so prior
             // outputs remain attached to their rows while the next group applies its own ordering.
             for (window_index, expressions) in planned_groups {
-                let window =
-                    crate::operator::Window::new(window_index, expressions, self.wrap_plan(root));
+                let window = crate::logical::operator::Window::new(
+                    window_index,
+                    expressions,
+                    self.wrap_plan(root),
+                );
                 root = LogicalOperator::Window(window);
             }
         }
@@ -325,7 +330,7 @@ impl Binder {
 mod tests {
     use super::group_window_expressions;
     use crate::expression::{ColumnRefExpression, Expression, WindowExpression, WindowFrame};
-    use crate::operator::ColumnBinding;
+    use crate::logical::operator::ColumnBinding;
     use paro_common::types::LogicalType;
     use paro_function::window::WindowFunction;
 
@@ -333,10 +338,13 @@ mod tests {
         WindowExpression::native(
             WindowFunction::row_number(),
             Vec::new(),
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(10, partition_column),
-                LogicalType::Integer,
-            ))],
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(10, partition_column),
+                    LogicalType::Integer,
+                )
+                .into(),
+            )],
             Vec::new(),
             WindowFrame::default(),
             false,
@@ -346,9 +354,9 @@ mod tests {
     #[test]
     fn window_groups_are_stable_and_combine_equal_layouts() {
         let groups = group_window_expressions(vec![
-            (0, row_number(0)),
-            (1, row_number(1)),
-            (2, row_number(0)),
+            (0, row_number(0).into()),
+            (1, row_number(1).into()),
+            (2, row_number(0).into()),
         ]);
 
         assert_eq!(groups.len(), 2);

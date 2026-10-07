@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use paro_common::chunk::Chunk;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
+use paro_storage::row::RowScanState;
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::join_hashtable::scan_structure::ScanStructure;
@@ -58,6 +59,10 @@ pub struct CrossProductProbeTransformLocal {
     pub probe_row: usize,
     pub build_chunk: usize,
     pub build_row: usize,
+    pub external_store: usize,
+    pub external_scan: RowScanState,
+    pub external_chunk: Option<Chunk>,
+    pub external_chunk_ready: bool,
     pub probe_in_progress: bool,
 }
 

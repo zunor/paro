@@ -4,6 +4,7 @@
 //! State for the query currently executing in a session.
 
 use crate::execution_control::ActiveStatementControl;
+use paro_context::StatementTrace;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -114,6 +115,9 @@ pub struct ActiveQueryContext {
     /// Atomic-only maintenance admission lease held for the complete async
     /// statement lifetime.
     _foreground_maintenance: Option<paro_instance::ForegroundMaintenanceGuard>,
+
+    /// Optional phase recorder shared with the immutable statement context.
+    statement_trace: Option<Arc<StatementTrace>>,
 }
 
 // Manual Debug implementation because Executor doesn't implement Debug
@@ -127,6 +131,7 @@ impl std::fmt::Debug for ActiveQueryContext {
             .field("open_result_id", &self.open_result_id)
             .field("has_executor", &self.executor.is_some())
             .field("progress", &self.progress)
+            .field("has_statement_trace", &self.statement_trace.is_some())
             .finish()
     }
 }
@@ -147,6 +152,7 @@ impl ActiveQueryContext {
             executor: None,
             progress: QueryProgress::default(),
             _foreground_maintenance: foreground_maintenance,
+            statement_trace: None,
         }
     }
 
@@ -165,6 +171,7 @@ impl ActiveQueryContext {
             executor: Some(executor),
             progress: QueryProgress::default(),
             _foreground_maintenance: None,
+            statement_trace: None,
         }
     }
 
@@ -183,6 +190,7 @@ impl ActiveQueryContext {
             executor: None,
             progress: QueryProgress::default(),
             _foreground_maintenance: None,
+            statement_trace: None,
         }
     }
 
@@ -208,6 +216,18 @@ impl ActiveQueryContext {
     #[inline]
     pub fn elapsed(&self) -> std::time::Duration {
         self.start_time.elapsed()
+    }
+
+    /// Attach the optional recorder after the lifecycle control has been
+    /// created.  Keeping this separate preserves the constructors used by
+    /// prepared/portal code and makes tracing opt-in at the front-end boundary.
+    pub fn set_statement_trace(&mut self, trace: Arc<StatementTrace>) {
+        self.statement_trace = Some(trace);
+    }
+
+    #[inline]
+    pub fn statement_trace(&self) -> Option<&Arc<StatementTrace>> {
+        self.statement_trace.as_ref()
     }
 
     #[inline]

@@ -9,7 +9,9 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use paro_function::scalar::FunctionExecContext;
-use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
+use paro_planner::logical::operator::join::{
+    AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics,
+};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::join_hashtable::{FullOuterScanState, JoinHashTable, JoinHashTableConfig};
@@ -22,10 +24,10 @@ use crate::operators::join::hash::residual::HashJoinResidualProbeState;
 use crate::operators::join::hash::source_predicate::ReductionSourcePredicateState;
 use crate::operators::join::hash::spill::probe_input_from_spill_chunk_into;
 use crate::operators::join::join_result_helpers::{
-    construct_right_outer_scan_result, construct_semi_join_result,
+    construct_permuted_right_outer_scan_result, construct_semi_join_result,
 };
 use crate::operators::output::ensure_source_output;
-use crate::physical::specs::HashReductionCascadeSpec;
+use crate::physical::specs::{HashReductionCascadeSpec, OutputPermutation};
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
@@ -39,6 +41,7 @@ pub struct HashJoinSpillReplaySourceExec {
     pub handle: HandleRef<JoinBuildHandle>,
     pub join_type: JoinType,
     pub anti_join_mode: AntiJoinMode,
+    pub mark_semantics: MarkJoinSemantics,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,
@@ -46,6 +49,7 @@ pub struct HashJoinSpillReplaySourceExec {
     pub build_output_count: usize,
     pub build_payload_types: Box<[LogicalType]>,
     pub left_projection: Box<[usize]>,
+    pub output_permutation: OutputPermutation,
     pub output_types: Box<[LogicalType]>,
     pub reduction_cascade: Option<HashReductionCascadeSpec>,
 }
@@ -231,7 +235,8 @@ impl HashJoinSpillReplaySourceExec {
                     self.join_type,
                     &replay_input,
                     &self.left_projection,
-                    &self.output_types,
+                    &self.output_permutation,
+                    current.hash_table.build_output_types(),
                     output,
                 )?;
                 if emitted > 0 {
@@ -428,12 +433,14 @@ impl HashJoinSpillReplaySourceExec {
         let count = scan_hash_join_results(
             self.join_type,
             self.anti_join_mode,
+            self.mark_semantics,
             probe_keys,
             probe_input,
             output,
             current.hash_table.as_ref(),
             &mut current.scan_structure,
             &self.left_projection,
+            &self.output_permutation,
             residual,
             ctx.query,
         )?;
@@ -487,18 +494,26 @@ impl HashJoinSpillReplaySourceExec {
         match self.join_type {
             JoinType::Right | JoinType::Outer => {
                 let projection = (0..build_chunk.column_count()).collect::<Vec<_>>();
-                construct_right_outer_scan_result(
+                construct_permuted_right_outer_scan_result(
                     &build_chunk,
                     &build_sel,
                     count,
                     &self.left_output_types(),
                     &projection,
+                    &self.output_permutation,
                     output,
                 )?
             }
             JoinType::RightSemi | JoinType::RightAnti => {
                 let projection = (0..build_chunk.column_count()).collect::<Vec<_>>();
-                construct_semi_join_result(&build_chunk, &build_sel, count, &projection, output)?
+                construct_semi_join_result(
+                    &build_chunk,
+                    &build_sel,
+                    count,
+                    &projection,
+                    &self.output_permutation,
+                    output,
+                )?
             }
             _ => unreachable!("checked build-propagating join types above"),
         }

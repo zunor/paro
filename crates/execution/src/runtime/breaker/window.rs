@@ -11,21 +11,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
-use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 
-use crate::operators::window::runtime::build_window_output_chunks;
-use crate::physical::specs::WindowSpec;
 use crate::runtime::context::OperatorCleanupContext;
 
 use super::cleanup::{CleanupReason, CleanupState, CleanupStatus, RuntimeCleanup};
+use super::radix::RadixChunk;
 use super::registry::BreakerHandleMetadata;
 
 #[derive(Debug)]
 pub struct WindowHandle {
     metadata: BreakerHandleMetadata,
-    pending_chunks: Mutex<Vec<Chunk>>,
+    pending_chunks: Mutex<Vec<RadixChunk>>,
     sealed_chunks: OnceLock<Arc<[Chunk]>>,
     sealed: AtomicBool,
     cleanup: CleanupState,
@@ -42,12 +40,21 @@ impl WindowHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn routing_bytes(&self) -> usize {
+        self.pending_chunks
+            .lock()
+            .iter()
+            .map(|c| c.routing.retained_bytes())
+            .sum::<usize>()
+    }
+
     #[inline]
     pub fn metadata(&self) -> &BreakerHandleMetadata {
         &self.metadata
     }
 
-    pub fn append_chunks(&self, chunks: &mut Vec<Chunk>) -> Result<()> {
+    pub(crate) fn append_chunks(&self, chunks: &mut Vec<RadixChunk>) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
         }
@@ -60,16 +67,11 @@ impl WindowHandle {
         Ok(())
     }
 
-    pub fn seal(&self, spec: &WindowSpec, allocator: Arc<dyn Allocator>) -> Result<()> {
-        if self.is_sealed() {
-            return Ok(());
-        }
+    pub(crate) fn take_input(&self) -> Vec<RadixChunk> {
+        std::mem::take(&mut *self.pending_chunks.lock())
+    }
 
-        let input_chunks = {
-            let mut pending = self.pending_chunks.lock();
-            std::mem::take(&mut *pending)
-        };
-        let output_chunks = build_window_output_chunks(spec, &input_chunks, allocator)?;
+    pub(crate) fn publish(&self, output_chunks: Vec<Chunk>) -> Result<()> {
         self.sealed_chunks
             .set(Arc::from(output_chunks.into_boxed_slice()))
             .map_err(|_| paro_error::internal("window handle was sealed twice"))?;

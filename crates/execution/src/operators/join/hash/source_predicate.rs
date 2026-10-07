@@ -272,11 +272,14 @@ mod tests {
 
     #[test]
     fn date_column_comparison_compiles_to_i32_kernel() {
-        let expression = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Date)),
-            Expression::Reference(ReferenceExpression::new(1, LogicalType::Date)),
-        ));
+        let expression = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Date).into()),
+                Expression::Reference(ReferenceExpression::new(1, LogicalType::Date).into()),
+            )
+            .into(),
+        );
         assert!(matches!(
             compile_fixed_comparison(&expression),
             Some(FixedComparisonShape {
@@ -294,11 +297,14 @@ mod tests {
             precision: 15,
             scale: 2,
         };
-        let expression = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::LessThan,
-            Expression::Reference(ReferenceExpression::new(0, decimal.clone())),
-            Expression::Reference(ReferenceExpression::new(1, decimal)),
-        ));
+        let expression = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::LessThan,
+                Expression::Reference(ReferenceExpression::new(0, decimal.clone()).into()),
+                Expression::Reference(ReferenceExpression::new(1, decimal).into()),
+            )
+            .into(),
+        );
         assert!(matches!(
             compile_fixed_comparison(&expression),
             Some(FixedComparisonShape {
@@ -312,11 +318,14 @@ mod tests {
 
     #[test]
     fn float_distinct_from_uses_generic_value_semantics() {
-        let expression = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::DistinctFrom,
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Double)),
-            Expression::Reference(ReferenceExpression::new(1, LogicalType::Double)),
-        ));
+        let expression = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::DistinctFrom,
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Double).into()),
+                Expression::Reference(ReferenceExpression::new(1, LogicalType::Double).into()),
+            )
+            .into(),
+        );
         assert!(compile_fixed_comparison(&expression).is_none());
     }
 

@@ -39,6 +39,7 @@ use crate::operators::aggregate::build_helpers::{
     build_per_aggregate_filters, ensure_group_update_scratch, fill_repeated_state_addresses,
     group_types, has_aggregate_filters,
 };
+use crate::operators::aggregate::group_hash::GroupHashScratch;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::UngroupedAggregateRuntimeState;
@@ -338,6 +339,7 @@ pub(crate) fn finalize_ordered_into_hash_tables(
                 input_chunk: Chunk::try_initialize(&input_types, batch_cap, allocator.clone())?,
                 addresses: Vector::try_new(LogicalType::BigInt, batch_cap, allocator.clone())?,
                 new_groups: SelectionVector::try_with_capacity(batch_cap, allocator.clone())?,
+                hash_scratch: GroupHashScratch::try_new(batch_cap, allocator.clone())?,
                 arena: ArenaAllocator::new(allocator.clone()),
                 allocator,
             };
@@ -475,6 +477,7 @@ struct OrderedTableBatchUpdater<'a> {
     input_chunk: Chunk,
     addresses: Vector,
     new_groups: SelectionVector,
+    hash_scratch: GroupHashScratch,
     arena: ArenaAllocator,
     allocator: Arc<dyn paro_common::allocator::Allocator>,
 }
@@ -495,19 +498,19 @@ impl OrderedTableBatchUpdater<'_> {
             self.input_count,
             self.agg_idx,
         )?;
-        let hashes = self.table.hash_groups(&self.groups)?;
         ensure_group_update_scratch(
             &mut self.addresses,
             &mut self.new_groups,
             batch.len(),
             self.allocator.clone(),
         )?;
-        self.table.find_or_create_groups(
+        let lookup = self.table.find_or_create_groups_with_scratch(
             &self.groups,
-            &hashes,
+            &mut self.hash_scratch,
             &mut self.addresses,
             &mut self.new_groups,
         )?;
+        lookup.consume_for_flat_custom_update()?;
         let states = build_state_vector(
             &self.addresses,
             self.full_layout,
