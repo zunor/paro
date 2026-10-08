@@ -30,9 +30,9 @@ FROM paro_storage_info('obs_docs')
 WHERE column_name IN ('id', 'title')
 ORDER BY column_name, segment_id;
 
-SELECT name, enabled, invocation_count >= 0 AS has_invocations
+SELECT name, kind, invocation_count >= 0 AS has_invocations
 FROM paro_optimizers()
-WHERE name IN ('search_optimization', 'statistics_gathering')
+WHERE name IN ('semantic_normalization', 'region_optimization')
 ORDER BY name;
 
 -- @normalize explain_search_ids

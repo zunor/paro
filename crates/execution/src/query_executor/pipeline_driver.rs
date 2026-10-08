@@ -223,9 +223,7 @@ impl PipelineExecutionDriver {
             return 1;
         }
         query
-            .session
-            .number_of_threads()
-            .max(1)
+            .max_parallel_tasks()
             .min(self.ready.len().saturating_add(self.running.len()).max(1))
     }
 
@@ -434,6 +432,7 @@ impl ActivePipelineTask {
             // fetch-driven operators do not park on them today, so keep the
             // task blocked and let the caller fail fast instead of polling.
             WakeSource::Memory
+            | WakeSource::TaskPermit
             | WakeSource::Spill
             | WakeSource::ExternalRuntime
             | WakeSource::DerivedIndex => false,

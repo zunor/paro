@@ -112,3 +112,28 @@ SELECT v
 FROM (SELECT v FROM setop_null_right) AS r;
 v
 1
+
+-- @query
+SELECT x FROM (VALUES (NULL::INTEGER), (1), (1), (2)) AS v(x)
+WHERE x = x ORDER BY x NULLS LAST;
+x
+1
+1
+2
+
+-- @query
+SELECT x FROM (VALUES (NULL::INTEGER), (1), (1), (2)) AS v(x)
+WHERE (x = x AND (x = 1 OR x IS NULL)) AND (x >= 0 OR x IS NULL)
+ORDER BY x NULLS LAST;
+x
+1
+1
+
+-- @query
+SELECT x FROM (VALUES (NULL::INTEGER), (1), (1), (2)) AS v(x)
+WHERE x IS NOT DISTINCT FROM x ORDER BY x NULLS LAST;
+x
+1
+1
+2
+NULL

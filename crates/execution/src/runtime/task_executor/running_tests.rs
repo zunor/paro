@@ -333,9 +333,21 @@ fn materialized_breaker_moves_chunks_through_typed_handle() {
 }
 
 #[test]
-fn cte_materialize_scan_gives_each_consumer_independent_cursor() {
+fn forced_external_cte_gives_each_consumer_independent_cursor() {
     let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
+    let query = query_context_with_limits(
+        output.clone(),
+        RuntimeLimits {
+            max_threads: 1,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: true,
+            temporary_directory: unique_temp_dir("paro_cte_spill"),
+            max_temp_directory_size: None,
+            force_external: true,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: false,
+        },
+    );
     let row_type = RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]);
 
     let mut handles = BreakerHandleCatalogBuilder::default();
@@ -356,7 +368,10 @@ fn cte_materialize_scan_gives_each_consumer_independent_cursor() {
                     vec![LogicalType::Integer],
                 )),
                 transforms: Vec::new(),
-                sink: SinkSpec::CteMaterialize(CteMaterializeSinkSpec { handle }),
+                sink: SinkSpec::CteMaterialize(CteMaterializeSinkSpec {
+                    handle,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::ForcedExternal,
+                }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
                 output: row_type.clone(),
@@ -473,10 +488,9 @@ fn delim_capture_deduplicates_values_and_keeps_cached_outer_explicit() {
                 transforms: Vec::new(),
                 sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
                     handle: delim,
-                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
-                        0,
-                        LogicalType::Integer,
-                    ))]
+                    duplicate_keys: vec![Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::Integer).into(),
+                    )]
                     .into_boxed_slice(),
                     cached_outer: Some(cached_outer),
                 }),
@@ -680,13 +694,14 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                     join_type: JoinType::Inner,
                     build_keys_unique: false,
                     build_time_integer_index: None,
+                    runtime_filter: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    force_external: false,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -703,12 +718,15 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
+                    covering_runtime_filter_key: None,
                     join_type: JoinType::Inner,
                     anti_join_mode: AntiJoinMode::Regular,
+                    mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(2),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -778,9 +796,21 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
 }
 
 #[test]
-fn cross_product_probe_reuses_materialized_build_vectors() {
+fn cross_product_probe_streams_external_build_rows() {
     let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
+    let query = query_context_with_limits(
+        output.clone(),
+        RuntimeLimits {
+            max_threads: 1,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: true,
+            temporary_directory: unique_temp_dir("paro_cross_product_spill"),
+            max_temp_directory_size: None,
+            force_external: true,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: false,
+        },
+    );
     let build_row_type = RowType::new(vec!["r".to_string()], vec![LogicalType::Integer]);
     let output_row_type = RowType::new(
         vec!["l".to_string(), "r".to_string()],
@@ -806,7 +836,10 @@ fn cross_product_probe_reuses_materialized_build_vectors() {
                     vec![LogicalType::Integer],
                 )),
                 transforms: Vec::new(),
-                sink: SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec { handle }),
+                sink: SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec {
+                    handle,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::ForcedExternal,
+                }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
                 output: build_row_type,
@@ -896,11 +929,11 @@ fn cross_product_probe_reuses_materialized_build_vectors() {
 }
 
 #[test]
-fn hash_join_left_probe_null_fills_when_build_is_empty() {
+fn hash_join_left_probe_applies_output_permutation_when_build_is_empty() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
     let join_row_type = RowType::new(
-        vec!["lv".to_string(), "rv".to_string()],
+        vec!["rv".to_string(), "lv".to_string()],
         vec![LogicalType::Integer, LogicalType::Integer],
     );
 
@@ -929,13 +962,14 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                     join_type: JoinType::Left,
                     build_keys_unique: false,
                     build_time_integer_index: None,
+                    runtime_filter: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    force_external: false,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -955,13 +989,17 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
+                    covering_runtime_filter_key: None,
                     join_type: JoinType::Left,
                     anti_join_mode: AntiJoinMode::Regular,
+                    mark_semantics: paro_planner::logical::operator::MarkJoinSemantics::NotMark,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
-                    output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::from_forward([1, 0])
+                        .unwrap(),
+                    output_names: vec!["rv".to_string(), "lv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
                     reduction_cascade: None,
@@ -1025,8 +1063,8 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
 
     let chunk = output.pop_front().expect("left join output");
     assert_eq!(chunk.size(), 2);
-    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(100));
-    assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(200));
-    assert!(chunk.column(1).unwrap().is_null(0));
-    assert!(chunk.column(1).unwrap().is_null(1));
+    assert!(chunk.column(0).unwrap().is_null(0));
+    assert!(chunk.column(0).unwrap().is_null(1));
+    assert_eq!(chunk.column(1).unwrap().get_i32(0), Some(100));
+    assert_eq!(chunk.column(1).unwrap().get_i32(1), Some(200));
 }

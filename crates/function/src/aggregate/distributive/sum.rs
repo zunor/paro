@@ -11,7 +11,7 @@ use crate::aggregate::{
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
+use paro_common::vector::{Vector, VectorType};
 
 #[repr(C)]
 struct SumState<T> {
@@ -156,6 +156,37 @@ macro_rules! define_sum_impl {
                 count: usize,
             ) {
                 let input = inputs[0];
+                // Expression payloads normally arrive flat. Resolve the
+                // representation and state-address selection once per batch,
+                // as the decimal kernel does, rather than through recursive
+                // vector accessors for each input. Preserve logical row order:
+                // floating SUM must not gain a reassociated reduction here.
+                if input.vector_type() == VectorType::Flat {
+                    if let Some(cursor) = states.direct_cursor() {
+                        let values = input.flat_data::<$input_type>();
+                        let validity = input.validity();
+                        if validity.all_valid() {
+                            for row in 0..count {
+                                let state = &mut *(cursor.state_ptr(row) as *mut State);
+                                <$accumulator_type as SumAccumulator<$input_type, $output_type>>::add_input(
+                                    &mut state.value, *values.add(row),
+                                );
+                                state.is_null = false;
+                            }
+                        } else {
+                            for row in 0..count {
+                                if validity.is_valid(row) {
+                                    let state = &mut *(cursor.state_ptr(row) as *mut State);
+                                    <$accumulator_type as SumAccumulator<$input_type, $output_type>>::add_input(
+                                        &mut state.value, *values.add(row),
+                                    );
+                                    state.is_null = false;
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
                 for i in 0..count {
                     if !input.is_null(i) {
                         let state_ptr = states.state_ptr(i);
@@ -427,6 +458,97 @@ mod tests {
     }
 
     #[test]
+    fn grouped_double_sum_preserves_row_order_nulls_and_selected_states() {
+        use paro_common::vector::SelectionVector;
+
+        let allocator = paro_common::test_utils::test_allocator();
+        // Reassociation changes these sums. Also exercise signed zero, NaN
+        // and infinities without relaxing bitwise equality to an epsilon.
+        let flat = paro_common::test_utils::test_f64_vector(&[
+            1.0e16,
+            -0.0,
+            1.0,
+            f64::INFINITY,
+            -1.0e16,
+            f64::NEG_INFINITY,
+            3.0,
+            f64::from_bits(0x7ff8_0000_0000_0042),
+        ]);
+        let mut nullable = flat.clone();
+        nullable.try_set_null(3, true).unwrap();
+        nullable.try_set_null(7, true).unwrap();
+        let mut all_null = flat.clone();
+        for row in 0..all_null.len() {
+            all_null.try_set_null(row, true).unwrap();
+        }
+        let dictionary = Vector::try_dictionary(
+            Arc::new(nullable.clone()),
+            SelectionVector::try_from_indices(vec![6, 3, 2, 2, 0, 7, 1, 4], allocator.clone())
+                .unwrap(),
+        )
+        .unwrap();
+        let constant =
+            Vector::try_constant(LogicalType::Double, 1.25_f64, 8, allocator.clone()).unwrap();
+        let (function, _) = get_sum_function().bind(&[LogicalType::Double]).unwrap();
+        for input in [flat, nullable, all_null, dictionary, constant] {
+            for selected in [false, true] {
+                let mut actual = [
+                    SumState {
+                        value: 0.0_f64,
+                        is_null: true,
+                    },
+                    SumState {
+                        value: 0.0_f64,
+                        is_null: true,
+                    },
+                ];
+                let mut expected = [(0.0_f64, true); 2];
+                let mut addresses =
+                    Vector::try_new(LogicalType::BigInt, input.len(), allocator.clone()).unwrap();
+                addresses.try_set_count(input.len()).unwrap();
+                for row in 0..input.len() {
+                    unsafe {
+                        *addresses.flat_data_mut::<*mut u8>().add(row) =
+                            (&mut actual[row % 2] as *mut SumState<f64>).cast();
+                    }
+                }
+                let selection = SelectionVector::try_from_indices(
+                    vec![1, 0, 3, 3, 6, 2, 7, 5],
+                    allocator.clone(),
+                )
+                .unwrap();
+                let states = AggregateStateInput::try_new(
+                    &addresses,
+                    0,
+                    selected.then_some(&selection),
+                    input.len(),
+                )
+                .unwrap();
+                for row in 0..input.len() {
+                    if let Some(value) = input.get_f64(row) {
+                        let group = if selected { selection.get(row) } else { row } % 2;
+                        expected[group].0 += value;
+                        expected[group].1 = false;
+                    }
+                }
+                let mut arena = test_arena();
+                unsafe {
+                    (function.update)(
+                        &[&input],
+                        &preserve_input_data(&function, &mut arena),
+                        &states,
+                        input.len(),
+                    );
+                }
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_eq!(actual.is_null, expected.1);
+                    assert_eq!(actual.value.to_bits(), expected.0.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_sum_integer() {
         let func_set = get_sum_function();
         let (func, _) = func_set.bind(&[LogicalType::Integer]).unwrap();
@@ -596,7 +718,8 @@ mod tests {
         assert!(!sum.execution_semantics_equal(&without_rollup));
 
         let mut different_empty_input = sum.clone();
-        different_empty_input.empty_input = AggregateEmptyInput::NonNull;
+        different_empty_input.empty_input =
+            AggregateEmptyInput::Exact(paro_common::runtime_value::Value::BigInt(0));
         assert!(!sum.execution_semantics_equal(&different_empty_input));
 
         let reducer = sum.partial_merge_function().unwrap();

@@ -23,7 +23,7 @@ impl<'a> PipelineLowerer<'a> {
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::Limit(spec) => {
-                    transforms.push(TransformSpec::Limit(spec.clone()));
+                    transforms.push(TransformSpec::Limit(spec.as_ref().clone()));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::Window(spec) if is_streaming_window_supported(spec) => {
@@ -40,7 +40,7 @@ impl<'a> PipelineLowerer<'a> {
                     current = child;
                 }
                 PhysicalNodeKind::GraphExpand(spec) => {
-                    transforms.push(TransformSpec::GraphExpand(spec.clone()));
+                    transforms.push(TransformSpec::GraphExpand(spec.as_ref().clone()));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::RowFetch(spec) => {
@@ -52,7 +52,7 @@ impl<'a> PipelineLowerer<'a> {
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::GraphShortestPath(spec) => {
-                    transforms.push(TransformSpec::GraphShortestPath(spec.clone()));
+                    transforms.push(TransformSpec::GraphShortestPath(spec.as_ref().clone()));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::ExternalProject(spec) => {

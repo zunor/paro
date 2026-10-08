@@ -13,7 +13,10 @@ pub struct WindowEmitSourceLocal {
 
 #[derive(Debug, Default)]
 pub struct WindowBuildSinkLocal {
-    pub chunks: Vec<Chunk>,
+    pub(crate) columns: Vec<usize>,
+    pub(crate) partitions: usize,
+    pub(crate) chunks: Vec<crate::runtime::breaker::radix::RadixChunk>,
+    pub(crate) router: crate::runtime::breaker::radix::RadixRouter,
 }
 
 #[derive(Debug, Default)]

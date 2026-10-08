@@ -902,6 +902,8 @@ pub enum TokenKind {
     LEFT,
     #[token("LET", ignore(ascii_case))]
     LET,
+    #[token("ILIKE", ignore(ascii_case))]
+    ILIKE,
     #[token("LIKE", ignore(ascii_case))]
     LIKE,
     #[token("LIMIT", ignore(ascii_case))]
@@ -1440,6 +1442,8 @@ pub enum TokenKind {
     WINDOW,
     #[token("WITH", ignore(ascii_case))]
     WITH,
+    #[token("WITHOUT", ignore(ascii_case))]
+    WITHOUT,
     #[token("WITHIN", ignore(ascii_case))]
     WITHIN,
     #[token("XML", ignore(ascii_case))]
@@ -1937,7 +1941,7 @@ impl TokenKind {
             // | TokenKind::FREEZE
             | TokenKind::FOR
             | TokenKind::FULL
-            // | TokenKind::ILIKE
+            | TokenKind::ILIKE
             | TokenKind::IN
             | TokenKind::IDENTIFIER
             // | TokenKind::INITIALLY

@@ -132,6 +132,8 @@ impl Binder {
         let mut bind_state = SelectBindState::new();
         for (index, name) in names.iter().enumerate() {
             bind_state.add_alias(name, false, index);
+            // These are already resolved output names, not SQL tokens.
+            bind_state.add_order_output_name(name, true, index, None);
         }
         let alias_lookup = AliasLookup::snapshot(&bind_state);
         let mut order_binder = OrderBinder::new(self, &mut bind_state, alias_lookup);
@@ -214,9 +216,9 @@ pub fn bind_select(
 #[cfg(test)]
 mod tests {
     use crate::binder::test_utils::test_binder;
-    use crate::operator::LogicalOperator;
+    use crate::logical::operator::LogicalOperator;
 
-    fn plan(sql: &str) -> crate::plan::LogicalPlan {
+    fn plan(sql: &str) -> crate::logical::plan::OwnedLogicalPlan {
         let statement = paro_parser::parse_one(sql).expect("parse query").stmt;
         test_binder().bind(statement).expect("plan query").plan
     }
@@ -224,14 +226,14 @@ mod tests {
     #[test]
     fn values_query_modifiers_wrap_the_values_body() {
         let plan = plan("VALUES (3), (1), (2) ORDER BY 1 LIMIT 1 OFFSET 1");
-        let LogicalOperator::Limit(limit) = plan.operator else {
+        let LogicalOperator::Limit(limit) = &plan.operator else {
             panic!("expected LIMIT at query boundary");
         };
-        let LogicalOperator::Order(order) = limit.child.operator else {
+        let LogicalOperator::Order(order) = &limit.child.operator else {
             panic!("expected ORDER BY below LIMIT");
         };
         assert!(matches!(
-            order.child.operator,
+            &order.child.operator,
             LogicalOperator::ExpressionGet(_)
         ));
     }
@@ -239,14 +241,14 @@ mod tests {
     #[test]
     fn set_operation_query_modifiers_wrap_the_set_result() {
         let plan = plan("SELECT 3 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY n LIMIT 1");
-        let LogicalOperator::Limit(limit) = plan.operator else {
+        let LogicalOperator::Limit(limit) = &plan.operator else {
             panic!("expected LIMIT at query boundary");
         };
-        let LogicalOperator::Order(order) = limit.child.operator else {
+        let LogicalOperator::Order(order) = &limit.child.operator else {
             panic!("expected ORDER BY below LIMIT");
         };
         assert!(matches!(
-            order.child.operator,
+            &order.child.operator,
             LogicalOperator::SetOperation(_)
         ));
     }
@@ -254,10 +256,10 @@ mod tests {
     #[test]
     fn parenthesized_query_modifiers_remain_on_the_inner_set_operand() {
         let plan = plan("(SELECT 2 AS n UNION ALL SELECT 1 ORDER BY n LIMIT 1) UNION ALL SELECT 3");
-        let LogicalOperator::SetOperation(set) = plan.operator else {
+        let LogicalOperator::SetOperation(set) = &plan.operator else {
             panic!("expected outer set operation");
         };
-        assert!(matches!(set.left.operator, LogicalOperator::Limit(_)));
+        assert!(matches!(&set.left.operator, LogicalOperator::Limit(_)));
     }
 
     #[test]
@@ -266,31 +268,49 @@ mod tests {
             "(SELECT n FROM (VALUES (2, 20), (1, 10)) AS t(n, hidden) \
              ORDER BY hidden LIMIT 1) UNION ALL SELECT 3",
         );
-        let LogicalOperator::SetOperation(set) = plan.operator else {
+        let LogicalOperator::SetOperation(set) = &plan.operator else {
             panic!("expected outer set operation");
         };
-        let LogicalOperator::Projection(prune) = set.left.operator else {
+        let LogicalOperator::Projection(prune) = &set.left.operator else {
             panic!("expected hidden-column pruning at the inner query boundary");
         };
-        assert!(matches!(prune.child.operator, LogicalOperator::Limit(_)));
+        assert!(matches!(&prune.child.operator, LogicalOperator::Limit(_)));
+    }
+
+    #[test]
+    fn input_column_precedes_same_named_inferred_select_alias() {
+        let plan = plan("SELECT x FROM (SELECT 1 AS x) AS input");
+        let LogicalOperator::Projection(projection) = &plan.operator else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            projection.expressions.as_slice(),
+            [crate::expression::Expression::ColumnRef(_)]
+        ));
     }
 
     #[test]
     fn distinct_ordering_is_planned_above_distinct() {
         let plan = plan("SELECT DISTINCT n FROM (VALUES (2), (1), (2)) AS t(n) ORDER BY n ASC");
-        let LogicalOperator::Order(order) = plan.operator else {
+        let LogicalOperator::Order(order) = &plan.operator else {
             panic!("expected ORDER BY at query boundary");
         };
-        assert!(matches!(order.child.operator, LogicalOperator::Distinct(_)));
+        assert!(matches!(
+            &order.child.operator,
+            LogicalOperator::Distinct(_)
+        ));
     }
 
     #[test]
     fn distinct_accepts_qualified_selected_expression() {
         let plan = plan("SELECT DISTINCT n FROM (VALUES (2), (1), (2)) AS t(n) ORDER BY t.n");
-        let LogicalOperator::Order(order) = plan.operator else {
+        let LogicalOperator::Order(order) = &plan.operator else {
             panic!("expected ORDER BY at query boundary");
         };
-        assert!(matches!(order.child.operator, LogicalOperator::Distinct(_)));
+        assert!(matches!(
+            &order.child.operator,
+            LogicalOperator::Distinct(_)
+        ));
     }
 
     #[test]

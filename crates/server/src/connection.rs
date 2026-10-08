@@ -5,6 +5,7 @@
 
 use crate::cancel::backend_key::BackendCancelKey;
 use paro_common::logging::targets;
+use paro_common::vector::VectorLifetimeOwner;
 use paro_instance::{
     ConnectionHandle, CopyStdinMetrics, CopyStdinRejectReason, Instance, SessionExecutionHandle,
     StatementCancelReason,
@@ -14,11 +15,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use paro_common::runtime_value::Value;
 use paro_session::{
     BindMessage, CloseTarget, ConnectionShutdownReason, DescribeTarget, ExecutePortalMessage,
-    ExtendedQueryMessage, ExtendedQueryResponder, ParseMessage, Session, TransactionState,
+    ExtendedQueryMessage, ParseMessage, Session, TransactionState,
 };
 use pgwire::error::PgWireError;
 use pgwire::messages::copy::{
@@ -44,6 +45,7 @@ use crate::connection_control::{ServerConnectionControl, ServerLimits};
 use crate::protocol::extended::PgWireExtendedQueryResponder;
 use crate::protocol::result::{build_error_response, build_error_response_message};
 use crate::protocol::simple::ProtocolSink;
+use crate::protocol::transport::{self, DrainOutcome, CANCELLED_OUTPUT_STALL_TIMEOUT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrontendProtocolState {
@@ -55,6 +57,18 @@ enum FrontendProtocolState {
 enum DispatchResult {
     Continue { send_ready_for_query: bool },
     Terminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolQueryOutcome {
+    Continue,
+    Terminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalSendOutcome {
+    Sent,
+    ConnectionClosed,
 }
 
 const DEFAULT_NORMAL_FRONTEND_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
@@ -118,6 +132,10 @@ pub(crate) struct Connection {
     protocol_state: FrontendProtocolState,
     /// Whether we have an open extended-query pipeline waiting for `Sync`.
     extended_query_pipeline_open: bool,
+    /// A simple-query cancellation/error path has already used the bounded
+    /// terminal policy for ErrorResponse. Its ReadyForQuery must use the same
+    /// policy; a plain send could otherwise wait forever.
+    bounded_ready_for_query: bool,
 }
 
 pub(crate) struct ConnectionInit {
@@ -170,6 +188,7 @@ impl Connection {
             registered_in_session_registry: false,
             protocol_state: FrontendProtocolState::Ready,
             extended_query_pipeline_open: false,
+            bounded_ready_for_query: false,
         }
     }
 
@@ -250,7 +269,16 @@ impl Connection {
                         break;
                     }
                     if send_ready_for_query {
-                        self.send_ready_for_query().await?;
+                        let bounded = std::mem::take(&mut self.bounded_ready_for_query);
+                        if bounded {
+                            if self.send_bounded_ready_for_query().await?
+                                == TerminalSendOutcome::ConnectionClosed
+                            {
+                                break;
+                            }
+                        } else {
+                            self.send_ready_for_query().await?;
+                        }
                     }
                 }
                 Ok(DispatchResult::Terminate) => break,
@@ -369,9 +397,11 @@ impl Connection {
                     self.register_connection_registry_mirror();
 
                     // No auth implemented yet, just say OK
-                    self.socket
-                        .send(PgWireBackendMessage::Authentication(Authentication::Ok))
-                        .await?;
+                    transport::send(
+                        &mut self.socket,
+                        PgWireBackendMessage::Authentication(Authentication::Ok),
+                    )
+                    .await?;
 
                     for (name, value) in self
                         .session
@@ -379,21 +409,25 @@ impl Connection {
                         .expect("session must exist after startup initialization")
                         .startup_parameters()
                     {
-                        self.socket
-                            .send(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                        transport::send(
+                            &mut self.socket,
+                            PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
                                 name.to_string(),
                                 value,
-                            )))
-                            .await?;
+                            )),
+                        )
+                        .await?;
                     }
 
                     if let Some(backend_key) = self.backend_key {
-                        self.socket
-                            .send(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+                        transport::send(
+                            &mut self.socket,
+                            PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
                                 backend_key.pid().value(),
                                 SecretKey::I32(backend_key.secret().value()),
-                            )))
-                            .await?;
+                            )),
+                        )
+                        .await?;
                     }
 
                     // Send ReadyForQuery to complete the handshake
@@ -465,7 +499,7 @@ impl Connection {
         // protocol boundary that makes those messages observable even when a
         // client does not send Sync/Flush next.
         if !self.socket.write_buffer().is_empty() {
-            self.socket.flush().await?;
+            transport::flush(&mut self.socket).await?;
         }
 
         tokio::select! {
@@ -528,12 +562,12 @@ impl Connection {
         }
 
         match msg {
-            PgWireFrontendMessage::Query(q) => {
-                self.execute_protocol_query(&q.query).await?;
-                Ok(DispatchResult::Continue {
+            PgWireFrontendMessage::Query(q) => match self.execute_protocol_query(&q.query).await? {
+                ProtocolQueryOutcome::Continue => Ok(DispatchResult::Continue {
                     send_ready_for_query: true,
-                })
-            }
+                }),
+                ProtocolQueryOutcome::Terminate => Ok(DispatchResult::Terminate),
+            },
             PgWireFrontendMessage::Parse(parse) => {
                 self.handle_extended_query_message(ExtendedQueryMessage::Parse(ParseMessage {
                     name: parse.name,
@@ -635,6 +669,10 @@ impl Connection {
             }
             PgWireFrontendMessage::Sync(_) => {
                 self.finish_extended_query_pipeline().await?;
+                // A successful Sync is ordinary protocol backpressure.  The
+                // bounded drain policy is reserved for cancellation/error
+                // recovery; applying it here would close a healthy client
+                // merely because it paused reading for the recovery window.
                 self.send_ready_for_query().await?;
                 Ok(DispatchResult::Continue {
                     send_ready_for_query: false,
@@ -682,7 +720,7 @@ impl Connection {
     ) -> anyhow::Result<DispatchResult> {
         match msg {
             PgWireFrontendMessage::Flush(_) => {
-                self.socket.flush().await?;
+                transport::flush(&mut self.socket).await?;
                 Ok(DispatchResult::Continue {
                     send_ready_for_query: false,
                 })
@@ -694,7 +732,11 @@ impl Connection {
                 );
                 self.protocol_state = FrontendProtocolState::Ready;
                 self.finish_extended_query_pipeline().await?;
-                self.send_ready_for_query().await?;
+                if self.send_bounded_ready_for_query().await?
+                    == TerminalSendOutcome::ConnectionClosed
+                {
+                    return Ok(DispatchResult::Terminate);
+                }
                 Ok(DispatchResult::Continue {
                     send_ready_for_query: false,
                 })
@@ -754,14 +796,17 @@ impl Connection {
 
         self.extended_query_pipeline_open = false;
         let session = self.session.as_mut().expect("session must be initialized");
-        if session.is_in_implicit_block() {
+        let implicit_commit = session.is_in_implicit_block();
+        let commit_result = if implicit_commit {
             if session.is_transaction_failed() {
-                session.rollback_implicit_transaction()?;
+                session.rollback_implicit_transaction()
             } else {
-                session.end_implicit_transaction_block()?;
+                session.end_implicit_transaction_block()
             }
-        }
-        Ok(())
+        } else {
+            Ok(())
+        };
+        Ok(session.finish_protocol_statement_traces(commit_result, implicit_commit)?)
     }
 
     async fn handle_extended_query_protocol_error(
@@ -782,17 +827,19 @@ impl Connection {
         self.extended_query_pipeline_open = false;
         self.enter_skip_until_sync();
 
-        let mut responder = PgWireExtendedQueryResponder::new(
-            &mut self.socket,
-            self.drain_token.clone(),
-            self.force_close_token.clone(),
-            Arc::clone(&self.pending_frontend_messages),
-        );
-        responder.send_error(&err).await?;
+        if self
+            .send_bounded_backend_message(PgWireBackendMessage::ErrorResponse(
+                build_error_response(&err),
+            ))
+            .await?
+            == TerminalSendOutcome::ConnectionClosed
+        {
+            return Ok(());
+        }
         Ok(())
     }
 
-    async fn execute_protocol_query(&mut self, sql: &str) -> anyhow::Result<()> {
+    async fn execute_protocol_query(&mut self, sql: &str) -> anyhow::Result<ProtocolQueryOutcome> {
         let session = self.session.as_mut().expect("session must be initialized");
         let mut sink = ProtocolSink::new(
             &mut self.socket,
@@ -802,16 +849,21 @@ impl Connection {
         );
 
         match session.execute_simple_query(sql, &mut sink).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(ProtocolQueryOutcome::Continue),
             Err(err) => {
                 if let Some(transport_failure) = sink.transport_failure() {
                     return Err(transport_failure.into());
                 }
                 if self.should_terminate_without_protocol_epilogue() {
-                    return Ok(());
+                    return Ok(ProtocolQueryOutcome::Terminate);
                 }
-                self.send_paro_error_response(&err).await?;
-                Ok(())
+                Ok(match self.send_paro_error_response(&err).await? {
+                    TerminalSendOutcome::Sent => {
+                        self.bounded_ready_for_query = true;
+                        ProtocolQueryOutcome::Continue
+                    }
+                    TerminalSendOutcome::ConnectionClosed => ProtocolQueryOutcome::Terminate,
+                })
             }
         }
     }
@@ -827,33 +879,193 @@ impl Connection {
             None => TransactionStatus::Idle,
         };
 
-        self.socket
-            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                status,
-            )))
-            .await?;
+        transport::send(
+            &mut self.socket,
+            PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(status)),
+        )
+        .await?;
         Ok(())
     }
 
+    async fn send_bounded_ready_for_query(&mut self) -> anyhow::Result<TerminalSendOutcome> {
+        let status = match self.session.as_ref() {
+            Some(session) => match session.transaction_state() {
+                TransactionState::Idle => TransactionStatus::Idle,
+                TransactionState::InTransaction => TransactionStatus::Transaction,
+                TransactionState::Failed => TransactionStatus::Error,
+            },
+            None => TransactionStatus::Idle,
+        };
+        self.send_bounded_backend_message(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+            status,
+        )))
+        .await
+    }
+
+    /// Send one terminal frame without allowing cancellation recovery to
+    /// wait forever. Bytes already accepted by the connection are drained
+    /// before the new frame, and the new frame is drained under the same
+    /// force-close/no-progress policy. The caller must terminate the
+    /// connection on `ConnectionClosed`; no second unbounded flush is valid.
+    async fn send_bounded_backend_message(
+        &mut self,
+        message: PgWireBackendMessage,
+    ) -> anyhow::Result<TerminalSendOutcome> {
+        match transport::drain_pending_output(
+            &mut self.socket,
+            &self.force_close_token,
+            CANCELLED_OUTPUT_STALL_TIMEOUT,
+        )
+        .await
+        {
+            Ok(DrainOutcome::Drained) => {}
+            Ok(DrainOutcome::ForceClosed | DrainOutcome::Stalled) => {
+                self.terminate_connection_after_output_stall();
+                return Ok(TerminalSendOutcome::ConnectionClosed);
+            }
+            Err(error) => {
+                self.force_close_token.cancel();
+                return Err(error.into());
+            }
+        }
+
+        let fed = tokio::select! {
+            biased;
+            _ = self.force_close_token.cancelled() => None,
+            result = tokio::time::timeout(
+                CANCELLED_OUTPUT_STALL_TIMEOUT,
+                transport::feed(&mut self.socket, message),
+            ) => Some(result),
+        };
+        let Some(fed) = fed else {
+            self.terminate_connection_after_output_stall();
+            return Ok(TerminalSendOutcome::ConnectionClosed);
+        };
+        match fed {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.force_close_token.cancel();
+                return Err(error.into());
+            }
+            Err(_) => {
+                self.terminate_connection_after_output_stall();
+                return Ok(TerminalSendOutcome::ConnectionClosed);
+            }
+        }
+
+        match transport::drain_pending_output(
+            &mut self.socket,
+            &self.force_close_token,
+            CANCELLED_OUTPUT_STALL_TIMEOUT,
+        )
+        .await
+        {
+            Ok(DrainOutcome::Drained) => Ok(TerminalSendOutcome::Sent),
+            Ok(DrainOutcome::ForceClosed | DrainOutcome::Stalled) => {
+                self.terminate_connection_after_output_stall();
+                Ok(TerminalSendOutcome::ConnectionClosed)
+            }
+            Err(error) => {
+                self.force_close_token.cancel();
+                Err(error.into())
+            }
+        }
+    }
+
     async fn send_error_response(&mut self, sqlstate: &str, message: &str) -> anyhow::Result<()> {
-        self.socket
-            .send(PgWireBackendMessage::ErrorResponse(
-                build_error_response_message("ERROR", sqlstate, message),
-            ))
-            .await?;
+        transport::send(
+            &mut self.socket,
+            PgWireBackendMessage::ErrorResponse(build_error_response_message(
+                "ERROR", sqlstate, message,
+            )),
+        )
+        .await?;
         Ok(())
     }
 
     async fn send_paro_error_response(
         &mut self,
         err: &paro_common::error::ParoError,
-    ) -> anyhow::Result<()> {
-        self.socket
-            .send(PgWireBackendMessage::ErrorResponse(build_error_response(
-                err,
-            )))
-            .await?;
-        Ok(())
+    ) -> anyhow::Result<TerminalSendOutcome> {
+        if self.force_close_token.is_cancelled() {
+            self.terminate_connection_after_output_stall();
+            return Ok(TerminalSendOutcome::ConnectionClosed);
+        }
+
+        // A cancelled result may have left a valid prefix (including a
+        // partial DataRow) in Framed's buffer.  Drain that prefix completely
+        // before appending ErrorResponse; the error must never overtake a
+        // partially sent frame.
+        match transport::drain_pending_output(
+            &mut self.socket,
+            &self.force_close_token,
+            CANCELLED_OUTPUT_STALL_TIMEOUT,
+        )
+        .await
+        {
+            Ok(DrainOutcome::Drained) => {}
+            Ok(DrainOutcome::ForceClosed | DrainOutcome::Stalled) => {
+                self.terminate_connection_after_output_stall();
+                return Ok(TerminalSendOutcome::ConnectionClosed);
+            }
+            Err(error) => {
+                self.force_close_token.cancel();
+                return Err(error.into());
+            }
+        }
+
+        // The buffer is empty, so feeding the terminal frame cannot overtake
+        // an older protocol frame.  Still give a force-close and bounded
+        // timeout a chance while the sink establishes ownership of the frame.
+        let feed_result = tokio::select! {
+            biased;
+            _ = self.force_close_token.cancelled() => None,
+            result = tokio::time::timeout(
+                CANCELLED_OUTPUT_STALL_TIMEOUT,
+                transport::feed(
+                    &mut self.socket,
+                    PgWireBackendMessage::ErrorResponse(build_error_response(err)),
+                ),
+            ) => Some(result),
+        };
+        let Some(feed_result) = feed_result else {
+            self.terminate_connection_after_output_stall();
+            return Ok(TerminalSendOutcome::ConnectionClosed);
+        };
+        let feed_result = match feed_result {
+            Ok(result) => result,
+            Err(_) => {
+                self.terminate_connection_after_output_stall();
+                return Ok(TerminalSendOutcome::ConnectionClosed);
+            }
+        };
+        if let Err(error) = feed_result {
+            self.force_close_token.cancel();
+            return Err(error.into());
+        }
+
+        match transport::drain_pending_output(
+            &mut self.socket,
+            &self.force_close_token,
+            CANCELLED_OUTPUT_STALL_TIMEOUT,
+        )
+        .await
+        {
+            Ok(DrainOutcome::Drained) => Ok(TerminalSendOutcome::Sent),
+            Ok(DrainOutcome::ForceClosed | DrainOutcome::Stalled) => {
+                self.terminate_connection_after_output_stall();
+                Ok(TerminalSendOutcome::ConnectionClosed)
+            }
+            Err(error) => {
+                self.force_close_token.cancel();
+                Err(error.into())
+            }
+        }
+    }
+
+    fn terminate_connection_after_output_stall(&mut self) {
+        self.force_close_token.cancel();
+        self.force_close_session();
     }
 
     async fn handle_frontend_decode_error(&mut self, error: &PgWireError) -> anyhow::Result<()> {
@@ -1009,6 +1221,17 @@ pub struct PgCodec {
     limits: PgFrontendMessageLimits,
     copy_data_mode: bool,
     copy_stdin_metrics: Arc<CopyStdinMetrics>,
+    /// Owners transferred to bytes currently retained by Framed's write
+    /// buffer.  The codec lives exactly as long as that buffer, so dropping a
+    /// connection also drops any still-pending diagnostic reservation.
+    pending_output_owners: Vec<PendingOutputOwner>,
+    pending_output_bytes: usize,
+}
+
+#[derive(Debug)]
+struct PendingOutputOwner {
+    bytes: usize,
+    _owner: Arc<dyn VectorLifetimeOwner>,
 }
 
 impl PgCodec {
@@ -1019,7 +1242,50 @@ impl PgCodec {
             limits,
             copy_data_mode: false,
             copy_stdin_metrics,
+            pending_output_owners: Vec::new(),
+            pending_output_bytes: 0,
         }
+    }
+
+    /// Transfer a diagnostic lease to the connection transport after its
+    /// encoded bytes have been appended to Framed's write buffer.
+    pub(crate) fn retain_pending_output_owner(
+        &mut self,
+        bytes: usize,
+        owner: Arc<dyn VectorLifetimeOwner>,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        self.pending_output_bytes = self.pending_output_bytes.saturating_add(bytes);
+        self.pending_output_owners.push(PendingOutputOwner {
+            bytes,
+            _owner: owner,
+        });
+    }
+
+    /// Observe the aggregate Framed write buffer after a transport operation.
+    /// Framed exposes no per-segment drain callback, so leases are released
+    /// only once the whole buffer is empty.  This is conservative for mixed
+    /// output, and never releases a lease while any owned or trailing bytes
+    /// can still be pending.
+    pub(crate) fn observe_pending_output(&mut self, buffered_bytes: usize) {
+        debug_assert_eq!(
+            self.pending_output_owners
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<usize>(),
+            self.pending_output_bytes
+        );
+        if buffered_bytes == 0 {
+            self.pending_output_owners.clear();
+            self.pending_output_bytes = 0;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_output_bytes(&self) -> usize {
+        self.pending_output_bytes
     }
 
     pub fn enter_copy_data_mode(&mut self) {

@@ -6,15 +6,12 @@ use std::sync::Arc;
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_function::scalar::FunctionExecContext;
+use paro_common::memory::MemoryAccountingClass;
 
-use crate::physical::properties::MemoryClass;
 use crate::physical::specs::WindowSpec;
 use crate::runtime::breaker::{HandleRef, WindowHandle};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
-use crate::runtime::sink::{
-    FinishPoll, FinishTaskGroupRunner, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll,
-};
+use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
 use crate::runtime::state::{BreakerHandleGlobal, SinkGlobal, SinkLocal, WindowBuildSinkLocal};
 
 // ---------------------------------------------------------------------------
@@ -36,10 +33,14 @@ impl WindowBuildSinkExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         _global: &SinkGlobal,
     ) -> Result<SinkLocal> {
-        Ok(SinkLocal::WindowBuild(WindowBuildSinkLocal::default()))
+        Ok(SinkLocal::WindowBuild(WindowBuildSinkLocal {
+            columns: super::runtime::window_radix_columns(&self.spec)?,
+            partitions: ctx.query.max_parallel_tasks().max(1).next_power_of_two(),
+            ..Default::default()
+        }))
     }
 
     pub(crate) fn consume(
@@ -58,7 +59,19 @@ impl WindowBuildSinkExec {
                 "window build sink local state mismatch",
             ));
         };
-        local.chunks.push(input.handoff_referencing_vectors());
+        local.router.push(
+            &mut local.chunks,
+            input,
+            &local.columns,
+            local.partitions,
+            || {
+                ctx.memory.accounted_allocator_for(
+                    MemoryTag::BaseTable,
+                    MemoryAccountingClass::NonRevocable,
+                )
+            },
+            ctx.cancel,
+        )?;
         Ok(SinkPoll::NeedMoreInput)
     }
 
@@ -79,6 +92,7 @@ impl WindowBuildSinkExec {
             ));
         };
         global.handle.append_chunks(&mut local.chunks)?;
+        local.router = Default::default();
         Ok(MergePoll::Done)
     }
 
@@ -92,7 +106,7 @@ impl WindowBuildSinkExec {
 
     pub(crate) fn finish_work(
         &self,
-        _ctx: &mut OperatorFinishContext,
+        ctx: &mut OperatorFinishContext,
         global: &SinkGlobal,
     ) -> Result<FinishWork> {
         let SinkGlobal::WindowBuild(global) = global else {
@@ -100,13 +114,7 @@ impl WindowBuildSinkExec {
                 "window build sink global state mismatch",
             ));
         };
-        let handle = global.handle.clone();
-        let spec = self.spec.clone();
-        Ok(FinishWork::Parallel(FinishTaskGroupRunner::group(
-            "window_seal",
-            MemoryClass::Blocking,
-            move |ctx| handle.seal(&spec, ctx.query.allocator(MemoryTag::BaseTable)),
-        )))
+        super::finalize::prepare_window_finalize(global.handle.clone(), &self.spec, ctx)
     }
 
     pub(crate) fn finish(
@@ -119,10 +127,9 @@ impl WindowBuildSinkExec {
                 "window build sink global state mismatch",
             ));
         };
+        ctx.cancel.check()?;
         if !global.handle.is_sealed() {
-            global
-                .handle
-                .seal(&self.spec, ctx.query.allocator(MemoryTag::BaseTable))?;
+            return Err(paro_error::internal("window finish group did not publish"));
         }
         Ok(FinishPoll::Done)
     }

@@ -1,7 +1,9 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::index::fulltext::tokenizer::TokenizerKind;
@@ -156,6 +158,29 @@ pub(crate) struct SearchView {
 }
 
 impl SearchView {
+    /// Content identity of every optimizer-visible search alternative.
+    ///
+    /// `version` is intentionally excluded: publication and maintenance may
+    /// replace an immutable registry view without changing the definitions,
+    /// queryability, generation statistics, or provider contract seen by the
+    /// optimizer. Plans depend on those inputs, not on publication traffic.
+    pub(crate) fn planning_signature(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        b"paro.search-planning-signature.v1".hash(&mut hasher);
+        for (definition_id, state) in &self.definitions {
+            definition_id.hash(&mut hasher);
+            let bytes = serde_json::to_vec(&(
+                &state.definition,
+                &state.origin,
+                &state.generation,
+                state.capability.is_some(),
+            ))
+            .expect("validated search planning state must be serializable");
+            bytes.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     pub(crate) fn generation_artifact_count(&self, definition_id: u64) -> Option<usize> {
         self.definitions
             .get(&definition_id)?
@@ -571,5 +596,17 @@ mod tests {
 
         assert_eq!(state.next_generation_id, 8);
         assert_eq!(state.next_build_epoch, 12);
+    }
+
+    #[test]
+    fn planning_signature_ignores_publication_only_revision() {
+        let baseline = SearchView::default();
+        let mut republished = baseline.clone();
+        republished.version = 19;
+
+        assert_eq!(
+            baseline.planning_signature(),
+            republished.planning_signature()
+        );
     }
 }

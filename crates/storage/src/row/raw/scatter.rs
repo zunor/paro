@@ -55,6 +55,7 @@ pub fn build_rows(
         let allocation = {
             let allocator = segment.allocator_mut();
             let accounting_class = allocator.accounting_class();
+            let memory_tag = allocator.memory_tag();
             let heap_sizes_opt = if layout.all_constant() {
                 None
             } else {
@@ -63,7 +64,7 @@ pub fn build_rows(
 
             allocator.allocate_rows(remaining, heap_sizes_opt).map_err(|err| {
                 paro_error::internal(format!(
-                    "failed to allocate row slots: class={accounting_class:?}, offset={offset}, remaining={remaining}, count={count}, error={err}"
+                    "failed to allocate row slots: tag={memory_tag:?}, class={accounting_class:?}, offset={offset}, remaining={remaining}, count={count}, error={err}"
                 ))
             })?
         };

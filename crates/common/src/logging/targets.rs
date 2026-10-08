@@ -21,6 +21,9 @@
 /// Query execution logs
 pub const QUERY: &str = "paro::query";
 
+/// Machine-readable, monotonic per-statement phase evidence.
+pub const STATEMENT_TRACE: &str = "paro::statement_trace";
+
 /// SQL parser logs
 pub const PARSER: &str = "paro::parser";
 

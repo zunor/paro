@@ -64,6 +64,30 @@ impl BlockCompressionCodec for ZstdBlockCompression {
         Ok(output)
     }
 
+    fn decompress_into(
+        &self,
+        input: &[u8],
+        uncompressed_size: usize,
+        output: &mut [u8],
+    ) -> Result<()> {
+        if output.len() != uncompressed_size {
+            return Err(paro_error::invalid_input(format!(
+                "ZSTD destination size {} does not match expected size {}",
+                output.len(),
+                uncompressed_size
+            )));
+        }
+        let decoded_size = zstd::bulk::decompress_to_buffer(input, output)
+            .map_err(|e| paro_error::data_corrupted(format!("ZSTD decompression failed: {}", e)))?;
+        if decoded_size != uncompressed_size {
+            return Err(paro_error::data_corrupted(format!(
+                "ZSTD decoded size {} does not match expected size {}",
+                decoded_size, uncompressed_size
+            )));
+        }
+        Ok(())
+    }
+
     fn max_compressed_len(&self, input_len: usize) -> usize {
         zstd::zstd_safe::compress_bound(input_len)
     }

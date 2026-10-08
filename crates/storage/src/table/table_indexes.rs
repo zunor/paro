@@ -15,6 +15,13 @@ use paro_common::error::Result;
 use std::sync::Arc;
 
 impl TableHandle {
+    /// Content identity of table-local search state observed during physical
+    /// planning. This covers both positive capability tokens and negative
+    /// observations made while choosing an ordinary scan.
+    pub fn search_planning_signature(&self) -> u64 {
+        self.search_registry.planning_signature()
+    }
+
     // ===== Index API facade =====
     pub fn index_count(&self) -> usize {
         self.runtime_indexes.index_count()

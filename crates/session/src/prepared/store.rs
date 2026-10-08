@@ -8,10 +8,11 @@ use crate::completion::StatementCompletion;
 use crate::dispatch::UtilityCommand;
 use crate::prepared::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
+use paro_context::StatementTrace;
 use paro_execution::query_executor::compiled::{
     CompiledStatement, ExecutionRequest, ResultColumnDesc,
 };
-use paro_parser::ast::Statement;
+use paro_parser::ast::{ExplainOption, Statement};
 
 use super::portal::{
     values_to_text, CursorHoldability, FormatCode, PortalExecutionState, PortalSnapshotRetention,
@@ -46,12 +47,23 @@ pub struct PreparedStatementEntry {
     pub generic_plan: Option<CompiledStatement>,
     /// Successful generic-plan selections by SQL EXECUTE or protocol Bind.
     pub generic_plan_uses: i64,
+    /// Terminal identity of the compilation that produced `generic_plan`.
+    /// The decision is not kept active by the prepared statement; later
+    /// executions reference the immutable historical compile receipt.
+    pub compile_decision_id: Option<u64>,
     pub source: PreparedStatementSource,
+    /// Trace started at protocol Parse and carried into the first Bind/portal.
+    pub statement_trace: Option<Arc<StatementTrace>>,
 }
 
 #[derive(Debug, Clone)]
 pub enum PortalKind {
-    Query(ExecutionRequest),
+    Query(Box<ExecutionRequest>),
+    CompileExplain {
+        target: Box<Statement>,
+        options: Vec<ExplainOption>,
+        parameter_env: TypedParameterEnv,
+    },
     Materialized,
     Utility(Box<UtilityCommand>),
     ClientCopy {
@@ -76,6 +88,8 @@ pub struct PortalEntry {
     pub completion: Option<StatementCompletion>,
     pub created_generation: u64,
     pub transaction_owned: bool,
+    /// Trace for the protocol operation currently consuming this portal.
+    pub statement_trace: Option<Arc<StatementTrace>>,
 }
 
 #[derive(Debug, Default)]
@@ -112,9 +126,15 @@ impl PreparedState {
         removed
     }
 
-    pub fn clear_statements(&mut self) {
-        self.named_statements.clear();
-        self.unnamed_statement = None;
+    pub fn clear_statements(&mut self) -> Vec<PreparedStatementEntry> {
+        let mut removed = self
+            .named_statements
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>();
+        if let Some(entry) = self.unnamed_statement.take() {
+            removed.push(entry);
+        }
         self.named_portals
             .retain(|_, portal| matches!(portal.statement_ref, PortalStatementRef::None));
         if self
@@ -124,6 +144,7 @@ impl PreparedState {
         {
             self.unnamed_portal = None;
         }
+        removed
     }
 
     pub fn set_unnamed_statement(
@@ -305,7 +326,9 @@ mod tests {
             result_schema: Vec::new(),
             generic_plan: None,
             generic_plan_uses: 0,
+            compile_decision_id: None,
             source: PreparedStatementSource::Protocol,
+            statement_trace: None,
         }
     }
 
@@ -332,6 +355,7 @@ mod tests {
             completion: None,
             created_generation: 0,
             transaction_owned,
+            statement_trace: None,
         }
     }
 

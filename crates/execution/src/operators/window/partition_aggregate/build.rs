@@ -416,13 +416,17 @@ pub struct PartitionAggregateWindowBuildSinkExec {
 impl PartitionAggregateWindowBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         self.spec.verify()?;
-        if ctx.query.session.limits.force_external && !query_has_temporary_directory(ctx.query) {
+        let spill_policy = self.spec.aggregate.spill_policy;
+        if spill_policy == crate::physical::specs::SpillExecutionPolicy::ForcedExternal
+            && !query_has_temporary_directory(ctx.query)
+        {
             return Err(paro_error::out_of_memory(
-                "force_external partition aggregate window requires a temporary directory",
+                "forced-spill partition aggregate window requires a temporary directory",
             ));
         }
         let handle = ctx.handles.get(self.handle)?;
         if self.spec.domain == PartitionAggregateDomain::Keyed
+            && spill_policy != crate::physical::specs::SpillExecutionPolicy::InMemory
             && query_has_temporary_directory(ctx.query)
         {
             ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
@@ -430,7 +434,7 @@ impl PartitionAggregateWindowBuildSinkExec {
                     Arc::clone(&handle),
                     self.spec.clone(),
                     ctx.query.session.buffer_pool().clone(),
-                    ctx.query.session.number_of_threads(),
+                    ctx.query.max_parallel_tasks(),
                     partition_aggregate_table_memory(ctx.query, true),
                 ),
             ));
@@ -448,7 +452,7 @@ impl PartitionAggregateWindowBuildSinkExec {
                 external_payloads: Vec::new(),
             }));
             if query_has_temporary_directory(ctx.query)
-                && !ctx.query.session.limits.force_external
+                && spill_policy == crate::physical::specs::SpillExecutionPolicy::Adaptive
                 && !partition_aggregate_preemptive_spill_enabled(ctx.query)
             {
                 let owner: Arc<dyn paro_common::memory::MemoryOwner> = ctx.query.memory.clone();
@@ -484,9 +488,14 @@ impl PartitionAggregateWindowBuildSinkExec {
     ) -> Result<SinkLocal> {
         if self.spec.domain == PartitionAggregateDomain::Global {
             let handle = ctx.handles.get(self.handle)?;
-            let spillable = query_has_temporary_directory(ctx.query);
-            let force_external = ctx.query.session.limits.force_external
-                || partition_aggregate_preemptive_spill_enabled(ctx.query);
+            let spillable = self.spec.aggregate.spill_policy
+                != crate::physical::specs::SpillExecutionPolicy::InMemory
+                && query_has_temporary_directory(ctx.query);
+            let force_external = self.spec.aggregate.spill_policy
+                == crate::physical::specs::SpillExecutionPolicy::ForcedExternal
+                || (self.spec.aggregate.spill_policy
+                    == crate::physical::specs::SpillExecutionPolicy::Adaptive
+                    && partition_aggregate_preemptive_spill_enabled(ctx.query));
             let payloads = Arc::new(parking_lot::Mutex::new(if spillable && force_external {
                 GlobalAggregatePayloadBacking::External(global_detail_spill_writer(
                     &self.spec, ctx.query,
@@ -542,11 +551,19 @@ impl PartitionAggregateWindowBuildSinkExec {
                 ctx.query.session.as_ref(),
             )
         });
-        let spillable = query_has_temporary_directory(ctx.query);
-        let force_external = ctx.query.session.limits.force_external
-            || partition_aggregate_preemptive_spill_enabled(ctx.query);
+        let spillable = self.spec.aggregate.spill_policy
+            != crate::physical::specs::SpillExecutionPolicy::InMemory
+            && query_has_temporary_directory(ctx.query);
+        let force_external = self.spec.aggregate.spill_policy
+            == crate::physical::specs::SpillExecutionPolicy::ForcedExternal
+            || (self.spec.aggregate.spill_policy
+                == crate::physical::specs::SpillExecutionPolicy::Adaptive
+                && partition_aggregate_preemptive_spill_enabled(ctx.query));
         let memory = partition_aggregate_table_memory(ctx.query, spillable);
-        let radix_bits = aggregate_spill_radix_bits(ctx.query.session.number_of_threads());
+        let radix_bits = aggregate_spill_radix_bits(
+            ctx.query.max_parallel_tasks(),
+            ctx.query.memory.capacity_bytes(),
+        );
         let group_refs = group_payload_refs(&self.spec.aggregate)?.into_boxed_slice();
         let backing = Arc::new(parking_lot::Mutex::new(if force_external && spillable {
             PartitionAggregateLocalBacking::External {
@@ -717,7 +734,10 @@ impl PartitionAggregateWindowBuildSinkExec {
                         ctx.query.session.buffer_pool().clone(),
                         &self.spec.aggregate.payload_types,
                         &local.group_refs,
-                        aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
+                        aggregate_spill_radix_bits(
+                            ctx.query.max_parallel_tasks(),
+                            ctx.query.memory.capacity_bytes(),
+                        ),
                         partition_aggregate_table_memory(ctx.query, true),
                     )?)
                 } else if let Err(error) = update_hash_aggregate_tables_with_scratch(
@@ -744,7 +764,10 @@ impl PartitionAggregateWindowBuildSinkExec {
                         ctx.query.session.buffer_pool().clone(),
                         &self.spec.aggregate.payload_types,
                         &local.group_refs,
-                        aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
+                        aggregate_spill_radix_bits(
+                            ctx.query.max_parallel_tasks(),
+                            ctx.query.memory.capacity_bytes(),
+                        ),
                         partition_aggregate_table_memory(ctx.query, true),
                     )?)
                 } else {
@@ -976,7 +999,7 @@ fn seal_handle(
         partition_aggregate_table_memory(ctx.query, query_has_temporary_directory(ctx.query)),
         index_memory,
         ctx.query.session.buffer_pool().clone(),
-        ctx.query.session.number_of_threads(),
+        ctx.query.max_parallel_tasks(),
         ctx.cancel,
     )?;
     record_partition_aggregate_spill(handle, ctx)
@@ -1028,6 +1051,6 @@ fn partition_aggregate_preemptive_spill_enabled(
         return false;
     }
     let threshold = PARTITION_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD
-        .saturating_mul(query.session.number_of_threads().max(1));
+        .saturating_mul(query.max_parallel_tasks());
     capacity <= threshold
 }

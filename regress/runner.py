@@ -93,6 +93,7 @@ class RunnerConfig:
     report_dir: Path
     runtime_profiles: Mapping[str, RuntimeProfile]
     managed_runtime_env: tuple[str, ...]
+    optimizer_verify: bool | None = None
 
     @property
     def cases_dir(self) -> Path:
@@ -172,7 +173,7 @@ class Reporter:
         self.config = config
         self.outcomes: list[CaseOutcome] = []
         self.case_stats: dict[Path, CaseSummary] = {}
-        
+
         # Initialize files
         self.config.report_txt_path.write_text("", encoding="utf-8")
         self.config.error_txt_path.write_text("", encoding="utf-8")
@@ -180,14 +181,14 @@ class Reporter:
     def record(self, outcome: CaseOutcome, stats: CaseSummary):
         self.outcomes.append(outcome)
         self.case_stats[outcome.path] = stats
-        
+
         # Append to report.txt (except summary line which comes last)
         rel_path = outcome.path.relative_to(self.config.root_dir).as_posix()
         line = (f"[{rel_path}] COST : {outcome.elapsed_seconds:.3f}s, "
                 f"TOTAL :{stats.total}, SUCCESS :{stats.success}, FAILED :{stats.failed}, "
                 f"IGNORED :{stats.ignored}, ABNORMAL :{stats.abnormal}, "
                 f"SUCCESS RATE : {stats.success_rate}%\n")
-        
+
         with self.config.report_txt_path.open("a", encoding="utf-8") as f:
             f.write(line)
 
@@ -216,7 +217,7 @@ class Reporter:
                   f"SUCCESS :{summary.passed}, FAILED :{summary.failed}, "
                   f"IGNORED :{summary.skipped}, ABNORMAL :0, "
                   f"SUCCESS RATE : {int((summary.passed / (summary.passed + summary.failed + summary.new or 1)) * 100)}%\n")
-        
+
         self.config.report_txt_path.write_text(header + content, encoding="utf-8")
 
 
@@ -227,6 +228,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--database", help="Database name")
     parser.add_argument("--user", help="Database user")
     parser.add_argument("--password", help="Database password")
+    parser.add_argument("--report-dir", type=Path, help="Owned output directory for this run")
+    parser.add_argument("--optimizer-verify", choices=("on", "off"),
+                        help="Set optimizer verification on every connection, including restarts")
     parser.add_argument(
         "--update",
         action="store_true",
@@ -328,7 +332,9 @@ def resolve_config(
     if jobs <= 0:
         raise RunnerError(f"invalid jobs: {jobs}")
 
-    report_dir = root / "report"
+    report_dir = getattr(args, "report_dir", None) or root / "report"
+    if getattr(args, "report_dir", None) is not None and report_dir.exists():
+        raise RunnerError("explicit report directory must not already exist")
 
     return RunnerConfig(
         host=host,
@@ -347,6 +353,8 @@ def resolve_config(
         report_dir=report_dir,
         runtime_profiles=runtime_profiles,
         managed_runtime_env=managed_runtime_env,
+        optimizer_verify=(None if getattr(args, "optimizer_verify", None) is None
+                          else args.optimizer_verify == "on"),
     )
 
 
@@ -443,7 +451,7 @@ def setup_logging(log_path: Path, verbose: bool):
             logging.StreamHandler(sys.stdout) if False else logging.NullHandler() # We handle stdout manually
         ]
     )
-    # Redirect some manual prints to logger if needed, 
+    # Redirect some manual prints to logger if needed,
     # but for now we just use logging.info in the runner.
 
 
@@ -528,7 +536,7 @@ def run_single_case(conn: Any, case_path: Path, config: RunnerConfig) -> tuple[C
         elapsed = time.perf_counter() - started
         stats.failed = 1 # Simplified: any error fails the file
         logging.error(f"Case failed: {case_path}\n{exc}")
-        
+
         error_info = None
         if isinstance(exc, ResultMismatch):
             error_info = {
@@ -537,7 +545,7 @@ def run_single_case(conn: Any, case_path: Path, config: RunnerConfig) -> tuple[C
                 "expected": exc.expected,
                 "actual": exc.actual,
             }
-            
+
         return CaseOutcome(
             path=case_path,
             status=_STATUS_FAIL,
@@ -588,7 +596,7 @@ def _prepare_case_blocks(case_path: Path, blocks: List[Any], config: RunnerConfi
         if sql == block.sql:
             prepared_blocks.append(block)
         else:
-            prepared_blocks.append(replace(block, sql=sql))
+            prepared_blocks.append(replace(block, sql=sql, source_sql=block.transcript_sql))
     return prepared_blocks
 
 
@@ -653,7 +661,7 @@ def run_cases(conn: Any, case_files: Iterable[Path], config: RunnerConfig, repor
             rel_path = case_path.relative_to(config.root_dir).as_posix()
             prefix = _colorize("RUN ", _CYAN)
             print(f"  {prefix}  {rel_path}")
-        
+
         outcome, stats = run_single_case(conn, case_path, config)
         outcomes.append(outcome)
         reporter.record(outcome, stats)
@@ -696,14 +704,14 @@ def main(argv: list[str] | None = None) -> int:
 
         reporter = Reporter(config)
         started = time.perf_counter()
-        
+
         outcomes = []
         for case_path in case_files:
             if config.verbose:
                 rel_path = case_path.relative_to(config.root_dir).as_posix()
                 prefix = _colorize("RUN ", _CYAN)
                 print(f"  {prefix}  {rel_path}")
-            
+
             conn = _open_connection(config)
             try:
                 outcome, stats = run_single_case(conn, case_path, config)
@@ -716,7 +724,7 @@ def main(argv: list[str] | None = None) -> int:
         elapsed = time.perf_counter() - started
         summary = summarize(outcomes, elapsed_seconds=elapsed, reporter=reporter)
         reporter.finalize(summary)
-        
+
         _print_summary(summary)
         print(f"\nDetailed report: {config.report_txt_path}")
         print(f"Error details:   {config.error_txt_path}")
@@ -756,6 +764,15 @@ def _open_connection(
         ) from exc
 
     conn.autocommit = True
+    if config.optimizer_verify is not None:
+        try:
+            with conn.cursor() as cursor:
+                if config.optimizer_verify is not None:
+                    cursor.execute("SET optimizer_verify = " +
+                                   ("true" if config.optimizer_verify else "false"))
+        except Exception:
+            conn.close()
+            raise
     return conn
 
 
@@ -785,6 +802,7 @@ def _restart_server(conn: Any, config: RunnerConfig, *, options: Mapping[str, st
     connection = _connection_target_from_active(conn, config)
     listener_pid = _discover_listener_pid(config.port)
     command = _discover_process_command(listener_pid)
+    working_directory = _discover_process_cwd(listener_pid)
 
     try:
         conn.close()
@@ -799,7 +817,7 @@ def _restart_server(conn: Any, config: RunnerConfig, *, options: Mapping[str, st
     try:
         process = subprocess.Popen(
             shlex.split(command),
-            cwd=config.root_dir.parent,
+            cwd=working_directory,
             env=_build_runtime_profile_env(config, profile),
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -948,6 +966,21 @@ def _discover_process_command(pid: int) -> str:
     if result.returncode != 0 or not command:
         raise ExecutionError(f"failed to inspect Paro command line for pid {pid}")
     return command
+
+
+def _discover_process_cwd(pid: int) -> Path:
+    """Preserve relative storage/config paths before terminating the owner."""
+    proc_path = Path(f"/proc/{pid}/cwd")
+    if proc_path.exists():
+        return proc_path.resolve(strict=True)
+    result = subprocess.run(
+        ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+        check=False, capture_output=True, text=True,
+    )
+    paths = [Path(line[1:]) for line in result.stdout.splitlines() if line.startswith("n")]
+    if result.returncode != 0 or len(paths) != 1 or not paths[0].is_absolute() or not paths[0].is_dir():
+        raise ExecutionError(f"failed to inspect working directory for pid {pid}")
+    return paths[0]
 
 
 def _wait_for_process_exit(pid: int, *, timeout_seconds: float) -> None:

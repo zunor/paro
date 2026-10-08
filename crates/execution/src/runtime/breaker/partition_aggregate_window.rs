@@ -12,6 +12,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, ErrorClass, Result};
 use paro_common::memory::{MemoryAccountingContext, MemoryError, MemoryResult};
 use paro_common::vector::{SelectionVector, ValidatedVectorSelection, Vector, VECTOR_SIZE};
+use paro_planner::expression::Expression;
 use paro_storage::row::{RowSpillWriter, RowStoreSpillWriter};
 
 use crate::memory_runtime::{ReclaimStats, Reclaimer, SpillCost};
@@ -71,7 +72,7 @@ impl PartitionAggregatePendingSpillReclaimer {
             handle,
             spec,
             buffer_pool,
-            radix_bits: aggregate_spill_radix_bits(parallelism),
+            radix_bits: aggregate_spill_radix_bits(parallelism, usize::MAX),
             memory,
         }
     }
@@ -308,9 +309,14 @@ impl PartitionAggregateWindowHandle {
                 result_chunks.push(output);
             }
             let index = FinalizedPartitionIndex::try_new(
-                spec.aggregate.groups[0].return_type(),
-                spec.aggregate_column_count(),
+                spec.aggregate
+                    .groups
+                    .iter()
+                    .map(Expression::return_type)
+                    .collect(),
+                result_types[spec.aggregate.grouping_key_count..].to_vec(),
                 result_chunks,
+                allocator.clone(),
                 index_memory.clone(),
             )?;
             Ok(PartitionAggregateSnapshot::InMemory {
@@ -483,7 +489,7 @@ fn seal_external(
     parallelism: usize,
     cancel: &paro_context::StatementCancellation,
 ) -> Result<PartitionAggregateSnapshot> {
-    let initial_radix_bits = aggregate_spill_radix_bits(parallelism);
+    let initial_radix_bits = aggregate_spill_radix_bits(parallelism, usize::MAX);
     let mut spills = Vec::with_capacity(pending.len());
     for local in pending {
         cancel.check()?;
@@ -669,9 +675,14 @@ fn finalize_partition_index(
         chunks.push(output);
     }
     FinalizedPartitionIndex::try_new(
-        spec.aggregate.groups[0].return_type(),
-        spec.aggregate_column_count(),
+        spec.aggregate
+            .groups
+            .iter()
+            .map(Expression::return_type)
+            .collect(),
+        result_types[spec.aggregate.grouping_key_count..].to_vec(),
         chunks,
+        allocator,
         memory,
     )
 }
@@ -687,10 +698,7 @@ fn append_external_output(
     let keys = build_groups_chunk(payload, group_refs)?;
     let mut selection =
         SelectionVector::try_with_capacity(payload.size().max(1), allocator.clone())?;
-    selection.set_len(payload.size());
-    for row in 0..payload.size() {
-        selection.try_set(row, index.lookup(&keys, row)?.0 as usize)?;
-    }
+    index.select_rows(&keys, &mut selection)?;
     let child_count = index
         .aggregate_columns()
         .first()
@@ -745,12 +753,13 @@ mod tests {
     use crate::pipeline::handles::{BreakerHandleId, BreakerHandleKind};
 
     fn reference(index: usize, ty: LogicalType) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, ty))
+        Expression::Reference(ReferenceExpression::new(index, ty).into())
     }
 
     fn test_spec() -> PartitionAggregateWindowSpec {
         let aggregate = AggregateSpec {
             grouping_key_count: 1,
+            initial_lookup_hash_key_count: 1,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([
@@ -761,17 +770,21 @@ mod tests {
             groups: Box::new([reference(0, LogicalType::Integer)]),
             group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
             grouping_sets: Box::new([]),
-            aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
-                get_count_star_function(),
-                Vec::new(),
-                LogicalType::BigInt,
-            ))]),
+            aggregates: Box::new([Expression::Aggregate(
+                AggregateExpression::new(
+                    get_count_star_function(),
+                    Vec::new(),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )]),
             grouping_functions: Box::new([]),
             aggregate_inputs: Box::new([Box::new([])]),
             aggregate_filters: Box::new([None]),
             aggregate_orders: Box::new([Box::new([])]),
             post_reduction: None,
             having_filter: Box::new([]),
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
             perfect_hash: None,
             output_names: Box::new(["k".to_string(), "count".to_string()]),
             output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
@@ -856,7 +869,13 @@ mod tests {
         }
 
         let stats = handle
-            .reclaim_pending(2, &spec, buffer_pool, aggregate_spill_radix_bits(1), memory)
+            .reclaim_pending(
+                2,
+                &spec,
+                buffer_pool,
+                aggregate_spill_radix_bits(1, usize::MAX),
+                memory,
+            )
             .expect("reclaim pending locals");
         assert_eq!(stats.reclaimed_bytes, 2);
         assert!(stats.spilled_bytes > 0);
@@ -1010,7 +1029,7 @@ mod tests {
         let mut spill = AggregatePayloadSpillBuffer::new(
             Arc::clone(&buffer_pool),
             spec.aggregate.payload_types.iter().cloned(),
-            aggregate_spill_radix_bits(1),
+            aggregate_spill_radix_bits(1, usize::MAX),
             table_memory.clone(),
         )
         .expect("spill");

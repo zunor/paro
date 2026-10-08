@@ -7,7 +7,6 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::DecodedVectorRef;
-use paro_storage::statistics::{BaseStatistics, StringStats};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PerfectHashKeyDomain {
@@ -38,18 +37,6 @@ impl PerfectHashKeyDomain {
 
     pub(crate) fn logical_type(&self) -> &LogicalType {
         &self.logical_type
-    }
-
-    pub(crate) fn min_max_from_stats(
-        &self,
-        stats: Option<&BaseStatistics>,
-    ) -> Option<(i128, i128)> {
-        match self.codec {
-            PerfectHashKeyCodec::Integer => stats
-                .and_then(integer_min_max_from_stats)
-                .or_else(|| integer_type_bounds(&self.logical_type)),
-            PerfectHashKeyCodec::SingleByteVarchar => single_byte_varchar_min_max(stats?),
-        }
     }
 
     pub(crate) fn encode_decoded(
@@ -137,52 +124,6 @@ where
     })
 }
 
-fn integer_min_max_from_stats(stats: &BaseStatistics) -> Option<(i128, i128)> {
-    let min = stats.min_value().and_then(|value| integer_value(&value))?;
-    let max = stats.max_value().and_then(|value| integer_value(&value))?;
-    Some((min, max))
-}
-
-fn integer_value(value: &Value) -> Option<i128> {
-    match value {
-        Value::TinyInt(v) => Some(*v as i128),
-        Value::SmallInt(v) => Some(*v as i128),
-        Value::Integer(v) => Some(*v as i128),
-        Value::BigInt(v) => Some(*v as i128),
-        Value::HugeInt(v) => Some(*v),
-        Value::UTinyInt(v) => Some(*v as i128),
-        Value::USmallInt(v) => Some(*v as i128),
-        Value::UInteger(v) => Some(*v as i128),
-        Value::UBigInt(v) => Some(*v as i128),
-        Value::UHugeInt(v) => i128::try_from(*v).ok(),
-        _ => None,
-    }
-}
-
-fn integer_type_bounds(ty: &LogicalType) -> Option<(i128, i128)> {
-    match ty {
-        LogicalType::TinyInt => Some((i8::MIN as i128, i8::MAX as i128)),
-        LogicalType::SmallInt => Some((i16::MIN as i128, i16::MAX as i128)),
-        LogicalType::Integer => Some((i32::MIN as i128, i32::MAX as i128)),
-        LogicalType::BigInt => Some((i64::MIN as i128, i64::MAX as i128)),
-        LogicalType::UTinyInt => Some((0, u8::MAX as i128)),
-        LogicalType::USmallInt => Some((0, u16::MAX as i128)),
-        LogicalType::UInteger => Some((0, u32::MAX as i128)),
-        LogicalType::UBigInt => Some((0, u64::MAX as i128)),
-        _ => None,
-    }
-}
-
-fn single_byte_varchar_min_max(stats: &BaseStatistics) -> Option<(i128, i128)> {
-    let string_stats = StringStats::get_data(stats)?;
-    if string_stats.max_string_length()? > 1 {
-        return None;
-    }
-    let min = encode_single_byte_varchar(string_stats.min_bytes())?;
-    let max = encode_single_byte_varchar(string_stats.max_bytes())?;
-    (min <= max).then_some((min, max))
-}
-
 fn encode_single_byte_varchar(value: &[u8]) -> Option<i128> {
     match value {
         [] => Some(0),
@@ -229,17 +170,5 @@ mod tests {
             Value::Varchar("R".to_string())
         );
         assert!(domain.value_from_encoded(257).is_err());
-    }
-
-    #[test]
-    fn single_byte_varchar_stats_form_a_compact_domain() {
-        let domain = PerfectHashKeyDomain::try_new(LogicalType::Varchar).unwrap();
-        let mut stats = StringStats::create_empty(LogicalType::Varchar);
-        StringStats::update(&mut stats, "A");
-        StringStats::update(&mut stats, "R");
-        assert_eq!(domain.min_max_from_stats(Some(&stats)), Some((66, 83)));
-
-        StringStats::update(&mut stats, "AB");
-        assert_eq!(domain.min_max_from_stats(Some(&stats)), None);
     }
 }

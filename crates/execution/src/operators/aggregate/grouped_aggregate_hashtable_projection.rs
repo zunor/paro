@@ -101,6 +101,7 @@ impl GroupedAggregateHashTable {
         start: usize,
         count: usize,
         prefix_count: usize,
+        hash_contract: RoutingHashContract,
         run_starts: &mut SelectionVector,
         hashes: &mut Vector,
     ) -> Result<usize> {
@@ -109,6 +110,12 @@ impl GroupedAggregateHashTable {
             return Err(paro_error::internal(format!(
                 "Serialized group run prefix exceeds layout: prefix={prefix_count}, groups={}",
                 self.layout.group_count()
+            )));
+        }
+        if hash_contract.width() > prefix_count {
+            return Err(paro_error::internal(format!(
+                "Serialized group run hash width is invalid: hashed={}, prefix={prefix_count}",
+                hash_contract.width()
             )));
         }
         if run_starts.capacity() < count {
@@ -137,8 +144,11 @@ impl GroupedAggregateHashTable {
         starts[0] = 0;
         let mut previous = self.row_ptr(start);
         let mut previous_hash = unsafe {
-            self.layout
-                .hash_serialized_group_prefix(previous, prefix_count, &self.varlen_heap)?
+            self.layout.hash_serialized_group_prefix(
+                previous,
+                hash_contract.width(),
+                &self.varlen_heap,
+            )?
         };
         unsafe { *output = previous_hash };
         let mut run_count = 1usize;
@@ -161,7 +171,7 @@ impl GroupedAggregateHashTable {
                 previous_hash = unsafe {
                     self.layout.hash_serialized_group_prefix(
                         current,
-                        prefix_count,
+                        hash_contract.width(),
                         &self.varlen_heap,
                     )?
                 };
@@ -242,6 +252,8 @@ impl GroupedAggregateHashTable {
         self.ensure_capacity_for(row_count)?;
         self.ensure_row_storage_capacity(row_count)?;
 
+        let incoming_contract = IncomingHashContract::Routing(self.hash_contract.routing());
+
         addresses.try_set_count(row_count)?;
         let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
         let inline_layout = self.inline_key_layout.clone();
@@ -250,7 +262,9 @@ impl GroupedAggregateHashTable {
             .map(|_| self.inline_key_storage_mut_ptr())
             .transpose()?;
         let mut new_state_ptrs = Vec::new();
-        for (row_idx, &hash) in hashes.iter().enumerate() {
+        let observe_prefix_probes = self.hash_contract.lookup_is_prefix();
+        let mut max_prefix_probe_distance = 0usize;
+        for (row_idx, &incoming_hash) in hashes.iter().enumerate() {
             let source_row_idx = source_rows.source_row(row_idx)?;
             if source_row_idx >= source.count {
                 return Err(paro_error::internal(format!(
@@ -259,6 +273,17 @@ impl GroupedAggregateHashTable {
                 )));
             }
             let source_row = source.row_ptr(source_row_idx);
+            let hash = if incoming_contract.width() == self.hash_contract.lookup().width() {
+                incoming_hash
+            } else {
+                unsafe {
+                    source.layout.hash_serialized_group_prefix(
+                        source_row,
+                        self.hash_contract.lookup().width(),
+                        &source.varlen_heap,
+                    )?
+                }
+            };
             let inline_key = inline_layout
                 .as_ref()
                 .map(|layout| unsafe {
@@ -266,6 +291,7 @@ impl GroupedAggregateHashTable {
                 })
                 .transpose()?;
             let mut slot = self.slot_for_hash(hash);
+            let mut probe_distance = 0usize;
             loop {
                 let entry = self.entries[slot];
                 if !entry.is_occupied() {
@@ -313,9 +339,15 @@ impl GroupedAggregateHashTable {
                     }
                     break;
                 }
+                probe_distance += 1;
+                if observe_prefix_probes {
+                    max_prefix_probe_distance = max_prefix_probe_distance.max(probe_distance);
+                }
                 slot = (slot + 1) & self.bitmask;
             }
         }
+
+        self.finish_prefix_probe_batch(max_prefix_probe_distance)?;
 
         if !new_state_ptrs.is_empty() {
             let new_addresses = pointer_vector_from_slice(&new_state_ptrs, self.allocator())?;

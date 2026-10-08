@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paro Benchmark"
+  short_description: "Explore Paro performance and run engineering gates"
+  default_prompt: "Use $paro-benchmark to investigate the requested performance question with a scoped experiment and no baseline changes."

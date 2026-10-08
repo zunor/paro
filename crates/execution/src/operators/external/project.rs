@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::operators::external::batching::SubmissionBatchPolicy;
 use crate::operators::external::runtime_bridge::{
-    ProjectSubmission, RuntimeBridgeOutcome, RuntimeBridgeResponse,
+    ExternalRuntimeBridge, ProjectSubmission, RuntimeBridgeOutcome, RuntimeBridgeResponse,
 };
 use crate::physical::specs::ExternalProjectSpec;
 use crate::runtime::context::{
@@ -24,6 +24,7 @@ use paro_common::error::{self as paro_error, Result};
 #[derive(Debug, Clone)]
 pub struct ExternalProjectTransformExec {
     pub spec: ExternalProjectSpec,
+    pub bridge: Arc<ExternalRuntimeBridge>,
 }
 
 impl ExternalProjectTransformExec {
@@ -31,7 +32,7 @@ impl ExternalProjectTransformExec {
         Ok(TransformGlobal::ExternalProject(Arc::new(
             ExternalProjectTransformGlobal {
                 batch_policy: SubmissionBatchPolicy::from_dispatch_policy(
-                    self.spec.bridge.dispatch_policy(),
+                    self.bridge.dispatch_policy(),
                 ),
             },
         )))
@@ -83,7 +84,6 @@ impl ExternalProjectTransformExec {
         };
         local.next_batch_id = local.next_batch_id.saturating_add(1);
         let outcome = self
-            .spec
             .bridge
             .execute_project(ctx.query, &submission, &ctx.memory)?;
         let (response, blocked) = match outcome {
@@ -189,7 +189,7 @@ fn enqueue_external_project_output(
     let mut generated_ref = Chunk::try_init_empty(generated.types().as_slice(), allocator.clone())?;
     generated_ref.reference(generated);
     passthrough.fuse(&mut generated_ref);
-    let policy = SubmissionBatchPolicy::from_dispatch_policy(exec.spec.bridge.dispatch_policy());
+    let policy = SubmissionBatchPolicy::from_dispatch_policy(exec.bridge.dispatch_policy());
     let mut batches = policy.rechunk_output(&passthrough, allocator)?;
     let mut first = batches.pop_front().ok_or_else(|| {
         paro_error::internal("external project produced no output for non-empty input")

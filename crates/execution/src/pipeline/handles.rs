@@ -134,6 +134,13 @@ impl BreakerHandleCatalogBuilder {
         Ok(())
     }
 
+    pub fn producer(&self, id: BreakerHandleId) -> Result<Option<PipelineId>> {
+        self.entries
+            .get(id.index())
+            .map(|entry| entry.producer)
+            .ok_or_else(|| paro_error::internal("unknown breaker handle id"))
+    }
+
     /// Roll back a speculative registration before lowering has attached any
     /// producer or consumer. IDs remain dense, so only the newest entry may be
     /// removed.

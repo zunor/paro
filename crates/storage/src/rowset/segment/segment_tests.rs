@@ -553,6 +553,31 @@ fn late_materialization_adapts_to_observed_batch_density() {
         i32::from_le_bytes(sparse_batch.columns[0].1.data[..4].try_into().unwrap()),
         107
     );
+
+    let mut reusable =
+        SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
+            &segment,
+            vec![0, 1],
+            vec![0],
+            None,
+            Some(PredicateTree::leaf(Predicate::Eq {
+                column_id: 0,
+                value: Value::Integer(7),
+            })),
+            None,
+        )
+        .unwrap();
+    assert_eq!(reusable.reused_predicate_column_count(), 1);
+    let reused_batch = reusable.next_batch_with_rowid_policy(20, false).unwrap();
+    assert_eq!(reused_batch.rows, 1);
+    assert_eq!(
+        i32::from_le_bytes(reused_batch.columns[0].1.data[..4].try_into().unwrap()),
+        7
+    );
+    assert_eq!(
+        i32::from_le_bytes(reused_batch.columns[1].1.data[..4].try_into().unwrap()),
+        107
+    );
 }
 
 #[test]

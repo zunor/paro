@@ -26,7 +26,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::{Vector, VectorSelection, VECTOR_SIZE};
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::{
+use paro_planner::logical::operator::join::{
     JoinComparisonType, JoinCondition, JoinType, MarkJoinSemantics,
 };
 
@@ -1005,7 +1005,7 @@ impl NljUnmatchedSourceExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_planner::operator::join::JoinComparisonType;
+    use paro_planner::logical::operator::join::JoinComparisonType;
 
     #[test]
     fn compare_equal_matching() {

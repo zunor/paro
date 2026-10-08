@@ -288,7 +288,7 @@ impl Segment {
             self.rowset_gen,
             predicate_tree,
             scoring_stats,
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
         )
     }
 

@@ -57,7 +57,9 @@ fn bench_state() -> &'static BenchState {
             ),
             selection,
             input: paro_common::test_utils::test_chunk_from_arc_vectors(vec![flat]),
-            reference_expr: Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
+            reference_expr: Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::BigInt).into(),
+            ),
         }
     })
 }

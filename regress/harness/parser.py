@@ -45,6 +45,10 @@ class Block:
     sql: str
     fixture_refs: Tuple[str, ...] = ()
 
+    # Fixture expansion changes execution SQL, not the stable test identity.
+    # Keep both explicitly; never scrub paths from returned values or errors.
+    source_sql: Optional[str] = None
+
     statement_expect: Optional[str] = None
     expected_count: Optional[int] = None
     error_pattern: Optional[str] = None
@@ -67,6 +71,10 @@ class Block:
     sleep_ms: Optional[int] = None
     wait_expect_interval_ms: Optional[int] = None
     wait_expect_timeout_ms: Optional[int] = None
+
+    @property
+    def transcript_sql(self) -> str:
+        return self.source_sql if self.source_sql is not None else self.sql
 
 
 @dataclass(frozen=True)

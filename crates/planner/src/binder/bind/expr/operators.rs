@@ -23,7 +23,12 @@ pub fn bind_comparison(
     bind_bound_comparison(binder, left, right, comparison_type)
 }
 
-fn bind_bound_comparison(
+/// Bind already-resolved operands to the same normalized physical input type.
+///
+/// Planner-generated comparisons, including `JOIN .. USING`, must use this
+/// path rather than constructing a comparison around independently typed
+/// operands. The expression executor deliberately performs no implicit cast.
+pub(crate) fn bind_bound_comparison(
     binder: &mut ExpressionBinder,
     mut left: Expression,
     mut right: Expression,
@@ -46,11 +51,9 @@ fn bind_bound_comparison(
             CastExpression::add_cast_if_needed(right, target_type, &binder.binder.cast_functions)?;
     }
 
-    Ok(Expression::Comparison(ComparisonExpression::new(
-        comparison_type,
-        left,
-        right,
-    )))
+    Ok(Expression::Comparison(
+        ComparisonExpression::new(comparison_type, left, right).into(),
+    ))
 }
 
 /// Try to bind a comparison and determine the common input type.
@@ -126,28 +129,26 @@ pub fn bind_conjunction(
     let left = binder.bind_child(left)?;
     let right = binder.bind_child(right)?;
 
-    Ok(Expression::Conjunction(ConjunctionExpression::new(
-        conjunction_type,
-        vec![left, right],
-    )))
+    Ok(Expression::Conjunction(
+        ConjunctionExpression::new(conjunction_type, vec![left, right]).into(),
+    ))
 }
 
 /// Binds a unary NOT expression.
 pub fn bind_not(binder: &mut ExpressionBinder, expr: Expr) -> Result<Expression> {
     let bound_child = binder.bind_child(expr)?;
-    Ok(Expression::Operator(OperatorExpression::new_unary(
-        OperatorType::Not,
-        bound_child,
-        LogicalType::Boolean,
-    )))
+    Ok(Expression::Operator(
+        OperatorExpression::new_unary(OperatorType::Not, bound_child, LogicalType::Boolean).into(),
+    ))
 }
 
-/// Binds a LIKE or NOT LIKE expression.
+/// Binds a LIKE-family expression.
 pub fn bind_like(
     binder: &mut ExpressionBinder,
     left: Expr,
     right: Expr,
-    not: bool,
+    case_insensitive: bool,
+    negated: bool,
 ) -> Result<Expression> {
     let mut left = binder.bind_child(left)?;
     let mut right = binder.bind_child(right)?;
@@ -167,18 +168,23 @@ pub fn bind_like(
         )?;
     }
 
-    let like = Expression::Operator(OperatorExpression::new(
-        OperatorType::Like,
-        vec![left, right],
-        LogicalType::Boolean,
-    ));
-
-    if not {
-        Ok(Expression::Operator(OperatorExpression::new_unary(
-            OperatorType::Not,
-            like,
+    let like = Expression::Operator(
+        OperatorExpression::new(
+            if case_insensitive {
+                OperatorType::ILike
+            } else {
+                OperatorType::Like
+            },
+            vec![left, right],
             LogicalType::Boolean,
-        )))
+        )
+        .into(),
+    );
+
+    if negated {
+        Ok(Expression::Operator(
+            OperatorExpression::new_unary(OperatorType::Not, like, LogicalType::Boolean).into(),
+        ))
     } else {
         Ok(like)
     }
@@ -192,11 +198,9 @@ pub fn bind_is_null(binder: &mut ExpressionBinder, expr: Expr, not: bool) -> Res
     } else {
         OperatorType::IsNull
     };
-    Ok(Expression::Operator(OperatorExpression::new_unary(
-        op_type,
-        bound_child,
-        LogicalType::Boolean,
-    )))
+    Ok(Expression::Operator(
+        OperatorExpression::new_unary(op_type, bound_child, LogicalType::Boolean).into(),
+    ))
 }
 
 /// Binds an IN list expression.
@@ -211,16 +215,32 @@ pub fn bind_in_list(
     for item in list {
         children.push(binder.bind_child(item)?);
     }
+    let mut comparison_type = children[0].get_expression_return_type();
+    for child in children.iter().skip(1) {
+        comparison_type = try_bind_comparison(
+            &comparison_type,
+            &child.get_expression_return_type(),
+            ComparisonType::Equal,
+        )?;
+    }
+    let comparison_type = comparison_type.normalize_type();
+    for child in &mut children {
+        if child.return_type() != comparison_type {
+            *child = CastExpression::add_cast_if_needed(
+                child.clone(),
+                comparison_type.clone(),
+                &binder.binder.cast_functions,
+            )?;
+        }
+    }
     let op_type = if not {
         OperatorType::NotIn
     } else {
         OperatorType::In
     };
-    Ok(Expression::Operator(OperatorExpression::new(
-        op_type,
-        children,
-        LogicalType::Boolean,
-    )))
+    Ok(Expression::Operator(
+        OperatorExpression::new(op_type, children, LogicalType::Boolean).into(),
+    ))
 }
 
 /// Binds a BETWEEN expression.
@@ -244,10 +264,9 @@ pub fn bind_between(
         )?;
         let right =
             bind_bound_comparison(binder, bound_expr, bound_high, ComparisonType::GreaterThan)?;
-        Ok(Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            vec![left, right],
-        )))
+        Ok(Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::Or, vec![left, right]).into(),
+        ))
     } else {
         let left = bind_bound_comparison(
             binder,
@@ -261,10 +280,9 @@ pub fn bind_between(
             bound_high,
             ComparisonType::LessThanOrEqual,
         )?;
-        Ok(Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::And,
-            vec![left, right],
-        )))
+        Ok(Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::And, vec![left, right]).into(),
+        ))
     }
 }
 
@@ -304,19 +322,21 @@ pub fn bind_array(binder: &mut ExpressionBinder, exprs: Vec<Expr>) -> Result<Exp
         let mut values = Vec::with_capacity(bound_exprs.len());
         for expr in bound_exprs {
             if let Expression::Constant(constant) = expr {
-                values.push(constant.value);
+                values.push(constant.into_inner().value);
             }
         }
-        Ok(Expression::Constant(ConstantExpression {
-            value: Value::array(child_type, values),
-            return_type,
-        }))
+        Ok(Expression::Constant(
+            ConstantExpression {
+                value: Value::array(child_type, values),
+                return_type,
+            }
+            .into(),
+        ))
     } else {
-        Ok(Expression::Operator(OperatorExpression::new(
-            OperatorType::ArrayConstructor,
-            bound_exprs,
-            return_type,
-        )))
+        Ok(Expression::Operator(
+            OperatorExpression::new(OperatorType::ArrayConstructor, bound_exprs, return_type)
+                .into(),
+        ))
     }
 }
 
@@ -340,19 +360,21 @@ pub fn bind_tuple(binder: &mut ExpressionBinder, exprs: Vec<Expr>) -> Result<Exp
         let mut values = Vec::with_capacity(bound_exprs.len());
         for expr in bound_exprs {
             if let Expression::Constant(constant) = expr {
-                values.push(constant.value);
+                values.push(constant.into_inner().value);
             }
         }
-        Ok(Expression::Constant(ConstantExpression {
-            value: Value::struct_value(fields, values),
-            return_type,
-        }))
+        Ok(Expression::Constant(
+            ConstantExpression {
+                value: Value::struct_value(fields, values),
+                return_type,
+            }
+            .into(),
+        ))
     } else {
-        Ok(Expression::Operator(OperatorExpression::new(
-            OperatorType::StructConstructor,
-            bound_exprs,
-            return_type,
-        )))
+        Ok(Expression::Operator(
+            OperatorExpression::new(OperatorType::StructConstructor, bound_exprs, return_type)
+                .into(),
+        ))
     }
 }
 
@@ -382,11 +404,9 @@ pub fn bind_coalesce(binder: &mut ExpressionBinder, args: Vec<Expr>) -> Result<E
         }
     }
 
-    Ok(Expression::Operator(OperatorExpression::new(
-        OperatorType::Coalesce,
-        bound_args,
-        return_type,
-    )))
+    Ok(Expression::Operator(
+        OperatorExpression::new(OperatorType::Coalesce, bound_args, return_type).into(),
+    ))
 }
 
 /// Binds a MAP/ARRAY access expression.
@@ -409,15 +429,96 @@ pub fn bind_map_access(
                     )))
                 }
             };
-            Ok(Expression::Operator(OperatorExpression::new(
-                OperatorType::ArrayExtract,
-                vec![bound_child, bound_key],
-                child_type,
-            )))
+            Ok(Expression::Operator(
+                OperatorExpression::new(
+                    OperatorType::ArrayExtract,
+                    vec![bound_child, bound_key],
+                    child_type,
+                )
+                .into(),
+            ))
         }
         _ => Err(paro_error::not_implemented(format!(
             "Map accessor not supported: {:?}",
             accessor
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binder::test_utils::test_binder;
+    use crate::expression::ColumnRefExpression;
+    use crate::logical::operator::ColumnBinding;
+
+    fn column(index: usize, logical_type: LogicalType) -> Expression {
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(index, 0), logical_type).into(),
+        )
+    }
+
+    fn assert_explicit_common_comparison(left_type: LogicalType, right_type: LogicalType) {
+        let expected = try_bind_comparison(&left_type, &right_type, ComparisonType::Equal)
+            .expect("types have a comparison domain")
+            .normalize_type();
+        let mut binder = test_binder();
+        let mut expression_binder = ExpressionBinder::new(&mut binder);
+        let expression = bind_bound_comparison(
+            &mut expression_binder,
+            column(1, left_type.clone()),
+            column(2, right_type.clone()),
+            ComparisonType::Equal,
+        )
+        .expect("comparison casts are registered");
+        let Expression::Comparison(comparison) = expression else {
+            panic!("bound comparison must retain its expression kind")
+        };
+
+        assert!(comparison.has_bound_input_contract());
+        assert_eq!(comparison.left.return_type(), expected);
+        assert_eq!(comparison.right.return_type(), expected);
+        if left_type != expected {
+            assert!(matches!(comparison.left.as_ref(), Expression::Cast(_)));
+        }
+        if right_type != expected {
+            assert!(matches!(comparison.right.as_ref(), Expression::Cast(_)));
+        }
+    }
+
+    #[test]
+    fn comparison_binding_makes_implicit_numeric_casts_explicit() {
+        assert_explicit_common_comparison(LogicalType::Integer, LogicalType::BigInt);
+    }
+
+    #[test]
+    fn comparison_binding_uses_one_lossless_decimal_domain() {
+        assert_explicit_common_comparison(
+            LogicalType::Decimal {
+                precision: 6,
+                scale: 2,
+            },
+            LogicalType::Decimal {
+                precision: 9,
+                scale: 4,
+            },
+        );
+    }
+
+    #[test]
+    fn comparison_binding_requires_an_explicit_compatible_collation_domain() {
+        let nocase = LogicalType::varchar_collation("NOCASE");
+        assert_explicit_common_comparison(nocase.clone(), nocase.clone());
+
+        let mut binder = test_binder();
+        let mut expression_binder = ExpressionBinder::new(&mut binder);
+        let error = bind_bound_comparison(
+            &mut expression_binder,
+            column(1, LogicalType::Varchar),
+            column(2, nocase),
+            ComparisonType::Equal,
+        )
+        .expect_err("plain and collated strings have no implicit comparison cast");
+        assert!(error.to_string().contains("Cannot implicitly cast"));
     }
 }

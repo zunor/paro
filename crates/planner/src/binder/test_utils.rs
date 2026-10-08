@@ -37,6 +37,7 @@ pub(crate) fn test_session(search_path: Vec<CatalogSearchEntry>) -> Arc<Statemen
         random: base.random.clone(),
         databases: base.databases.clone(),
         limits: base.limits.clone(),
+        compile_resources: base.compile_resources,
         cancellation: base.cancellation.clone(),
         services: Arc::new(QueryResources {
             infra: base.services.infra.clone(),
@@ -46,8 +47,11 @@ pub(crate) fn test_session(search_path: Vec<CatalogSearchEntry>) -> Arc<Statemen
             governance: base.services.governance.clone(),
             connection_info: base.services.connection_info.clone(),
         }),
+        graph_snapshots: base.graph_snapshots.clone(),
         graph_registry: base.graph_registry.clone(),
         session_metadata: base.session_metadata.clone(),
+        diagnostics: base.diagnostics.clone(),
+        statement_trace: base.statement_trace.clone(),
     })
 }
 

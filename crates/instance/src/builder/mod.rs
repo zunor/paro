@@ -70,6 +70,22 @@ impl InstanceBuilder {
     }
 
     fn build_in_memory(mut config: InstanceConfig) -> paro_common::error::Result<Arc<Instance>> {
+        let ephemeral_workspace = if config.options.use_temporary_directory
+            && config.options.temporary_directory.trim().is_empty()
+        {
+            let workspace = tempfile::Builder::new()
+                .prefix("paro-in-memory-")
+                .tempdir()
+                .map_err(|error| {
+                    paro_common::error::internal(format!(
+                        "failed to create in-memory query workspace: {error}"
+                    ))
+                })?;
+            config.options.temporary_directory = workspace.path().to_string_lossy().into_owned();
+            Some(workspace)
+        } else {
+            None
+        };
         Self::prepare_buffer_pool(&config)?;
         let boot_config = Arc::new(BootConfig::from_config(&config));
         let runtime =
@@ -81,6 +97,7 @@ impl InstanceBuilder {
             boot_config,
             InstanceMetadata::new_in_memory(),
             runtime,
+            ephemeral_workspace,
         ))
     }
 
@@ -117,6 +134,7 @@ impl InstanceBuilder {
                 owner_guard,
             ),
             runtime,
+            None,
         ))
     }
 
@@ -125,6 +143,7 @@ impl InstanceBuilder {
         boot_config: Arc<BootConfig>,
         metadata: InstanceMetadata,
         runtime: crate::runtime::InstanceRuntime,
+        ephemeral_workspace: Option<tempfile::TempDir>,
     ) -> Arc<Instance> {
         set_delete_patch_inline_row_ref_threshold(
             boot_config.delete_patch_inline_row_ref_threshold,
@@ -149,6 +168,7 @@ impl InstanceBuilder {
                 scheduler,
                 recovery_hooks,
             ),
+            _ephemeral_workspace: ephemeral_workspace,
         })
     }
 

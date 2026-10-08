@@ -3,7 +3,7 @@
 
 use crate::binder::ir::BoundBaseTable;
 use crate::binder::Binder;
-use crate::operator::{Get, LogicalOperator};
+use crate::logical::operator::{Get, LogicalOperator};
 use paro_common::error::Result;
 
 impl Binder {
@@ -33,6 +33,6 @@ impl Binder {
             get.append_virtual_rowid("rowid");
         }
         let get = get.with_relation(base_ref.relation_name, base_ref.relation_alias);
-        Ok(LogicalOperator::Get(get))
+        Ok(LogicalOperator::Get(Box::new(get)))
     }
 }

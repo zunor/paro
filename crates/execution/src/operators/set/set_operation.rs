@@ -6,7 +6,7 @@ use std::sync::Arc;
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_function::scalar::FunctionExecContext;
+use paro_common::memory::MemoryAccountingClass;
 
 use crate::physical::specs::{SetOperationInputSide, SetOperationSpec};
 use crate::runtime::breaker::{HandleRef, SetOperationHandle};
@@ -36,12 +36,20 @@ impl SetOperationInputSinkExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         _global: &SinkGlobal,
     ) -> Result<SinkLocal> {
-        Ok(SinkLocal::SetOperationInput(
-            SetOperationInputSinkLocal::default(),
-        ))
+        Ok(SinkLocal::SetOperationInput(SetOperationInputSinkLocal {
+            columns: (0..self.spec.output_types.len()).collect::<Vec<_>>(),
+            partitions: if self.spec.op == paro_planner::logical::operator::SetOpType::Union
+                && self.spec.all
+            {
+                1
+            } else {
+                ctx.query.max_parallel_tasks().max(1).next_power_of_two()
+            },
+            ..Default::default()
+        }))
     }
 
     pub(crate) fn consume(
@@ -60,7 +68,19 @@ impl SetOperationInputSinkExec {
                 "set-operation sink local state mismatch",
             ));
         };
-        local.chunks.push(input.handoff_referencing_vectors());
+        local.router.push(
+            &mut local.chunks,
+            input,
+            &local.columns,
+            local.partitions,
+            || {
+                ctx.memory.accounted_allocator_for(
+                    MemoryTag::HashTable,
+                    MemoryAccountingClass::NonRevocable,
+                )
+            },
+            ctx.cancel,
+        )?;
         Ok(SinkPoll::NeedMoreInput)
     }
 
@@ -81,6 +101,7 @@ impl SetOperationInputSinkExec {
             ));
         };
         global.handle.append_chunks(self.side, &mut local.chunks)?;
+        local.router = Default::default();
         Ok(MergePoll::Done)
     }
 
@@ -94,10 +115,15 @@ impl SetOperationInputSinkExec {
 
     pub(crate) fn finish_work(
         &self,
-        _ctx: &mut OperatorFinishContext,
-        _global: &SinkGlobal,
+        ctx: &mut OperatorFinishContext,
+        global: &SinkGlobal,
     ) -> Result<FinishWork> {
-        Ok(FinishWork::None)
+        let SinkGlobal::SetOperationInput(global) = global else {
+            return Err(paro_error::internal(
+                "set-operation sink global state mismatch",
+            ));
+        };
+        global.handle.finish_work(&self.spec, ctx)
     }
 
     pub(crate) fn finish(
@@ -110,9 +136,12 @@ impl SetOperationInputSinkExec {
                 "set-operation sink global state mismatch",
             ));
         };
-        global
-            .handle
-            .seal(&self.spec, ctx.query.allocator(MemoryTag::HashTable))?;
+        ctx.cancel.check()?;
+        if !global.handle.is_sealed() {
+            return Err(paro_error::internal(
+                "set-operation finish group did not publish",
+            ));
+        }
         Ok(FinishPoll::Done)
     }
 }

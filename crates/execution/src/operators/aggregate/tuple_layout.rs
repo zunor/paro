@@ -10,9 +10,11 @@ use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::hash::{combine_hash, hash_bytes, hash_i64, hash_u128, hash_u64, NULL_HASH};
-use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
+use paro_common::memory::{
+    AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
+};
 use paro_common::runtime_value::Value;
-use paro_common::types::{LogicalType, StringView};
+use paro_common::types::{FlatGroupKeyKind, LogicalType, StringView};
 use paro_common::vector::Vector;
 
 use super::aggregate_object::AggregateObject;
@@ -192,6 +194,69 @@ impl VarlenHeap {
 
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    pub(crate) fn growth_requirement(&self, incoming_bytes: usize) -> Result<(usize, usize)> {
+        if incoming_bytes == 0 {
+            return Ok((0, 0));
+        }
+        let target_capacity = self.target_capacity(incoming_bytes)?;
+        let heap_growth = target_capacity.saturating_sub(self.data.capacity());
+        let cache_growth = self
+            .dedup_cache
+            .is_none()
+            .then_some(VARLEN_DEDUP_CACHE_SLOTS.saturating_mul(size_of::<VarlenDedupEntry>()));
+        Ok((
+            heap_growth.saturating_add(cache_growth.unwrap_or(0)),
+            self.data.capacity(),
+        ))
+    }
+
+    /// Transfer an already-issued batch transition into the heap-owned
+    /// grants. Subsequent `intern` calls cannot enter the query arbitrator.
+    pub(crate) fn prepare_growth(
+        &mut self,
+        incoming_bytes: usize,
+        reservation: &MemoryGrant,
+    ) -> Result<()> {
+        if incoming_bytes == 0 {
+            return Ok(());
+        }
+        let target_capacity = self.target_capacity(incoming_bytes)?;
+        let heap_growth = target_capacity.saturating_sub(self.data.capacity());
+        if heap_growth > 0 {
+            reservation
+                .split(heap_growth)?
+                .merge_into(self.data.grant())?;
+        }
+        if self.dedup_cache.is_none() {
+            let cache_bytes =
+                VARLEN_DEDUP_CACHE_SLOTS.saturating_mul(size_of::<VarlenDedupEntry>());
+            let cache_grant = reservation.split(cache_bytes)?;
+            let mut cache = AccountedVec::new_with_accounting(
+                cache_grant,
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Metadata,
+            );
+            cache.try_resize_with(VARLEN_DEDUP_CACHE_SLOTS, VarlenDedupEntry::default)?;
+            self.dedup_cache = Some(cache);
+        }
+        Ok(())
+    }
+
+    fn target_capacity(&self, incoming_bytes: usize) -> Result<usize> {
+        let required = self.data.len().checked_add(incoming_bytes).ok_or_else(|| {
+            paro_error::internal("aggregate varlen heap transition size overflow")
+        })?;
+        Ok(if required > self.data.capacity() {
+            self.data
+                .capacity()
+                .saturating_mul(2)
+                .max(MIN_VARLEN_HEAP_CAPACITY)
+                .max(required)
+        } else {
+            self.data.capacity()
+        })
     }
 
     pub fn append(&mut self, bytes: &[u8]) -> Result<usize> {
@@ -1041,19 +1106,17 @@ fn validity_mask_size(column_count: usize) -> usize {
 }
 
 fn is_varlen_group_type(logical_type: &LogicalType) -> bool {
-    matches!(
-        logical_type,
-        LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb
-            | LogicalType::Blob
-    )
+    logical_type
+        .flat_group_key_kind()
+        .is_some_and(FlatGroupKeyKind::is_varlen)
 }
 
 fn group_storage_width(logical_type: &LogicalType) -> Result<usize> {
+    if !logical_type.supports_flat_group_key() {
+        return Err(paro_error::internal(format!(
+            "Unsupported group key type in TupleLayout: {logical_type:?}"
+        )));
+    }
     if is_varlen_group_type(logical_type) {
         return Ok(size_of::<VarlenRef>());
     }
@@ -1121,6 +1184,91 @@ fn varlen_bytes<'a>(
     }
 }
 
+/// Compare values from two vectors under grouped-aggregate key semantics.
+///
+/// This is the vector-to-vector form of [`TupleLayout::compare_groups`]. It is
+/// shared by immutable grouping-domain indexes so finalized lookup cannot
+/// drift from the hash aggregate's NULL, floating-point, or varlen equality
+/// contract.
+///
+/// `VarcharCollation` deliberately compares the same raw bytes used by the
+/// hash aggregate today. Collation-aware grouping must introduce one shared
+/// canonical key representation before hashing; this lookup must never apply
+/// a different comparator after groups have already been formed.
+pub(crate) fn group_vector_values_equal(
+    left: &Vector,
+    left_row: usize,
+    right: &Vector,
+    right_row: usize,
+    logical_type: &LogicalType,
+) -> Result<bool> {
+    let left_null = left.is_null(left_row);
+    let right_null = right.is_null(right_row);
+    if left_null || right_null {
+        return Ok(left_null == right_null);
+    }
+
+    macro_rules! compare_scalar {
+        ($getter:ident, $name:literal) => {{
+            let left = left.$getter(left_row).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Expected non-null {} group key at row {left_row}",
+                    $name
+                ))
+            })?;
+            let right = right.$getter(right_row).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Expected non-null {} group key at row {right_row}",
+                    $name
+                ))
+            })?;
+            Ok(left == right)
+        }};
+    }
+
+    let kind = logical_type.flat_group_key_kind().ok_or_else(|| {
+        paro_error::internal(format!(
+            "Unsupported vector group key comparison type: {logical_type:?}"
+        ))
+    })?;
+    match kind {
+        FlatGroupKeyKind::Boolean => compare_scalar!(get_bool, "BOOLEAN"),
+        FlatGroupKeyKind::I8 => compare_scalar!(get_i8, "TINYINT"),
+        FlatGroupKeyKind::U8 => compare_scalar!(get_u8, "UTINYINT"),
+        FlatGroupKeyKind::I16 => compare_scalar!(get_i16, "SMALLINT"),
+        FlatGroupKeyKind::U16 => compare_scalar!(get_u16, "USMALLINT"),
+        FlatGroupKeyKind::I32 => compare_scalar!(get_i32, "INT32"),
+        FlatGroupKeyKind::U32 => compare_scalar!(get_u32, "UINTEGER"),
+        FlatGroupKeyKind::I64 => compare_scalar!(get_i64, "INT64"),
+        FlatGroupKeyKind::U64 => compare_scalar!(get_u64, "UBIGINT"),
+        FlatGroupKeyKind::I128 => compare_scalar!(get_i128, "HUGEINT"),
+        FlatGroupKeyKind::U128 => compare_scalar!(get_u128, "UHUGEINT/UUID"),
+        FlatGroupKeyKind::F32Bits => {
+            let left = left.get_f32(left_row).ok_or_else(|| {
+                paro_error::internal(format!("Expected non-null FLOAT at row {left_row}"))
+            })?;
+            let right = right.get_f32(right_row).ok_or_else(|| {
+                paro_error::internal(format!("Expected non-null FLOAT at row {right_row}"))
+            })?;
+            Ok(left.to_bits() == right.to_bits())
+        }
+        FlatGroupKeyKind::F64Bits => {
+            let left = left.get_f64(left_row).ok_or_else(|| {
+                paro_error::internal(format!("Expected non-null DOUBLE at row {left_row}"))
+            })?;
+            let right = right.get_f64(right_row).ok_or_else(|| {
+                paro_error::internal(format!("Expected non-null DOUBLE at row {right_row}"))
+            })?;
+            Ok(left.to_bits() == right.to_bits())
+        }
+        FlatGroupKeyKind::Interval => compare_scalar!(get_interval, "INTERVAL"),
+        FlatGroupKeyKind::Decimal64 => compare_scalar!(get_i64, "DECIMAL64"),
+        FlatGroupKeyKind::Decimal128 => compare_scalar!(get_i128, "DECIMAL128"),
+        FlatGroupKeyKind::VarlenBytes => Ok(varlen_bytes(left, left_row, logical_type)?
+            == varlen_bytes(right, right_row, logical_type)?),
+    }
+}
+
 fn deserialize_varlen_value(logical_type: &LogicalType, bytes: &[u8]) -> Result<Value> {
     match logical_type {
         LogicalType::Blob => Ok(Value::Blob(bytes.to_vec())),
@@ -1158,36 +1306,42 @@ fn write_fixed_group_value(
     row_idx: usize,
     logical_type: &LogicalType,
 ) -> Result<()> {
-    match logical_type {
-        LogicalType::Boolean => {
+    let kind = logical_type.flat_group_key_kind().ok_or_else(|| {
+        paro_error::internal(format!(
+            "Unsupported fixed group type in TupleLayout scatter: {logical_type:?}"
+        ))
+    })?;
+    match kind {
+        FlatGroupKeyKind::Boolean => {
             let value = column.get_bool(row_idx).ok_or_else(|| {
                 paro_error::internal(format!("Expected non-null BOOLEAN at row {row_idx}"))
             })?;
             unsafe { std::ptr::write(target as *mut bool, value) };
             Ok(())
         }
-        LogicalType::TinyInt => write_scalar(target, column.get_i8(row_idx), "TINYINT", row_idx),
-        LogicalType::UTinyInt => write_scalar(target, column.get_u8(row_idx), "UTINYINT", row_idx),
-        LogicalType::SmallInt => write_scalar(target, column.get_i16(row_idx), "SMALLINT", row_idx),
-        LogicalType::USmallInt => {
+        FlatGroupKeyKind::I8 => write_scalar(target, column.get_i8(row_idx), "TINYINT", row_idx),
+        FlatGroupKeyKind::U8 => write_scalar(target, column.get_u8(row_idx), "UTINYINT", row_idx),
+        FlatGroupKeyKind::I16 => write_scalar(target, column.get_i16(row_idx), "SMALLINT", row_idx),
+        FlatGroupKeyKind::U16 => {
             write_scalar(target, column.get_u16(row_idx), "USMALLINT", row_idx)
         }
-        LogicalType::Integer | LogicalType::Date => {
-            write_scalar(target, column.get_i32(row_idx), "INT32", row_idx)
+        FlatGroupKeyKind::I32 => write_scalar(target, column.get_i32(row_idx), "INT32", row_idx),
+        FlatGroupKeyKind::U32 => write_scalar(target, column.get_u32(row_idx), "UINTEGER", row_idx),
+        FlatGroupKeyKind::I64 => write_scalar(target, column.get_i64(row_idx), "INT64", row_idx),
+        FlatGroupKeyKind::U64 => write_scalar(target, column.get_u64(row_idx), "UBIGINT", row_idx),
+        FlatGroupKeyKind::I128 => {
+            write_scalar(target, column.get_i128(row_idx), "HUGEINT", row_idx)
         }
-        LogicalType::UInteger => write_scalar(target, column.get_u32(row_idx), "UINTEGER", row_idx),
-        LogicalType::BigInt
-        | LogicalType::Timestamp
-        | LogicalType::TimestampTz
-        | LogicalType::Time => write_scalar(target, column.get_i64(row_idx), "INT64", row_idx),
-        LogicalType::UBigInt => write_scalar(target, column.get_u64(row_idx), "UBIGINT", row_idx),
-        LogicalType::HugeInt => write_scalar(target, column.get_i128(row_idx), "HUGEINT", row_idx),
-        LogicalType::UHugeInt | LogicalType::Uuid => {
+        FlatGroupKeyKind::U128 => {
             write_scalar(target, column.get_u128(row_idx), "UHUGEINT/UUID", row_idx)
         }
-        LogicalType::Float => write_scalar(target, column.get_f32(row_idx), "FLOAT", row_idx),
-        LogicalType::Double => write_scalar(target, column.get_f64(row_idx), "DOUBLE", row_idx),
-        LogicalType::Interval => {
+        FlatGroupKeyKind::F32Bits => {
+            write_scalar(target, column.get_f32(row_idx), "FLOAT", row_idx)
+        }
+        FlatGroupKeyKind::F64Bits => {
+            write_scalar(target, column.get_f64(row_idx), "DOUBLE", row_idx)
+        }
+        FlatGroupKeyKind::Interval => {
             let (months, days, micros) = column.get_interval(row_idx).ok_or_else(|| {
                 paro_error::internal(format!("Expected non-null INTERVAL at row {row_idx}"))
             })?;
@@ -1198,14 +1352,13 @@ fn write_fixed_group_value(
             }
             Ok(())
         }
-        LogicalType::Decimal { precision, .. } => {
-            if *precision <= 18 {
-                write_scalar(target, column.get_i64(row_idx), "DECIMAL64", row_idx)
-            } else {
-                write_scalar(target, column.get_i128(row_idx), "DECIMAL128", row_idx)
-            }
+        FlatGroupKeyKind::Decimal64 => {
+            write_scalar(target, column.get_i64(row_idx), "DECIMAL64", row_idx)
         }
-        _ => Err(paro_error::internal(format!(
+        FlatGroupKeyKind::Decimal128 => {
+            write_scalar(target, column.get_i128(row_idx), "DECIMAL128", row_idx)
+        }
+        FlatGroupKeyKind::VarlenBytes => Err(paro_error::internal(format!(
             "Unsupported fixed group type in TupleLayout scatter: {logical_type:?}"
         ))),
     }
@@ -1217,55 +1370,54 @@ fn fixed_group_value_equals(
     row_idx: usize,
     logical_type: &LogicalType,
 ) -> Result<bool> {
-    match logical_type {
-        LogicalType::Boolean => {
+    let kind = logical_type.flat_group_key_kind().ok_or_else(|| {
+        paro_error::internal(format!(
+            "Unsupported fixed group type in TupleLayout compare: {logical_type:?}"
+        ))
+    })?;
+    match kind {
+        FlatGroupKeyKind::Boolean => {
             Ok(column.get_bool(row_idx) == Some(unsafe { std::ptr::read(source as *const bool) }))
         }
-        LogicalType::TinyInt => eq_scalar(source, column.get_i8(row_idx), "TINYINT", row_idx),
-        LogicalType::UTinyInt => eq_scalar(source, column.get_u8(row_idx), "UTINYINT", row_idx),
-        LogicalType::SmallInt => eq_scalar(source, column.get_i16(row_idx), "SMALLINT", row_idx),
-        LogicalType::USmallInt => eq_scalar(source, column.get_u16(row_idx), "USMALLINT", row_idx),
-        LogicalType::Integer | LogicalType::Date => {
-            eq_scalar(source, column.get_i32(row_idx), "INT32", row_idx)
-        }
-        LogicalType::UInteger => eq_scalar(source, column.get_u32(row_idx), "UINTEGER", row_idx),
-        LogicalType::BigInt
-        | LogicalType::Timestamp
-        | LogicalType::TimestampTz
-        | LogicalType::Time => eq_scalar(source, column.get_i64(row_idx), "INT64", row_idx),
-        LogicalType::UBigInt => eq_scalar(source, column.get_u64(row_idx), "UBIGINT", row_idx),
-        LogicalType::HugeInt => eq_scalar(source, column.get_i128(row_idx), "HUGEINT", row_idx),
-        LogicalType::UHugeInt | LogicalType::Uuid => {
+        FlatGroupKeyKind::I8 => eq_scalar(source, column.get_i8(row_idx), "TINYINT", row_idx),
+        FlatGroupKeyKind::U8 => eq_scalar(source, column.get_u8(row_idx), "UTINYINT", row_idx),
+        FlatGroupKeyKind::I16 => eq_scalar(source, column.get_i16(row_idx), "SMALLINT", row_idx),
+        FlatGroupKeyKind::U16 => eq_scalar(source, column.get_u16(row_idx), "USMALLINT", row_idx),
+        FlatGroupKeyKind::I32 => eq_scalar(source, column.get_i32(row_idx), "INT32", row_idx),
+        FlatGroupKeyKind::U32 => eq_scalar(source, column.get_u32(row_idx), "UINTEGER", row_idx),
+        FlatGroupKeyKind::I64 => eq_scalar(source, column.get_i64(row_idx), "INT64", row_idx),
+        FlatGroupKeyKind::U64 => eq_scalar(source, column.get_u64(row_idx), "UBIGINT", row_idx),
+        FlatGroupKeyKind::I128 => eq_scalar(source, column.get_i128(row_idx), "HUGEINT", row_idx),
+        FlatGroupKeyKind::U128 => {
             eq_scalar(source, column.get_u128(row_idx), "UHUGEINT/UUID", row_idx)
         }
-        LogicalType::Float => {
+        FlatGroupKeyKind::F32Bits => {
             let left = unsafe { std::ptr::read_unaligned(source as *const f32) };
             let right = column.get_f32(row_idx).ok_or_else(|| {
                 paro_error::internal(format!("Expected non-null FLOAT at row {row_idx}"))
             })?;
             Ok(left.to_bits() == right.to_bits())
         }
-        LogicalType::Double => {
+        FlatGroupKeyKind::F64Bits => {
             let left = unsafe { std::ptr::read_unaligned(source as *const f64) };
             let right = column.get_f64(row_idx).ok_or_else(|| {
                 paro_error::internal(format!("Expected non-null DOUBLE at row {row_idx}"))
             })?;
             Ok(left.to_bits() == right.to_bits())
         }
-        LogicalType::Interval => {
+        FlatGroupKeyKind::Interval => {
             let months = unsafe { std::ptr::read_unaligned(source as *const i32) };
             let days = unsafe { std::ptr::read_unaligned(source.add(4) as *const i32) };
             let micros = unsafe { std::ptr::read_unaligned(source.add(8) as *const i64) };
             Ok(column.get_interval(row_idx) == Some((months, days, micros)))
         }
-        LogicalType::Decimal { precision, .. } => {
-            if *precision <= 18 {
-                eq_scalar(source, column.get_i64(row_idx), "DECIMAL64", row_idx)
-            } else {
-                eq_scalar(source, column.get_i128(row_idx), "DECIMAL128", row_idx)
-            }
+        FlatGroupKeyKind::Decimal64 => {
+            eq_scalar(source, column.get_i64(row_idx), "DECIMAL64", row_idx)
         }
-        _ => Err(paro_error::internal(format!(
+        FlatGroupKeyKind::Decimal128 => {
+            eq_scalar(source, column.get_i128(row_idx), "DECIMAL128", row_idx)
+        }
+        FlatGroupKeyKind::VarlenBytes => Err(paro_error::internal(format!(
             "Unsupported fixed group type in TupleLayout compare: {logical_type:?}"
         ))),
     }

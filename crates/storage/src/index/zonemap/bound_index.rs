@@ -20,7 +20,8 @@ use crate::index::predicate_result::{
     decode_page_ranges, encode_page_ranges, PageRange, PredicateResult,
 };
 use crate::index::{
-    ColumnId, Index, IndexAppendInfo, IndexBufferInfo, IndexConstraintType, IndexStorageInfo,
+    ColumnId, FixedMembership, FixedMembershipWidth, Index, IndexAppendInfo, IndexBufferInfo,
+    IndexConstraintType, IndexStorageInfo,
 };
 
 use super::{ZoneMapEntry, ZoneMapIndexReader};
@@ -32,13 +33,27 @@ enum PagePredicateTruth {
     AlwaysFalse,
 }
 
-enum EncodedPredicate {
+enum EncodedPredicate<'a> {
     Eq(Vec<u8>),
     NotEq(Vec<u8>),
-    Lt { value: Vec<u8>, inclusive: bool },
-    Gt { value: Vec<u8>, inclusive: bool },
-    Range { lower: Vec<u8>, upper: Vec<u8> },
-    In(Vec<Vec<u8>>),
+    Lt {
+        value: Vec<u8>,
+        inclusive: bool,
+    },
+    Gt {
+        value: Vec<u8>,
+        inclusive: bool,
+    },
+    Range {
+        lower: Vec<u8>,
+        upper: Vec<u8>,
+    },
+    In {
+        values: Vec<Vec<u8>>,
+        ordered: bool,
+        contiguous: bool,
+    },
+    FixedIn(&'a FixedMembership),
     IsNull,
     IsNotNull,
 }
@@ -168,7 +183,10 @@ impl ZoneMapIndex {
     }
 }
 
-fn encode_predicate(predicate: &Predicate, ty: &LogicalType) -> Option<EncodedPredicate> {
+fn encode_predicate<'a>(
+    predicate: &'a Predicate,
+    ty: &LogicalType,
+) -> Option<EncodedPredicate<'a>> {
     let encode = |value: &Value| value_to_bytes(value, ty).ok();
     match predicate {
         Predicate::Eq { value, .. } => Some(EncodedPredicate::Eq(encode(value)?)),
@@ -193,13 +211,18 @@ fn encode_predicate(predicate: &Predicate, ty: &LogicalType) -> Option<EncodedPr
             lower: encode(lower)?,
             upper: encode(upper)?,
         }),
-        Predicate::In { values, .. } => Some(EncodedPredicate::In(
-            values.iter().map(encode).collect::<Option<Vec<_>>>()?,
-        )),
+        Predicate::In { values, .. } => Some(EncodedPredicate::In {
+            values: values.iter().map(encode).collect::<Option<Vec<_>>>()?,
+            ordered: false,
+            contiguous: false,
+        }),
+        Predicate::FixedIn { values, .. } if fixed_membership_type_matches(values, ty) => {
+            Some(EncodedPredicate::FixedIn(values))
+        }
+        Predicate::FixedIn { .. } => None,
         Predicate::IsNull { .. } => Some(EncodedPredicate::IsNull),
         Predicate::IsNotNull { .. } => Some(EncodedPredicate::IsNotNull),
-        Predicate::FixedIn { .. }
-        | Predicate::StringPrefix { .. }
+        Predicate::StringPrefix { .. }
         | Predicate::StringPrefixIn { .. }
         | Predicate::StringLike { .. }
         | Predicate::ColumnComparison { .. } => None,
@@ -208,7 +231,7 @@ fn encode_predicate(predicate: &Predicate, ty: &LogicalType) -> Option<EncodedPr
 
 fn classify_page(
     entry: &ZoneMapEntry,
-    predicate: &EncodedPredicate,
+    predicate: &EncodedPredicate<'_>,
     ty: &LogicalType,
 ) -> Option<PagePredicateTruth> {
     use std::cmp::Ordering;
@@ -308,20 +331,62 @@ fn classify_page(
                 PagePredicateTruth::MaybeTrue
             })
         }
-        EncodedPredicate::In(values) => {
-            let mut page_may_match = false;
-            for value in values {
-                page_may_match |= contains(value)?;
-            }
-            if !page_may_match {
+        EncodedPredicate::In {
+            values,
+            ordered,
+            contiguous,
+        } => {
+            let matching_index = if *ordered {
+                lower_bound(values, &entry.min, ty)?
+            } else {
+                values
+                    .iter()
+                    .position(|value| contains(value) == Some(true))
+                    .unwrap_or(values.len())
+            };
+            let Some(value) = values.get(matching_index) else {
+                return Some(PagePredicateTruth::AlwaysFalse);
+            };
+            if *ordered && compare(value, &entry.max)? == Ordering::Greater {
                 return Some(PagePredicateTruth::AlwaysFalse);
             }
             let constant = exact_all_valid
                 && compare(&entry.min, &entry.max)? == Ordering::Equal
+                && compare(&entry.min, value)? == Ordering::Equal;
+            let covered_range = *contiguous
+                && exact_all_valid
+                && values.first().is_some_and(|lower| {
+                    compare(&entry.min, lower).is_some_and(|order| order != Ordering::Less)
+                })
+                && values.last().is_some_and(|upper| {
+                    compare(&entry.max, upper).is_some_and(|order| order != Ordering::Greater)
+                });
+            Some(if constant || covered_range {
+                PagePredicateTruth::AlwaysTrue
+            } else {
+                PagePredicateTruth::MaybeTrue
+            })
+        }
+        EncodedPredicate::FixedIn(values) => {
+            let width = values.width();
+            let minimum = decode_fixed_membership_bound(&entry.min, ty, width)?;
+            let maximum = decode_fixed_membership_bound(&entry.max, ty, width)?;
+            let Some(matching) = values.first_at_or_after(minimum) else {
+                return Some(PagePredicateTruth::AlwaysFalse);
+            };
+            if matching > maximum {
+                return Some(PagePredicateTruth::AlwaysFalse);
+            }
+            let constant = exact_all_valid && minimum == maximum && matching == minimum;
+            let covered_range = values.is_contiguous()
+                && exact_all_valid
                 && values
-                    .iter()
-                    .any(|value| compare(&entry.min, value) == Some(Ordering::Equal));
-            Some(if constant {
+                    .first_canonical()
+                    .is_some_and(|lower| minimum >= lower)
+                && values
+                    .last_canonical()
+                    .is_some_and(|upper| maximum <= upper);
+            Some(if constant || covered_range {
                 PagePredicateTruth::AlwaysTrue
             } else {
                 PagePredicateTruth::MaybeTrue
@@ -338,6 +403,70 @@ fn classify_page(
             PagePredicateTruth::AlwaysTrue
         }),
     }
+}
+
+fn fixed_membership_type_matches(values: &FixedMembership, ty: &LogicalType) -> bool {
+    matches!(
+        (values.width(), ty),
+        (
+            FixedMembershipWidth::I32,
+            LogicalType::Integer | LogicalType::Date
+        ) | (FixedMembershipWidth::I64, LogicalType::BigInt)
+            | (
+                FixedMembershipWidth::I64,
+                LogicalType::Decimal {
+                    precision: 0..=18,
+                    ..
+                }
+            )
+            | (
+                FixedMembershipWidth::I128,
+                LogicalType::Decimal {
+                    precision: 19..,
+                    ..
+                }
+            )
+    )
+}
+
+fn decode_fixed_membership_bound(
+    bytes: &[u8],
+    ty: &LogicalType,
+    width: FixedMembershipWidth,
+) -> Option<i128> {
+    match (width, ty) {
+        (FixedMembershipWidth::I32, LogicalType::Integer | LogicalType::Date) => {
+            Some(i128::from(i32::from_le_bytes(bytes.try_into().ok()?)))
+        }
+        (FixedMembershipWidth::I64, LogicalType::BigInt)
+        | (
+            FixedMembershipWidth::I64,
+            LogicalType::Decimal {
+                precision: 0..=18, ..
+            },
+        ) => Some(i128::from(i64::from_le_bytes(bytes.try_into().ok()?))),
+        (
+            FixedMembershipWidth::I128,
+            LogicalType::Decimal {
+                precision: 19.., ..
+            },
+        ) => Some(i128::from_le_bytes(bytes.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+fn lower_bound(values: &[Vec<u8>], target: &[u8], ty: &LogicalType) -> Option<usize> {
+    let mut left = 0usize;
+    let mut right = values.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if compare_bytes(ty, &values[middle], target).ok()? == std::cmp::Ordering::Less {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+    Some(left)
 }
 
 fn ranges_to_result(ranges: Vec<PageRange>, page_count: usize) -> PredicateResult {
@@ -440,6 +569,7 @@ impl BoundIndex for ZoneMapIndex {
 mod tests {
     use super::*;
     use crate::index::zonemap::{BoundsPrecision, ZoneMapIndexWriter};
+    use crate::index::FixedMembership;
 
     fn i32_cmp(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
         i32::from_le_bytes(left.try_into().unwrap())
@@ -613,5 +743,70 @@ mod tests {
         });
         assert!(matches!(outcome.candidates, PredicateResult::AllMatch));
         assert!(matches!(outcome.guaranteed(), PredicateResult::NoneMatch));
+    }
+
+    #[test]
+    fn fixed_membership_prunes_pages_by_ordered_set_intersection() {
+        let mut writer = ZoneMapIndexWriter::new();
+        for (lower, upper) in [(1_i32, 3_i32), (4, 6), (7, 9)] {
+            writer.add_with_cmp(
+                Bytes::copy_from_slice(&lower.to_le_bytes()),
+                Bytes::copy_from_slice(&upper.to_le_bytes()),
+                false,
+                BoundsPrecision::Exact,
+                i32_cmp,
+            );
+        }
+        let index = ZoneMapIndex::from_bytes(
+            "zm",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Integer],
+            writer.finish(),
+            vec![
+                PageRange::new(0, 3),
+                PageRange::new(3, 6),
+                PageRange::new(6, 9),
+            ],
+        )
+        .unwrap();
+
+        let outcome = index.evaluate_predicate_with_proof(&Predicate::FixedIn {
+            column_id: 0,
+            values: FixedMembership::i32(vec![2, 8]),
+        });
+        assert_eq!(
+            outcome.candidates,
+            PredicateResult::PageRanges(vec![PageRange::new(0, 3), PageRange::new(6, 9)])
+        );
+        assert!(matches!(outcome.guaranteed(), PredicateResult::NoneMatch));
+    }
+
+    #[test]
+    fn contiguous_fixed_membership_proves_fully_covered_pages() {
+        let mut writer = ZoneMapIndexWriter::new();
+        writer.add_with_cmp(
+            Bytes::copy_from_slice(&4_i32.to_le_bytes()),
+            Bytes::copy_from_slice(&6_i32.to_le_bytes()),
+            false,
+            BoundsPrecision::Exact,
+            i32_cmp,
+        );
+        let index = ZoneMapIndex::from_bytes(
+            "zm",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Integer],
+            writer.finish(),
+            vec![PageRange::new(0, 3)],
+        )
+        .unwrap();
+
+        let outcome = index.evaluate_predicate_with_proof(&Predicate::FixedIn {
+            column_id: 0,
+            values: FixedMembership::i32((2..=8).collect()),
+        });
+        assert!(matches!(outcome.candidates, PredicateResult::AllMatch));
+        assert!(matches!(outcome.guaranteed(), PredicateResult::AllMatch));
     }
 }

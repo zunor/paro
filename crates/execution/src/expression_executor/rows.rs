@@ -365,7 +365,7 @@ mod tests {
     use crate::runtime::{ParameterBindingEpoch, QueryOutputPort, QueryRuntimeContext};
 
     fn constant(value: Value, ty: LogicalType) -> Expression {
-        Expression::Constant(ConstantExpression::new(value, ty))
+        Expression::Constant(ConstantExpression::new(value, ty).into())
     }
 
     fn row(expressions: Vec<Expression>) -> Box<[Expression]> {
@@ -435,9 +435,9 @@ mod tests {
     #[test]
     fn parameters_use_current_binding_epoch() {
         let slot = ParameterSlot::new(RuntimeParamId::new(0), LogicalType::Integer);
-        let rows = vec![row(vec![Expression::Parameter(ParameterExpression::new(
-            slot,
-        ))])];
+        let rows = vec![row(vec![Expression::Parameter(
+            ParameterExpression::new(slot).into(),
+        )])];
         let types = [LogicalType::Integer];
         let initial = query(
             ParameterBindings::new(
@@ -480,11 +480,14 @@ mod tests {
         let array_type = LogicalType::Array(Box::new(LogicalType::Integer), 2);
         let rows = vec![row(vec![
             constant(Value::BigInt(3), LogicalType::BigInt),
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                constant(Value::Integer(9), LogicalType::Integer),
-                constant(Value::Integer(9), LogicalType::Integer),
-            )),
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    constant(Value::Integer(9), LogicalType::Integer),
+                    constant(Value::Integer(9), LogicalType::Integer),
+                )
+                .into(),
+            ),
             constant(
                 Value::Array(
                     vec![Value::Integer(4), Value::Integer(5)],

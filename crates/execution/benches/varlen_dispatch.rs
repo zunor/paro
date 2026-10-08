@@ -88,14 +88,13 @@ fn bench_state() -> &'static BenchState {
 }
 
 fn reference_varchar(index: usize) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, LogicalType::Varchar))
+    Expression::Reference(ReferenceExpression::new(index, LogicalType::Varchar).into())
 }
 
 fn constant_varchar(value: &str) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Varchar(value.to_string()),
-        LogicalType::Varchar,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Varchar(value.to_string()), LogicalType::Varchar).into(),
+    )
 }
 
 fn bind_function(
@@ -117,20 +116,16 @@ fn length_expr() -> Expression {
         vec![LogicalType::Varchar],
         vec![None],
     );
-    Expression::Function(FunctionExpression::new(
-        bound,
-        vec![reference_varchar(0)],
-        LogicalType::BigInt,
-    ))
+    Expression::Function(
+        FunctionExpression::new(bound, vec![reference_varchar(0)], LogicalType::BigInt).into(),
+    )
 }
 
 fn lower_expr() -> Expression {
     let bound = bind_function(get_lower_function(), vec![LogicalType::Varchar], vec![None]);
-    Expression::Function(FunctionExpression::new(
-        bound,
-        vec![reference_varchar(0)],
-        LogicalType::Varchar,
-    ))
+    Expression::Function(
+        FunctionExpression::new(bound, vec![reference_varchar(0)], LogicalType::Varchar).into(),
+    )
 }
 
 fn replace_expr() -> Expression {
@@ -147,24 +142,30 @@ fn replace_expr() -> Expression {
             Some(Value::Varchar("hello".to_string())),
         ],
     );
-    Expression::Function(FunctionExpression::new(
-        bound,
-        vec![
-            reference_varchar(0),
-            constant_varchar("HELLO"),
-            constant_varchar("hello"),
-        ],
-        LogicalType::Varchar,
-    ))
+    Expression::Function(
+        FunctionExpression::new(
+            bound,
+            vec![
+                reference_varchar(0),
+                constant_varchar("HELLO"),
+                constant_varchar("hello"),
+            ],
+            LogicalType::Varchar,
+        )
+        .into(),
+    )
 }
 
 fn cast_varchar_to_i64_expr() -> Expression {
-    Expression::Cast(CastExpression::new(
-        reference_varchar(0),
-        LogicalType::BigInt,
-        BoundCastInfo::varlen(string_casts::varchar_to_numeric_cast::<i64>),
-        false,
-    ))
+    Expression::Cast(
+        CastExpression::new(
+            reference_varchar(0),
+            LogicalType::BigInt,
+            BoundCastInfo::varlen(string_casts::varchar_to_numeric_cast::<i64>),
+            false,
+        )
+        .into(),
+    )
 }
 
 #[divan::bench(sample_count = 10)]

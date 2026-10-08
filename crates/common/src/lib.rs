@@ -28,6 +28,7 @@ pub mod allocator;
 pub mod cast_rules;
 pub mod checkpoint;
 pub mod chunk;
+pub mod cold_work;
 pub mod collections;
 pub mod config;
 pub mod ddl;
@@ -47,6 +48,7 @@ pub mod prefetch;
 pub mod runtime_value;
 pub mod sort_key;
 pub mod string_pattern;
+pub mod task_supply;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_utils;
 pub mod typed_parameters;

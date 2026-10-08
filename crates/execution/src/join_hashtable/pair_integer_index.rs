@@ -76,13 +76,16 @@ impl ExactI64PairJoinIndex {
 
     /// Insert a build row and return the previous head for a duplicate key.
     pub(super) fn insert(&mut self, layout: &RowLayout, row_ptr: usize) -> Result<Option<usize>> {
-        if row_ptr == 0
-            || row_key_is_null(layout, row_ptr, 0)
-            || row_key_is_null(layout, row_ptr, 1)
-        {
+        if row_ptr == 0 {
             return Err(paro_error::internal(
-                "pair integer index received a NULL or invalid build row",
+                "pair integer index received an invalid build row",
             ));
+        }
+        // SQL equality never matches a NULL key. Outer joins still retain the
+        // row in the build store so the unmatched-build source can emit it;
+        // the exact lookup index must simply leave it unindexed.
+        if row_key_is_null(layout, row_ptr, 0) || row_key_is_null(layout, row_ptr, 1) {
+            return Ok(None);
         }
         let left = read_row_i64(layout, row_ptr, 0);
         let right = read_row_i64(layout, row_ptr, 1);

@@ -19,6 +19,7 @@
 //!
 //! ## information_schema Views (SQL Standard)
 //! - `schemata`, `tables`, `columns`, `views`
+//! - `table_constraints`, `key_column_usage`
 //!
 //! ## pg_catalog Views (PostgreSQL Compatibility)
 //! - `pg_database`, `pg_namespace`, `pg_tables`, `pg_views`, `pg_class`, `pg_attribute`
@@ -169,6 +170,77 @@ pub static DEFAULT_VIEWS: &[DefaultView] = &[
 
 /// information_schema views for SQL standard compliance.
 pub static INFORMATION_SCHEMA_VIEWS: &[DefaultView] = &[
+    DefaultView {
+        name: "table_constraints",
+        sql: "SELECT DISTINCT \
+            database_name AS constraint_catalog, \
+            schema_name AS constraint_schema, \
+            constraint_name, \
+            database_name AS table_catalog, \
+            schema_name AS table_schema, \
+            table_name, \
+            constraint_type, \
+            CASE WHEN enforced THEN 'YES' ELSE 'NO' END AS enforced \
+            FROM paro_constraints() \
+            WHERE database_name = current_database()",
+        column_names: &[
+            "constraint_catalog",
+            "constraint_schema",
+            "constraint_name",
+            "table_catalog",
+            "table_schema",
+            "table_name",
+            "constraint_type",
+            "enforced",
+        ],
+        column_types: &[
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+        ],
+    },
+    DefaultView {
+        name: "key_column_usage",
+        sql: "SELECT \
+            database_name AS constraint_catalog, \
+            schema_name AS constraint_schema, \
+            constraint_name, \
+            database_name AS table_catalog, \
+            schema_name AS table_schema, \
+            table_name, \
+            column_name, \
+            ordinal_position, \
+            NULL AS position_in_unique_constraint \
+            FROM paro_constraints() \
+            WHERE database_name = current_database() AND column_name IS NOT NULL",
+        column_names: &[
+            "constraint_catalog",
+            "constraint_schema",
+            "constraint_name",
+            "table_catalog",
+            "table_schema",
+            "table_name",
+            "column_name",
+            "ordinal_position",
+            "position_in_unique_constraint",
+        ],
+        column_types: &[
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::BigInt,
+            LogicalType::BigInt,
+        ],
+    },
     DefaultView {
         name: "schemata",
         sql: "SELECT \

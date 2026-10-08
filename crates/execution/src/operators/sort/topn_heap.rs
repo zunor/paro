@@ -3,7 +3,6 @@
 
 //! Heap implementation used by [`super::topn::TopN`].
 
-use std::cmp::Ordering;
 use std::mem::size_of;
 use std::sync::Mutex;
 
@@ -12,7 +11,7 @@ use paro_common::error::Result;
 use paro_common::memory::{
     AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
 };
-use paro_common::sort_key::{compare_keys, encode_column, OrderModifiers};
+use paro_common::sort_key::{encode_column, OrderModifiers};
 use paro_common::types::LogicalType;
 use paro_planner::binder::ir::OrderByNode;
 
@@ -21,6 +20,10 @@ use crate::memory_runtime::RetainedChunkVec;
 #[path = "topn_entry_heap.rs"]
 mod entry_heap;
 use entry_heap::{TopNEntry, TopNEntryHeap};
+#[path = "topn_merge.rs"]
+mod merge;
+#[cfg(test)]
+use merge::CombineCandidate;
 
 /// Global boundary value for TopN optimization.
 ///
@@ -89,20 +92,6 @@ impl Default for TopNBoundaryValue {
 struct HeapRowSource {
     chunk_index: usize,
     row_index: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum MergeSide {
-    Left,
-    Right,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CombineCandidate {
-    side: MergeSide,
-    heap_position: usize,
-    old_payload_index: usize,
-    new_payload_index: usize,
 }
 
 /// Immutable directory translating heap-global row ids into chunk-local ids.
@@ -236,7 +225,7 @@ impl TopNHeap {
             + self
                 .heap
                 .iter()
-                .map(|entry| entry.sort_key.capacity())
+                .map(|entry| entry.sort_key.allocated_bytes())
                 .sum::<usize>()
             + self.heap_data.retained_bytes()
     }
@@ -263,21 +252,29 @@ impl TopNHeap {
             return Ok(());
         }
 
-        // Check boundary value first to filter out rows early
-        let (filtered_payload, filtered_sort) = if let Some(boundary_val) = boundary {
-            self.filter_by_boundary_with_sort(payload_chunk, sort_chunk, boundary_val)?
-        } else {
-            (payload_chunk.clone(), sort_chunk.clone())
-        };
+        // Snapshot the cross-worker boundary once per batch. Encoding and
+        // boundary rejection happen in the same pass as the local heap check;
+        // materializing filtered payload/sort chunks would encode every
+        // surviving key twice and copy rows that the local boundary may still
+        // reject.
+        let boundary_key = boundary.and_then(TopNBoundaryValue::get_boundary);
 
-        if filtered_payload.is_empty() {
-            return Ok(());
-        }
-
-        if self.heap_size <= SMALL_HEAP_THRESHOLD {
-            self.add_small_heap_with_sort(&filtered_payload, &filtered_sort)?;
+        // The first batch often already is the complete input of a small
+        // aggregate or DISTINCT.  Retain its immutable vectors directly while
+        // the frontier is still underfilled; copying every value into a new
+        // chunk only to gather it again at seal adds work without reducing the
+        // bounded state.  Subsequent batches keep using the regular heap path,
+        // which compacts discarded payloads once the frontier fills.
+        if self.heap.is_empty()
+            && self.heap_data.is_empty()
+            && payload_chunk.size() <= self.heap_size
+            && boundary_key.is_none()
+        {
+            self.seed_underfilled_frontier(payload_chunk, sort_chunk)?;
+        } else if self.heap_size <= SMALL_HEAP_THRESHOLD {
+            self.add_small_heap_with_sort(payload_chunk, sort_chunk, boundary_key.as_deref())?;
         } else {
-            self.add_large_heap_with_sort(&filtered_payload, &filtered_sort)?;
+            self.add_large_heap_with_sort(payload_chunk, sort_chunk, boundary_key.as_deref())?;
         }
 
         // Update global boundary if heap is full
@@ -285,11 +282,31 @@ impl TopNHeap {
         if self.heap.len() >= self.heap_size {
             if let Some(boundary_val) = boundary {
                 if let Some(max_entry) = self.heap.peek() {
-                    boundary_val.update(&max_entry.sort_key);
+                    boundary_val.update(max_entry.sort_key.as_slice());
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn seed_underfilled_frontier(
+        &mut self,
+        payload_chunk: &Chunk,
+        sort_chunk: &Chunk,
+    ) -> Result<()> {
+        debug_assert_eq!(payload_chunk.size(), sort_chunk.size());
+        debug_assert!(payload_chunk.size() <= self.heap_size);
+
+        // Retain before publishing row addresses so an accounting failure
+        // cannot leave heap entries referring to an absent payload chunk.
+        self.heap_data.push(payload_chunk.clone())?;
+        let mut sort_key = Vec::new();
+        for row_index in 0..sort_chunk.size() {
+            self.encode_sort_key_into(sort_chunk, row_index, &mut sort_key)?;
+            let entry = TopNEntry::try_from_scratch(&mut sort_key, row_index, &self.memory)?;
+            self.heap.try_push(entry)?;
+        }
         Ok(())
     }
 
@@ -454,82 +471,31 @@ impl TopNHeap {
         Ok(result)
     }
 
-    /// Filter chunks by boundary value (with separate sort chunk).
-    ///
-    /// Returns filtered payload and sort chunks containing only rows that could
-    fn filter_by_boundary_with_sort(
-        &self,
-        payload_chunk: &Chunk,
-        sort_chunk: &Chunk,
-        boundary: &TopNBoundaryValue,
-    ) -> Result<(Chunk, Chunk)> {
-        let boundary_key = match boundary.get_boundary() {
-            Some(key) => key,
-            None => return Ok((payload_chunk.clone(), sort_chunk.clone())), // No boundary yet
-        };
-
-        // The sort chunk materializes ORDER BY expressions densely as [0, 1, 2, ...].
-        let sort_indices: Vec<usize> = (0..sort_chunk.column_count()).collect();
-
-        // Collect indices of rows that pass the boundary check
-        let mut passing_rows = Vec::new();
-        let mut sort_key = Vec::new();
-
-        for row_idx in 0..sort_chunk.size() {
-            self.encode_sort_key_into(sort_chunk, row_idx, &sort_indices, &mut sort_key)?;
-
-            // Row passes if its sort key is less than the boundary
-            if compare_keys(&sort_key, &boundary_key) == Ordering::Less {
-                passing_rows.push(row_idx);
-            }
-        }
-
-        if passing_rows.is_empty() {
-            // No rows pass - return empty chunks
-            return Ok((
-                Chunk::try_new(payload_chunk.allocator().clone())?,
-                Chunk::try_new(sort_chunk.allocator().clone())?,
-            ));
-        }
-
-        if passing_rows.len() == payload_chunk.size() {
-            // All rows pass - return original chunks
-            return Ok((payload_chunk.clone(), sort_chunk.clone()));
-        }
-
-        // Some rows pass - create filtered chunks
-        let filtered_payload = self.copy_rows(payload_chunk, &passing_rows)?;
-        let filtered_sort = self.copy_rows_generic(sort_chunk, &passing_rows)?;
-        Ok((filtered_payload, filtered_sort))
-    }
-
     /// Add entries to a small heap with separate sort chunk (delayed payload copy).
     fn add_small_heap_with_sort(
         &mut self,
         payload_chunk: &Chunk,
         sort_chunk: &Chunk,
+        global_boundary: Option<&[u8]>,
     ) -> Result<()> {
         const BASE_INDEX: usize = u32::MAX as usize;
-
-        // The sort chunk materializes ORDER BY expressions densely as [0, 1, 2, ...].
-        let sort_indices: Vec<usize> = (0..sort_chunk.column_count()).collect();
 
         let mut any_added = false;
         let mut sort_key = Vec::new();
 
         // First pass: add entries with temporary indices
         for row_idx in 0..sort_chunk.size() {
-            self.encode_sort_key_into(sort_chunk, row_idx, &sort_indices, &mut sort_key)?;
+            self.encode_sort_key_into(sort_chunk, row_idx, &mut sort_key)?;
 
+            if global_boundary.is_some_and(|boundary| sort_key.as_slice() >= boundary) {
+                continue;
+            }
             if !self.should_add_entry(&sort_key) {
                 continue;
             }
 
-            let entry = TopNEntry::try_new(
-                std::mem::take(&mut sort_key),
-                BASE_INDEX + row_idx,
-                &self.memory,
-            )?;
+            let entry =
+                TopNEntry::try_from_scratch(&mut sort_key, BASE_INDEX + row_idx, &self.memory)?;
 
             self.add_entry_to_heap(entry)?;
             any_added = true;
@@ -551,19 +517,21 @@ impl TopNHeap {
         }
 
         if !rows_to_copy.is_empty() {
+            rows_to_copy.sort_unstable();
             // Copy the selected rows from payload chunk
             let new_chunk = self.copy_rows(payload_chunk, &rows_to_copy)?;
 
-            // Update indices in heap
-            let mut row_map = std::collections::HashMap::new();
-            for (new_idx, &old_idx) in rows_to_copy.iter().enumerate() {
-                row_map.insert(BASE_INDEX + old_idx, base_heap_data_size + new_idx);
-            }
-
-            // Reindex in place, then restore the heap invariant.
+            // The live frontier is at most `heap_size`; binary search avoids a
+            // separately allocated hash map on every input batch.
             for entry in self.heap.as_mut_slice() {
-                if let Some(&new_index) = row_map.get(&entry.index) {
-                    entry.index = new_index;
+                if entry.index >= BASE_INDEX {
+                    let source_row = entry.index - BASE_INDEX;
+                    let new_index = rows_to_copy.binary_search(&source_row).map_err(|_| {
+                        paro_common::error::internal(
+                            "temporary TopN payload row is missing from the live frontier",
+                        )
+                    })?;
+                    entry.index = base_heap_data_size + new_index;
                 }
             }
             self.heap.rebuild();
@@ -578,24 +546,26 @@ impl TopNHeap {
         &mut self,
         payload_chunk: &Chunk,
         sort_chunk: &Chunk,
+        global_boundary: Option<&[u8]>,
     ) -> Result<()> {
         let base_index = self.total_heap_data_size();
         let mut rows_to_copy = Vec::new();
 
-        // The sort chunk materializes ORDER BY expressions densely as [0, 1, 2, ...].
-        let sort_indices: Vec<usize> = (0..sort_chunk.column_count()).collect();
         let mut sort_key = Vec::new();
 
         // Process each row
         for row_idx in 0..sort_chunk.size() {
-            self.encode_sort_key_into(sort_chunk, row_idx, &sort_indices, &mut sort_key)?;
+            self.encode_sort_key_into(sort_chunk, row_idx, &mut sort_key)?;
 
+            if global_boundary.is_some_and(|boundary| sort_key.as_slice() >= boundary) {
+                continue;
+            }
             if !self.should_add_entry(&sort_key) {
                 continue;
             }
 
-            let entry = TopNEntry::try_new(
-                std::mem::take(&mut sort_key),
+            let entry = TopNEntry::try_from_scratch(
+                &mut sort_key,
                 base_index + rows_to_copy.len(),
                 &self.memory,
             )?;
@@ -610,36 +580,6 @@ impl TopNHeap {
         }
 
         Ok(())
-    }
-
-    /// Copy selected rows from a chunk (generic version for any chunk).
-    fn copy_rows_generic(&self, chunk: &Chunk, row_indices: &[usize]) -> Result<Chunk> {
-        use paro_common::vector::Vector;
-        use std::sync::Arc;
-
-        let mut output_vectors = Vec::with_capacity(chunk.data.len());
-
-        for col_idx in 0..chunk.column_count() {
-            let src_vec = &chunk.data[col_idx];
-            let col_type = src_vec.logical_type().clone();
-            let mut dst_vec =
-                Vector::try_new(col_type, row_indices.len(), chunk.allocator().clone())?;
-
-            for (dst_idx, &src_idx) in row_indices.iter().enumerate() {
-                if src_vec.is_null(src_idx) {
-                    dst_vec.try_set_null(dst_idx, true)?;
-                } else {
-                    dst_vec.try_copy_at(dst_idx, src_vec, src_idx)?;
-                }
-            }
-
-            dst_vec.try_set_count(row_indices.len())?;
-            output_vectors.push(Arc::new(dst_vec));
-        }
-
-        let mut result = Chunk::from_arc_vectors(output_vectors, chunk.allocator().clone());
-        result.try_set_cardinality(row_indices.len())?;
-        Ok(result)
     }
 
     /// Check if an entry should be added to the heap.
@@ -657,16 +597,10 @@ impl TopNHeap {
         false
     }
 
-    fn encode_sort_key_into(
-        &self,
-        chunk: &Chunk,
-        row_idx: usize,
-        columns: &[usize],
-        out: &mut Vec<u8>,
-    ) -> Result<()> {
-        debug_assert_eq!(columns.len(), self.modifiers.len());
+    fn encode_sort_key_into(&self, chunk: &Chunk, row_idx: usize, out: &mut Vec<u8>) -> Result<()> {
+        debug_assert_eq!(chunk.column_count(), self.modifiers.len());
         out.clear();
-        for (&column_idx, modifiers) in columns.iter().zip(self.modifiers.iter().copied()) {
+        for (column_idx, modifiers) in self.modifiers.iter().copied().enumerate() {
             let vector = chunk.column(column_idx).expect("sort column must exist");
             encode_column(vector, row_idx, modifiers, out)?;
         }
@@ -725,136 +659,6 @@ impl TopNHeap {
         dst.try_copy_at(dst_idx, src, src_idx)
     }
 
-    /// Combine another heap into this one.
-    ///
-    /// Used to merge results from parallel sinks.
-    pub fn combine(&mut self, other: &mut TopNHeap) -> Result<()> {
-        if self.heap_size != other.heap_size
-            || self.offset != other.offset
-            || self.modifiers != other.modifiers
-            || self.payload_types != other.payload_types
-            || !self.memory.has_same_target(&other.memory)
-        {
-            return Err(paro_common::error::internal(
-                "cannot combine incompatible TopN heaps",
-            ));
-        }
-
-        // One accounted candidate buffer replaces the previous left/right
-        // refs, selections, validation copies, remaps, and combined entry Vec.
-        let candidate_count = self
-            .heap
-            .len()
-            .checked_add(other.heap.len())
-            .ok_or_else(|| paro_common::error::internal("TopN candidate count overflow"))?;
-        let mut candidates = accounted_metadata_vec(&self.memory);
-        candidates.try_reserve(candidate_count)?;
-        for (heap_position, entry) in self.heap.iter().enumerate() {
-            candidates.try_push(CombineCandidate {
-                side: MergeSide::Left,
-                heap_position,
-                old_payload_index: entry.index,
-                new_payload_index: 0,
-            })?;
-        }
-        for (heap_position, entry) in other.heap.iter().enumerate() {
-            candidates.try_push(CombineCandidate {
-                side: MergeSide::Right,
-                heap_position,
-                old_payload_index: entry.index,
-                new_payload_index: 0,
-            })?;
-        }
-
-        candidates.sort_unstable_by_key(|candidate| (candidate.side, candidate.old_payload_index));
-        if candidates.windows(2).any(|pair| {
-            pair[0].side == pair[1].side && pair[0].old_payload_index == pair[1].old_payload_index
-        }) {
-            return Err(paro_common::error::internal(
-                "TopN heap contains duplicate live payload indices",
-            ));
-        }
-        candidates.sort_unstable_by(|left, right| {
-            candidate_entry(left, &self.heap, &other.heap)
-                .sort_key
-                .cmp(&candidate_entry(right, &self.heap, &other.heap).sort_key)
-                .then_with(|| left.side.cmp(&right.side))
-                .then_with(|| left.old_payload_index.cmp(&right.old_payload_index))
-        });
-        candidates.truncate(self.heap_size.min(candidates.len()));
-        candidates.sort_unstable_by_key(|candidate| (candidate.side, candidate.heap_position));
-        for (new_payload_index, candidate) in candidates.iter_mut().enumerate() {
-            candidate.new_payload_index = new_payload_index;
-        }
-        let expected_entries = candidates.len();
-        let left_count = candidates.partition_point(|candidate| candidate.side == MergeSide::Left);
-
-        // The final persistent heap backing is also metadata-accounted and
-        // admitted before any source ownership is touched.
-        let mut final_heap = TopNEntryHeap::try_with_capacity(&self.memory, expected_entries)?;
-
-        // Gather the complete final live set into an independent ownership
-        // domain. Both old heaps stay intact until every payload allocation and
-        // retention charge has succeeded, including later vector-sized batches.
-        let mut staged_data = RetainedChunkVec::new(self.memory.clone());
-        Self::for_each_gathered_rows(
-            &self.memory,
-            &self.payload_types,
-            self.heap_data.as_slice(),
-            left_count,
-            |row| candidates[row].old_payload_index,
-            |chunk| {
-                staged_data.push(chunk)?;
-                Ok(())
-            },
-        )?;
-        Self::for_each_gathered_rows(
-            &self.memory,
-            &self.payload_types,
-            other.heap_data.as_slice(),
-            expected_entries - left_count,
-            |row| candidates[left_count + row].old_payload_index,
-            |chunk| {
-                staged_data.push(chunk)?;
-                Ok(())
-            },
-        )?;
-
-        // Copy is complete. Transfer sort-key ownership and publish the new
-        // entry address domain without cloning keys or allocating metadata.
-        let mut candidate_index = 0usize;
-        for (heap_position, mut entry) in self.heap.drain().enumerate() {
-            let Some(candidate) = candidates.get(candidate_index) else {
-                break;
-            };
-            if candidate.side != MergeSide::Left || candidate.heap_position != heap_position {
-                continue;
-            }
-            entry.index = candidate.new_payload_index;
-            final_heap.push_prepared(entry);
-            candidate_index += 1;
-        }
-        candidate_index = left_count;
-        for (heap_position, mut entry) in other.heap.drain().enumerate() {
-            let Some(candidate) = candidates.get(candidate_index) else {
-                break;
-            };
-            if candidate.side != MergeSide::Right || candidate.heap_position != heap_position {
-                continue;
-            }
-            entry.index = candidate.new_payload_index;
-            final_heap.push_prepared(entry);
-            candidate_index += 1;
-        }
-        debug_assert_eq!(final_heap.len(), expected_entries);
-        self.heap = final_heap;
-        self.heap_data = staged_data;
-        other.heap = TopNEntryHeap::new(&other.memory);
-        other.heap_data = RetainedChunkVec::new(other.memory.clone());
-
-        Ok(())
-    }
-
     /// Get the total number of rows in heap_data.
     fn total_heap_data_size(&self) -> usize {
         self.heap_data.iter().map(|c| c.size()).sum()
@@ -866,9 +670,9 @@ impl TopNHeap {
     pub fn extract_results(&mut self) -> Result<Vec<Chunk>> {
         // A heap has no stable iteration order; sort its accounted backing in
         // place and consume it after output materialization succeeds.
-        self.heap
-            .as_mut_slice()
-            .sort_unstable_by(|left, right| left.sort_key.cmp(&right.sort_key));
+        self.heap.as_mut_slice().sort_unstable_by(|left, right| {
+            left.sort_key.as_slice().cmp(right.sort_key.as_slice())
+        });
 
         // Apply offset
         let start_idx = self.offset.min(self.heap.len());
@@ -925,17 +729,6 @@ fn accounted_metadata_vec<T>(memory: &MemoryAccountingContext) -> AccountedVec<T
         paro_common::allocator::MemoryTag::Metadata,
         MemoryAccountingClass::Metadata,
     )
-}
-
-fn candidate_entry<'a>(
-    candidate: &CombineCandidate,
-    left: &'a TopNEntryHeap,
-    right: &'a TopNEntryHeap,
-) -> &'a TopNEntry {
-    match candidate.side {
-        MergeSide::Left => &left.as_slice()[candidate.heap_position],
-        MergeSide::Right => &right.as_slice()[candidate.heap_position],
-    }
 }
 
 #[cfg(test)]
@@ -1100,6 +893,40 @@ mod tests {
     }
 
     #[test]
+    fn cross_worker_boundary_filters_in_the_heap_admission_pass() {
+        let boundary = TopNBoundaryValue::new();
+        let seed = make_int_chunk(&[1, 3]);
+        let mut seed_heap = manual_heap(&[], std::iter::empty(), 2);
+        seed_heap
+            .sink_with_sort_chunk(&seed, &seed, Some(&boundary))
+            .unwrap();
+
+        let candidates = make_int_chunk(&[2, 3, 4, 0]);
+        let mut worker_heap = manual_heap(&[], std::iter::empty(), 2);
+        worker_heap
+            .sink_with_sort_chunk(&candidates, &candidates, Some(&boundary))
+            .unwrap();
+
+        assert_eq!(extract_ints(&mut worker_heap), vec![0, 2]);
+    }
+
+    #[test]
+    fn underfilled_first_batch_retains_payload_vectors_until_seal() {
+        let input = make_int_chunk(&[3, 1, 2]);
+        let input_vector = Arc::clone(input.column(0).unwrap());
+        let mut heap = manual_heap(&[], std::iter::empty(), 100);
+
+        heap.sink_with_sort_chunk(&input, &input, None).unwrap();
+
+        assert_eq!(heap.heap_data.len(), 1);
+        assert!(Arc::ptr_eq(
+            heap.heap_data.as_slice()[0].column(0).unwrap(),
+            &input_vector,
+        ));
+        assert_eq!(extract_ints(&mut heap), vec![1, 2, 3]);
+    }
+
+    #[test]
     fn test_topn_entry_ordering() {
         let memory =
             MemoryAccountingContext::detached(MemoryTag::OrderBy, MemoryAccountingClass::Revocable);
@@ -1142,6 +969,21 @@ mod tests {
             .map(|idx| result_vec.get_i32(idx).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(values, vec![1, 2, 5]);
+    }
+
+    #[test]
+    fn bulk_combine_selects_once_across_worker_frontier() {
+        let mut target = manual_heap(&[vec![8, 3]], [(8, 0), (3, 1)], 3);
+        let right = manual_heap(&[vec![7, 2]], [(7, 0), (2, 1)], 3);
+        let tail = manual_heap(&[vec![6, 1]], [(6, 0), (1, 1)], 3);
+        let mut sources = vec![right, tail];
+
+        target.combine_many(&mut sources).unwrap();
+
+        assert!(sources
+            .iter()
+            .all(|source| source.heap.is_empty() && source.heap_data.is_empty()));
+        assert_eq!(extract_ints(&mut target), vec![1, 2, 3]);
     }
 
     #[test]
@@ -1315,7 +1157,9 @@ mod tests {
             MemoryAccountingClass::Revocable,
         );
         let orders = [OrderByNode {
-            expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            expression: Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            ),
             ascending: true,
             nulls_first: false,
         }];

@@ -12,9 +12,6 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_context::{RuntimeLimits, StatementContext, TestStatementContextBuilder};
 use paro_execution::memory_runtime::QueryMemoryPool;
-use paro_execution::physical::properties::{Parallelism, PipelineProperties};
-use paro_execution::physical::row_type::RowType;
-use paro_execution::physical::specs::ChunkScanSpec;
 use paro_execution::pipeline::graph::{
     ClientResultSpec, PipelineGraph, PipelineId, PipelineRoot, PipelineSpec, SinkSharing, SinkSpec,
     SourceSpec,
@@ -25,6 +22,9 @@ use paro_execution::runtime::{
     BreakerHandleRegistry, ParameterBindings, PipelineScheduler, QueryOutputPort,
     QueryRuntimeContext,
 };
+use paro_planner::physical::properties::{Parallelism, PipelineProperties};
+use paro_planner::physical::row_type::RowType;
+use paro_planner::physical::specs::ChunkScanSpec;
 
 const SOURCE_CHUNKS: usize = 1_024;
 const WORKER_THREADS: usize = 4;

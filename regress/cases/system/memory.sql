@@ -3,8 +3,8 @@
 
 -- @setup
 DROP TABLE IF EXISTS memory_dummy;
-CREATE TABLE memory_dummy (x INT);
-INSERT INTO memory_dummy VALUES (1);
+CREATE TABLE memory_dummy (x INT, startup_memory VARCHAR);
+INSERT INTO memory_dummy VALUES (1, current_setting('memory_limit'));
 SELECT 1;
 SELECT count(*) FROM memory_dummy;
 
@@ -33,7 +33,9 @@ SELECT count(*) >= 0 FROM paro_temporary_files();
 
 -- RESET tests
 SET memory_limit = DEFAULT;
-SELECT current_setting('memory_limit') FROM memory_dummy;
+-- DEFAULT restores the server's declared envelope, not a hard-coded 1 GB.
+SELECT current_setting('memory_limit') = startup_memory AS restored_startup_envelope
+FROM memory_dummy;
 
 SET temp_directory = DEFAULT;
 SELECT current_setting('temp_directory') <> '(empty)' AS has_default_temp_directory

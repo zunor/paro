@@ -8,7 +8,7 @@
 //! Used when compression is disabled or when data is incompressible.
 
 use super::{BlockCompressionCodec, BlockCompressionType};
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 
 /// No-op compression codec.
 ///
@@ -30,6 +30,24 @@ impl BlockCompressionCodec for NoBlockCompression {
 
     fn decompress(&self, input: &[u8], _uncompressed_size: usize) -> Result<Vec<u8>> {
         Ok(input.to_vec())
+    }
+
+    fn decompress_into(
+        &self,
+        input: &[u8],
+        uncompressed_size: usize,
+        output: &mut [u8],
+    ) -> Result<()> {
+        if output.len() != uncompressed_size || input.len() != uncompressed_size {
+            return Err(paro_error::invalid_input(format!(
+                "no-compression input/output sizes ({}/{}) do not match expected size {}",
+                input.len(),
+                output.len(),
+                uncompressed_size
+            )));
+        }
+        output.copy_from_slice(input);
+        Ok(())
     }
 
     fn max_compressed_len(&self, input_len: usize) -> usize {

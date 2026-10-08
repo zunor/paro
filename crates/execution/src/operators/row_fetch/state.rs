@@ -11,6 +11,20 @@ use paro_storage::tablet::TabletRowIdReader;
 use crate::expression_executor::executor::ExpressionExecutor;
 
 #[derive(Debug)]
+pub struct RowFetchTableBinding {
+    pub table_name: String,
+    pub rowid_col_idx: usize,
+    pub storage: Arc<TableHandle>,
+    pub storage_snapshot: Arc<StorageSnapshot>,
+    pub column_ids: Box<[u32]>,
+}
+
+#[derive(Debug)]
+pub struct RowFetchTransformGlobal {
+    pub table_fetches: Box<[RowFetchTableBinding]>,
+}
+
+#[derive(Debug)]
 pub struct RowFetchTableState {
     pub table_name: String,
     pub rowid_col_idx: usize,
@@ -22,6 +36,20 @@ pub struct RowFetchTableState {
     pub reader: Option<TabletRowIdReader>,
     pub rowids: Vec<u64>,
     pub column_ids: Box<[u32]>,
+}
+
+impl RowFetchTableState {
+    pub fn from_binding(binding: &RowFetchTableBinding) -> Self {
+        Self {
+            table_name: binding.table_name.clone(),
+            rowid_col_idx: binding.rowid_col_idx,
+            storage: Arc::clone(&binding.storage),
+            storage_snapshot: Arc::clone(&binding.storage_snapshot),
+            reader: None,
+            rowids: Vec::new(),
+            column_ids: binding.column_ids.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]

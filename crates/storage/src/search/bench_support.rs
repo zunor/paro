@@ -17,14 +17,18 @@ use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
-use crate::index::hnsw::SearchParams;
+use crate::buffer::{BufferPool, PageCache};
+use crate::metrics::storage_metrics;
+use crate::rowset::SegmentRowId;
 use crate::table::table_factory::TableFactory;
 use crate::table::table_handle::TableHandle;
 
 use super::artifact::SegmentPagePointer;
-use super::budget::{ResourceBudget, SearchBatchConfig};
 use super::capability::{ArtifactSegmentRef, CoverageState, SearchArtifactRef, SearchIndexKind};
-use super::cursor::{SearchBatchState, SearchReadSnapshot};
+use super::cursor::{
+    GenerationArtifactSet, GenerationReadLease, GenerationReadSnapshot, SearchReadOptions,
+    SearchReadSnapshot, TableReadLease,
+};
 use super::inline_sink::{
     CostEstimate, FullTextStatsDelta, MaintenanceBenefit, MaintenanceCost, SearchStatsDelta,
 };
@@ -38,6 +42,7 @@ use super::manifest::{
     ManifestStore,
 };
 use super::row_fetch::{RowFetchMode, SearchRowFetcher};
+use super::sidecar::{SearchReaderRuntime, SidecarArtifactStore};
 use super::stats::{
     CatchUpBacklogTier, ExecutionModes, FullTextProviderStats, GenerationMaintenanceState,
     GenerationStats, MaintenancePriority, SearchArtifactStats, SearchProviderStats,
@@ -401,10 +406,24 @@ pub struct RowFetchBenchSummary {
     pub projected_bytes: usize,
     pub column_read_by_rowids_page_run_seeks: usize,
     pub search_layer_varlen_fallback_seek_count: usize,
+    pub decoded_page_cache_hits: u64,
+    pub decoded_page_cache_misses: u64,
+    pub decoded_page_cache_first_touch_admissions: u64,
+    pub decoded_page_cache_probation_promotions: u64,
+    pub decoded_page_cache_policy_rejections: u64,
 }
 
 impl RowFetchBenchFixture {
     pub fn new(config: RowFetchBenchConfig) -> Result<Self> {
+        if config.row_count == 0
+            || config.candidate_count == 0
+            || config.candidate_count > config.row_count
+            || config.row_count > u32::MAX as usize
+        {
+            return Err(paro_common::error::invalid_input(
+                "row-fetch benchmark requires 0 < candidate_count <= row_count <= u32::MAX",
+            ));
+        }
         let table = TableFactory::default().create_table(&[
             LogicalType::Array(Box::new(LogicalType::Float), 2),
             LogicalType::Varchar,
@@ -412,35 +431,57 @@ impl RowFetchBenchFixture {
         ])?;
         let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
         table.append(&row_fetch_bench_chunk(config.row_count, allocator)?)?;
-        let opened = table.open_vector_search_cursor(
-            0,
-            &[0.0, 0.0],
-            crate::index::hnsw::DistanceMetric::Euclidean,
-            config.candidate_count,
-            SearchParams {
-                ef: Some(128),
-                ..Default::default()
-            },
-            None,
+        let page_cache = Arc::new(PageCache::new(BufferPool::new_arc(64 * 1024 * 1024)));
+        let visible_version = table.max_version();
+        let read_options = SearchReadOptions::with_page_cache(page_cache);
+        let (table_snapshot, table_lease) = TableReadLease::open(
+            &table.tablet(),
+            table.table_id(),
             table.max_version(),
-            &crate::search::SearchReadOptions::ungoverned(),
+            &read_options,
         )?;
-        let mut cursor = opened.cursor;
-        let snapshot = opened.snapshot;
-        let mut budget = ResourceBudget::standalone(64 * 1024 * 1024, config.candidate_count, 1);
-        let rows = loop {
-            match cursor.next_batch(
-                &SearchBatchConfig {
-                    row_limit: config.candidate_count,
-                    preferred_bytes: 1 << 20,
-                },
-                &mut budget,
-            )? {
-                SearchBatchState::Ready(batch) if batch.is_empty() => continue,
-                SearchBatchState::Ready(batch) => break batch.rows,
-                SearchBatchState::Exhausted => break Vec::new(),
-            }
+        let generation = GenerationReadSnapshot {
+            definition_id: 1,
+            generation_id: 1,
+            build_epoch: 1,
+            build_snapshot_version: visible_version,
+            indexed_through_ts: visible_version.max(0) as u64,
+            coverage: CoverageState::Complete,
+            generation_stats: GenerationStats::default(),
+            maintenance_state: GenerationMaintenanceState::default(),
+            provider_config: Arc::new(serde_json::Value::Null),
+            hnsw_provider_config: None,
+            hnsw_query_activity: None,
+            artifacts: Arc::new(GenerationArtifactSet::default()),
+            tail_pending_entries: Arc::from([]),
         };
+        let generation_lease = GenerationReadLease::from_snapshot(&generation);
+        let snapshot = SearchReadSnapshot::new(
+            table_snapshot,
+            SearchIndexKind::Hnsw,
+            generation,
+            table_lease.clone(),
+            generation_lease,
+            Arc::new(SearchReaderRuntime::new(SidecarArtifactStore::new(
+                table.tablet().data_dir().clone(),
+            ))),
+        );
+        let segment = table_lease
+            .visible_segments()
+            .first()
+            .ok_or_else(|| paro_common::error::internal("row-fetch benchmark has no segment"))?;
+        let (rowset_id, segment_id) = segment.key();
+        let rows = (0..config.candidate_count)
+            .map(|index| {
+                let row_index = (index as u128 * config.row_count as u128
+                    / config.candidate_count as u128) as u32;
+                super::cursor::PhysicalRowRef::new(
+                    rowset_id,
+                    segment_id,
+                    SegmentRowId::from_raw(row_index),
+                )
+            })
+            .collect();
         Ok(Self {
             table,
             snapshot,
@@ -449,11 +490,13 @@ impl RowFetchBenchFixture {
     }
 
     pub fn run_once(&self) -> Result<RowFetchBenchSummary> {
+        let metrics_before = storage_metrics().snapshot();
         let projected = SearchRowFetcher::new(&self.snapshot, self.table.types()).fetch_batch(
             &self.rows,
             &[2, 1],
             RowFetchMode::materialize(self.rows.len()),
         )?;
+        let metrics_after = storage_metrics().snapshot();
         Ok(RowFetchBenchSummary {
             elapsed_ms: projected.stats.elapsed_micros as f64 / 1000.0,
             rows: projected.stats.rows,
@@ -467,6 +510,21 @@ impl RowFetchBenchFixture {
                 .stats
                 .column_read_by_rowids_page_run_seeks,
             search_layer_varlen_fallback_seek_count: 0,
+            decoded_page_cache_hits: metrics_after
+                .decoded_page_cache_hits
+                .saturating_sub(metrics_before.decoded_page_cache_hits),
+            decoded_page_cache_misses: metrics_after
+                .decoded_page_cache_misses
+                .saturating_sub(metrics_before.decoded_page_cache_misses),
+            decoded_page_cache_first_touch_admissions: metrics_after
+                .decoded_page_cache_first_touch_admissions
+                .saturating_sub(metrics_before.decoded_page_cache_first_touch_admissions),
+            decoded_page_cache_probation_promotions: metrics_after
+                .decoded_page_cache_probation_promotions
+                .saturating_sub(metrics_before.decoded_page_cache_probation_promotions),
+            decoded_page_cache_policy_rejections: metrics_after
+                .decoded_page_cache_policy_rejections
+                .saturating_sub(metrics_before.decoded_page_cache_policy_rejections),
         })
     }
 }

@@ -9,6 +9,7 @@
 //! It's the default choice for hot data.
 
 use super::{BlockCompressionCodec, BlockCompressionType};
+use paro_common::cold_work::{Kind, WorkScope};
 use paro_common::error::{self as paro_error, Result};
 
 /// LZ4 block compression codec.
@@ -32,6 +33,36 @@ pub(crate) fn decompress_size_prepended_exact(
     input: &[u8],
     expected_size: usize,
 ) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let reserved = {
+        let _work = WorkScope::bitshuffle_decompress_child(Kind::Lz4Reserve, expected_size);
+        output.try_reserve_exact(expected_size)
+    };
+    reserved.map_err(|error| {
+        paro_error::out_of_memory(format!(
+            "Failed to reserve {expected_size} bytes for LZ4 decompression: {error}"
+        ))
+    })?;
+    {
+        let _work = WorkScope::bitshuffle_decompress_child(Kind::Lz4Initialize, expected_size);
+        output.resize(expected_size, 0);
+    }
+    decompress_size_prepended_into(input, expected_size, &mut output)?;
+    Ok(output)
+}
+
+pub(crate) fn decompress_size_prepended_into(
+    input: &[u8],
+    expected_size: usize,
+    output: &mut [u8],
+) -> Result<()> {
+    if output.len() != expected_size {
+        return Err(paro_error::invalid_input(format!(
+            "LZ4 destination size {} does not match expected size {}",
+            output.len(),
+            expected_size
+        )));
+    }
     let size_prefix = input
         .get(..4)
         .ok_or_else(|| paro_error::data_corrupted("LZ4 block is shorter than its size prefix"))?;
@@ -43,23 +74,19 @@ pub(crate) fn decompress_size_prepended_exact(
         )));
     }
 
-    let mut output = Vec::new();
-    output.try_reserve_exact(expected_size).map_err(|error| {
-        paro_error::out_of_memory(format!(
-            "Failed to reserve {expected_size} bytes for LZ4 decompression: {error}"
-        ))
+    let decoded = {
+        let _work = WorkScope::bitshuffle_decompress_child(Kind::Lz4Core, input.len() - 4);
+        lz4_flex::block::decompress_into(&input[4..], output)
+    };
+    let decoded_size = decoded.map_err(|error| {
+        paro_error::data_corrupted(format!("LZ4 decompression failed: {error}"))
     })?;
-    output.resize(expected_size, 0);
-    let decoded_size =
-        lz4_flex::block::decompress_into(&input[4..], &mut output).map_err(|error| {
-            paro_error::data_corrupted(format!("LZ4 decompression failed: {error}"))
-        })?;
     if decoded_size != expected_size {
         return Err(paro_error::data_corrupted(format!(
             "LZ4 decoded size {decoded_size} does not match expected size {expected_size}"
         )));
     }
-    Ok(output)
+    Ok(())
 }
 
 impl BlockCompressionCodec for Lz4BlockCompression {
@@ -71,6 +98,15 @@ impl BlockCompressionCodec for Lz4BlockCompression {
 
     fn decompress(&self, input: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
         decompress_size_prepended_exact(input, uncompressed_size)
+    }
+
+    fn decompress_into(
+        &self,
+        input: &[u8],
+        uncompressed_size: usize,
+        output: &mut [u8],
+    ) -> Result<()> {
+        decompress_size_prepended_into(input, uncompressed_size, output)
     }
 
     fn max_compressed_len(&self, input_len: usize) -> usize {
@@ -86,6 +122,78 @@ impl BlockCompressionCodec for Lz4BlockCompression {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_common::cold_work::with_test_window;
+
+    #[test]
+    fn test_lz4_cold_work_children_only_split_bitshuffle_parent() {
+        let data = b"bounded diagnostic output";
+        let compressed = lz4_flex::compress_prepend_size(data);
+        let (_, plain) = with_test_window(|| {
+            assert_eq!(
+                decompress_size_prepended_exact(&compressed, data.len()).unwrap(),
+                data
+            );
+        });
+        for kind in [Kind::Lz4Reserve, Kind::Lz4Initialize, Kind::Lz4Core] {
+            assert_eq!(plain.metrics[kind as usize][0], 0);
+        }
+        let (_, split) = with_test_window(|| {
+            let _parent = WorkScope::new(Kind::BitShuffleDecompress, compressed.len()).unwrap();
+            assert_eq!(
+                decompress_size_prepended_exact(&compressed, data.len()).unwrap(),
+                data
+            );
+        });
+        assert!(split.valid);
+        for kind in [Kind::Lz4Reserve, Kind::Lz4Initialize] {
+            assert_eq!(split.metrics[kind as usize][..2], [1, data.len() as u64]);
+        }
+        assert_eq!(
+            split.metrics[Kind::Lz4Core as usize][..2],
+            [1, (compressed.len() - 4) as u64]
+        );
+        assert_eq!(split.metrics[Kind::BitShuffleDecompress as usize][0], 1);
+    }
+
+    #[test]
+    fn test_lz4_cold_work_bad_input_and_reserve_failure_restore_parent() {
+        // A matching prefix followed by a truncated literal reaches LZ4 core.
+        let corrupt = [1, 0, 0, 0, 0x10];
+        let (_, record) = with_test_window(|| {
+            let _parent = WorkScope::new(Kind::BitShuffleDecompress, corrupt.len()).unwrap();
+            assert!(decompress_size_prepended_exact(&corrupt, 1).is_err());
+            assert!(decompress_size_prepended_exact(&[], 1).is_err());
+            // Capacity overflow is deterministic and cannot request real memory.
+            assert!(decompress_size_prepended_exact(&[], isize::MAX as usize + 1).is_err());
+            let compressed = lz4_flex::compress_prepend_size(b"ok");
+            assert_eq!(
+                decompress_size_prepended_exact(&compressed, 2).unwrap(),
+                b"ok"
+            );
+        });
+        assert!(record.valid);
+        assert_eq!(record.metrics[Kind::Lz4Reserve as usize][0], 4);
+        assert_eq!(record.metrics[Kind::Lz4Initialize as usize][0], 3);
+        assert_eq!(record.metrics[Kind::Lz4Core as usize][0], 2);
+        assert_eq!(record.metrics[Kind::BitShuffleDecompress as usize][0], 1);
+    }
+
+    #[test]
+    fn test_lz4_cold_work_existing_destination_times_only_validated_core() {
+        let compressed = lz4_flex::compress_prepend_size(b"ok");
+        let (_, record) = with_test_window(|| {
+            let _parent = WorkScope::new(Kind::BitShuffleDecompress, compressed.len()).unwrap();
+            let mut output = [0; 2];
+            assert!(decompress_size_prepended_into(&compressed, 1, &mut output).is_err());
+            assert!(decompress_size_prepended_into(&[0, 0, 0, 0], 2, &mut output).is_err());
+            decompress_size_prepended_into(&compressed, 2, &mut output).unwrap();
+            assert_eq!(output, *b"ok");
+        });
+        assert!(record.valid);
+        assert_eq!(record.metrics[Kind::Lz4Reserve as usize][0], 0);
+        assert_eq!(record.metrics[Kind::Lz4Initialize as usize][0], 0);
+        assert_eq!(record.metrics[Kind::Lz4Core as usize][0], 1);
+    }
 
     #[test]
     fn test_lz4_roundtrip() {

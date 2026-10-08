@@ -351,12 +351,18 @@ fn bind_using_clause(
         // Find column in right table
         let right_col = find_column_in_tableref(binder, right, &col_str)?;
 
-        // Create equality condition
-        let eq_expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::ColumnRef(left_col),
-            Expression::ColumnRef(right_col),
-        ));
+        // USING is a bound comparison just like an explicit ON predicate. In
+        // particular, independently declared columns may need a widening cast
+        // before the executor can compare them.
+        let eq_expr = {
+            let mut expression_binder = expr::ExpressionBinder::new(binder);
+            expr::bind_bound_comparison(
+                &mut expression_binder,
+                Expression::ColumnRef(left_col.into()),
+                Expression::ColumnRef(right_col.into()),
+                ComparisonType::Equal,
+            )?
+        };
 
         conditions.push(eq_expr);
     }
@@ -365,10 +371,13 @@ fn bind_using_clause(
     if conditions.len() == 1 {
         Ok(Some(conditions.pop().unwrap()))
     } else {
-        Ok(Some(Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::And,
-            children: conditions,
-        })))
+        Ok(Some(Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::And,
+                children: conditions,
+            }
+            .into(),
+        )))
     }
 }
 
@@ -387,7 +396,7 @@ fn find_column_in_tableref(
         column_index: usize,
         return_type: LogicalType,
     ) -> ColumnRefExpression {
-        use crate::operator::ColumnBinding;
+        use crate::logical::operator::ColumnBinding;
         ColumnRefExpression::new(ColumnBinding::new(table_index, column_index), return_type)
     }
 

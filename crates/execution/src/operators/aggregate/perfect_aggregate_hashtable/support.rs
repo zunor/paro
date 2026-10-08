@@ -9,9 +9,9 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryGrant};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
-use paro_function::aggregate::{AggregateDirectUpdate, DirectGroupedAggregateProgram};
+use paro_function::aggregate::DirectGroupedAggregateProgram;
 
-use super::{AggregateObject, AggregateStateLayout};
+use super::AggregateObject;
 
 pub(super) fn compact_state_addresses(
     addresses: &mut Vector,
@@ -61,37 +61,6 @@ pub(super) fn validate_aggregate_inputs(
         }
     }
     Ok(())
-}
-
-fn direct_payload_input(object: &AggregateObject, inputs: &[usize]) -> Option<usize> {
-    if object.function.direct_update == Some(AggregateDirectUpdate::CountStar) {
-        return None;
-    }
-    inputs.first().copied()
-}
-
-pub(crate) fn compile_direct_update_program(
-    aggregate_objects: &[AggregateObject],
-    aggregate_inputs: &[Vec<usize>],
-    state_layout: &AggregateStateLayout,
-) -> DirectGroupedAggregateProgram {
-    let mut program = DirectGroupedAggregateProgram::new(aggregate_objects.len());
-    for (aggregate_index, object) in aggregate_objects.iter().enumerate() {
-        let Some(inputs) = aggregate_inputs.get(aggregate_index) else {
-            continue;
-        };
-        if object.is_distinct() || object.filter.is_some() || !object.order_bys.is_empty() {
-            continue;
-        }
-        program.try_add(
-            aggregate_index,
-            object.function.direct_update,
-            state_layout.state_offset(aggregate_index),
-            direct_payload_input(object, inputs),
-            object.function.state_is_trivially_copyable(),
-        );
-    }
-    program
 }
 
 pub(super) fn validate_addresses_vector(addresses: &Vector, row_count: usize) -> Result<()> {

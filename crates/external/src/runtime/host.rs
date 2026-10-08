@@ -5,14 +5,14 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::process::Command;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use paro_common::error::{self as paro_error, Result};
 use tracing::{info, warn};
 
 use crate::runtime::artifact::gc::ArtifactGcPolicy;
-use crate::runtime::dispatch::permits::PermitBudget;
+use crate::runtime::dispatch::permits::{PermitBudget, PermitPool, PermitTicket};
 use crate::runtime::dispatch::policy::ExternalDispatchPolicy;
 use crate::runtime::metrics::autotuning::AutotuningPolicy;
 use crate::runtime::protocol::version::RuntimeProtocolVersion;
@@ -134,9 +134,149 @@ pub trait PythonRuntimeProvider: Send + Sync {
     fn status(&self) -> PythonRuntimeStatus;
     fn ensure_ready_for_ddl(&self) -> Result<()>;
     fn ensure_ready_for_execution(&self) -> Result<()>;
+    fn execution_slot_limit(&self) -> u16;
+    fn try_acquire_execution_slots(
+        &self,
+        query_id: u64,
+        slots: u16,
+    ) -> Result<Option<ExternalWorkerLease>>;
     fn force_reprobe(&self) -> PythonRuntimeStatus;
     fn observe_worker_failure(&self, _message: &str) -> PythonRuntimeStatus {
         self.status()
+    }
+}
+
+/// Query-lifetime ownership of external worker capacity. The optimizer may
+/// select a worker-dependent variant only after this lease has been acquired.
+pub struct ExternalWorkerLease {
+    state: Arc<ExternalWorkerLeaseState>,
+}
+
+struct ExternalWorkerLeaseState {
+    permits: Arc<Mutex<PermitPool>>,
+    tickets: Vec<PermitTicket>,
+    dispatch_available: Mutex<usize>,
+    dispatch_ready: Condvar,
+}
+
+/// Query-scoped gate for calls into an external worker runtime.
+///
+/// Clones retain the underlying host reservation, so a dispatch can never
+/// outlive the capacity that admitted it.
+#[derive(Clone)]
+pub struct ExternalDispatchGate {
+    state: Arc<ExternalWorkerLeaseState>,
+}
+
+/// One checked-out slot from an [`ExternalDispatchGate`].
+pub struct ExternalDispatchPermit {
+    state: Arc<ExternalWorkerLeaseState>,
+}
+
+impl fmt::Debug for ExternalWorkerLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalWorkerLease")
+            .field("slots", &self.state.tickets.len())
+            .finish()
+    }
+}
+
+impl ExternalWorkerLease {
+    fn new(permits: Arc<Mutex<PermitPool>>, tickets: Vec<PermitTicket>) -> Self {
+        let slots = tickets.len();
+        Self {
+            state: Arc::new(ExternalWorkerLeaseState {
+                permits,
+                tickets,
+                dispatch_available: Mutex::new(slots),
+                dispatch_ready: Condvar::new(),
+            }),
+        }
+    }
+
+    pub fn slots(&self) -> u16 {
+        self.state.tickets.len().min(u16::MAX as usize) as u16
+    }
+
+    pub fn dispatch_gate(&self) -> ExternalDispatchGate {
+        ExternalDispatchGate {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl fmt::Debug for ExternalDispatchGate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalDispatchGate")
+            .field("slots", &self.state.tickets.len())
+            .finish()
+    }
+}
+
+impl ExternalDispatchGate {
+    pub fn acquire(&self) -> ExternalDispatchPermit {
+        let mut available = self
+            .state
+            .dispatch_available
+            .lock()
+            .expect("external dispatch gate lock poisoned");
+        while *available == 0 {
+            available = self
+                .state
+                .dispatch_ready
+                .wait(available)
+                .expect("external dispatch gate lock poisoned");
+        }
+        *available -= 1;
+        ExternalDispatchPermit {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub fn try_acquire(&self) -> Option<ExternalDispatchPermit> {
+        let mut available = self
+            .state
+            .dispatch_available
+            .lock()
+            .expect("external dispatch gate lock poisoned");
+        if *available == 0 {
+            return None;
+        }
+        *available -= 1;
+        Some(ExternalDispatchPermit {
+            state: Arc::clone(&self.state),
+        })
+    }
+}
+
+impl fmt::Debug for ExternalDispatchPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalDispatchPermit")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ExternalDispatchPermit {
+    fn drop(&mut self) {
+        let mut available = self
+            .state
+            .dispatch_available
+            .lock()
+            .expect("external dispatch gate lock poisoned");
+        *available = available.saturating_add(1);
+        self.state.dispatch_ready.notify_one();
+    }
+}
+
+impl Drop for ExternalWorkerLeaseState {
+    fn drop(&mut self) {
+        let mut permits = self
+            .permits
+            .lock()
+            .expect("external worker permit pool lock poisoned");
+        for ticket in self.tickets.drain(..) {
+            permits.release(ticket);
+        }
     }
 }
 
@@ -237,6 +377,7 @@ pub struct ExternalRuntimeHost {
     dispatch_policy: ExternalDispatchPolicy,
     worker_pool_policy: WorkerPoolPolicy,
     permit_budget: PermitBudget,
+    permits: Arc<Mutex<PermitPool>>,
     artifact_gc_policy: ArtifactGcPolicy,
     autotuning_policy: AutotuningPolicy,
     degraded_retry_base: Duration,
@@ -268,12 +409,14 @@ impl fmt::Debug for ExternalRuntimeHost {
 
 impl ExternalRuntimeHost {
     pub fn new() -> Self {
+        let permit_budget = PermitBudget::default();
         Self {
             protocol: RuntimeProtocolVersion::current(),
             startup_policy: PythonRuntimeStartupPolicy::LazyBestEffort,
             dispatch_policy: ExternalDispatchPolicy::default(),
             worker_pool_policy: WorkerPoolPolicy::default(),
-            permit_budget: PermitBudget::default(),
+            permits: Arc::new(Mutex::new(PermitPool::new(permit_budget.clone()))),
+            permit_budget,
             artifact_gc_policy: ArtifactGcPolicy::default(),
             autotuning_policy: AutotuningPolicy::default(),
             degraded_retry_base: DEFAULT_REPROBE_BASE,
@@ -492,6 +635,47 @@ impl PythonRuntimeProvider for ExternalRuntimeHost {
         self.ensure_ready("external routine execution")
     }
 
+    fn execution_slot_limit(&self) -> u16 {
+        self.permit_budget
+            .global_external_permits
+            .min(self.permit_budget.per_shard_permits)
+            .min(self.permit_budget.per_query_permits)
+            .min(u16::MAX as usize) as u16
+    }
+
+    fn try_acquire_execution_slots(
+        &self,
+        query_id: u64,
+        slots: u16,
+    ) -> Result<Option<ExternalWorkerLease>> {
+        if slots == 0 {
+            return Ok(Some(ExternalWorkerLease::new(
+                self.permits.clone(),
+                Vec::new(),
+            )));
+        }
+        self.ensure_ready("external routine execution")?;
+        let mut permits = self
+            .permits
+            .lock()
+            .expect("external worker permit pool lock poisoned");
+        let mut tickets = Vec::with_capacity(slots as usize);
+        for _ in 0..slots {
+            let Some(ticket) = permits.try_acquire("python", query_id) else {
+                for ticket in tickets.drain(..) {
+                    permits.release(ticket);
+                }
+                return Ok(None);
+            };
+            tickets.push(ticket);
+        }
+        drop(permits);
+        Ok(Some(ExternalWorkerLease::new(
+            self.permits.clone(),
+            tickets,
+        )))
+    }
+
     fn force_reprobe(&self) -> PythonRuntimeStatus {
         self.run_probe()
     }
@@ -560,4 +744,52 @@ fn env_flag_enabled(name: &str) -> bool {
 
 fn display_os(value: &OsStr) -> String {
     value.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExternalRuntimeHost, PythonRuntimeProvider};
+
+    #[test]
+    fn execution_slot_lease_is_held_until_drop() {
+        let host = ExternalRuntimeHost::ready_stub();
+        let slot_limit = host.execution_slot_limit();
+        let lease = host
+            .try_acquire_execution_slots(1, slot_limit)
+            .unwrap()
+            .expect("first query should acquire the full per-query budget");
+        let second_lease = host
+            .try_acquire_execution_slots(2, slot_limit)
+            .unwrap()
+            .expect("second query should fill the shard budget");
+        assert_eq!(lease.slots(), slot_limit);
+        assert!(host.try_acquire_execution_slots(3, 1).unwrap().is_none());
+
+        drop(lease);
+        assert_eq!(
+            host.try_acquire_execution_slots(3, 1)
+                .unwrap()
+                .expect("released permit should be reusable")
+                .slots(),
+            1
+        );
+        drop(second_lease);
+    }
+
+    #[test]
+    fn execution_slot_lease_gates_each_dispatch() {
+        let host = ExternalRuntimeHost::ready_stub();
+        let lease = host
+            .try_acquire_execution_slots(1, 1)
+            .unwrap()
+            .expect("query should acquire one worker slot");
+        let gate = lease.dispatch_gate();
+
+        let permit = gate
+            .try_acquire()
+            .expect("reserved worker slot should be dispatchable");
+        assert!(gate.try_acquire().is_none());
+        drop(permit);
+        assert!(gate.try_acquire().is_some());
+    }
 }

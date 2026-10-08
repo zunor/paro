@@ -323,7 +323,10 @@ impl InstanceConfigOptions {
             // Production code should use None (system default)
             maximum_threads: Some(1),
             pin_threads: ThreadAffinityMode::Auto,
-            use_temporary_directory: false,
+            // `:memory:` describes durable database state, not query scratch.
+            // Exact blocking operators still need a bounded external fallback
+            // when their input has no schema-invariant cardinality bound.
+            use_temporary_directory: true,
             enable_external_access: false,
             ..Default::default()
         }

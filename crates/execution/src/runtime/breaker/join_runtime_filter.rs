@@ -18,6 +18,7 @@ use paro_common::memory::{
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{DataRef, SelectionVector, Vector, VECTOR_SIZE};
+use paro_planner::physical::{RuntimeFilterKeyRepresentation, RuntimeFilterResourceContract};
 use paro_storage::index::{
     ColumnId, FixedMembership, FixedMembershipBuildPolicy, Predicate, PredicateTree,
 };
@@ -25,23 +26,54 @@ use paro_storage::index::{
 /// Bounded construction policy for analytical join filters.
 ///
 /// The mutable domain is capped independently from its frozen representation.
-/// A frozen dense set can spend up to 8 MiB and at most 256 bits per retained
-/// value, which covers fact-table key domains without allowing sparse endpoint
-/// ranges to dictate allocation size. Domains beyond the exact-value budget
+/// A frozen dense set can spend up to 8 MiB when the physical consumer's
+/// expected probe work pays back its initialization. Sparse or short-lived
+/// consumers retain sorted storage. Domains beyond the exact-value budget
 /// retain min/max only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JoinRuntimeFilterPolicy {
     max_exact_values: usize,
+    max_range_value_bytes: usize,
     membership: FixedMembershipBuildPolicy,
+    freeze_additional_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeFilterBuilderScope {
+    Local,
+    Global,
 }
 
 const MIN_EXACT_PENDING_VALUES: usize = VECTOR_SIZE;
 
-impl Default for JoinRuntimeFilterPolicy {
-    fn default() -> Self {
+impl JoinRuntimeFilterPolicy {
+    fn from_contract(
+        contract: &RuntimeFilterResourceContract,
+        representation: RuntimeFilterKeyRepresentation,
+        scope: RuntimeFilterBuilderScope,
+    ) -> Self {
+        let value_width = representation.value_width();
+        let max_exact_values = match scope {
+            RuntimeFilterBuilderScope::Local => contract.max_local_exact_values,
+            RuntimeFilterBuilderScope::Global => contract.max_global_exact_values,
+        } as usize;
+        let transfer = max_exact_values.saturating_mul(value_width);
+        // Dense point lookup is an accelerator layered over the canonical
+        // sorted domain. Account for both retained representations; the
+        // canonical copy keeps interval probes and enumeration independent of
+        // gaps in the dense address space.
+        let frozen = (contract.max_dense_bits as usize)
+            .div_ceil(u64::BITS as usize)
+            .saturating_mul(std::mem::size_of::<u64>())
+            .saturating_add(transfer);
         Self {
-            max_exact_values: 512 * 1024,
-            membership: FixedMembershipBuildPolicy::new(64 * 1024 * 1024, 256),
+            max_exact_values,
+            max_range_value_bytes: contract.max_range_value_bytes as usize,
+            membership: FixedMembershipBuildPolicy::new(
+                contract.max_dense_bits as usize,
+                usize::try_from(contract.expected_probe_rows).unwrap_or(usize::MAX),
+            ),
+            freeze_additional_bytes: transfer.saturating_add(frozen),
         }
     }
 }
@@ -70,6 +102,9 @@ enum ExactValues<T> {
 #[derive(Debug)]
 struct FrozenExactValues {
     values: Option<FixedMembership>,
+    /// Whether `values`, or the published contiguous min/max range, still
+    /// represents the complete non-null build-key domain.
+    exact: bool,
     _reservation: Option<RuntimeFilterReservation>,
 }
 
@@ -135,15 +170,11 @@ where
                     }
                     return;
                 }
-                Some(_) if values.binary_search(&value).is_ok() => return,
                 Some(_) => {}
             }
-        } else if values.last().copied() == Some(value)
-            || values[..*canonical_len].binary_search(&value).is_ok()
-        {
-            // The canonical prefix doubles as the deduplication index. The
-            // last-value check also keeps runs of a newly observed, out-of-
-            // order value from inflating the pending suffix.
+        } else if values.last().copied() == Some(value) {
+            // Reject runs cheaply; random values append without a per-row
+            // search of the canonical prefix. Deduplication is batched.
             return;
         }
         if values.try_push(value).is_err() {
@@ -199,6 +230,20 @@ where
             .is_err()
         {
             *self = Self::Disabled;
+        }
+    }
+
+    fn normalize(&mut self, max_values: usize) {
+        if let Self::Enabled {
+            values,
+            canonical_len,
+            ..
+        } = self
+        {
+            normalize_exact_values(values, canonical_len);
+            if values.len() > max_values {
+                *self = Self::Disabled;
+            }
         }
     }
 
@@ -262,6 +307,7 @@ where
     fn freeze_with(
         mut self,
         max_values: usize,
+        freeze_additional_bytes: usize,
         freeze: impl FnOnce(Vec<T>) -> FixedMembership,
     ) -> FrozenExactValues {
         let Self::Enabled {
@@ -272,6 +318,7 @@ where
         else {
             return FrozenExactValues {
                 values: None,
+                exact: false,
                 _reservation: None,
             };
         };
@@ -279,24 +326,33 @@ where
         if values.len() > max_values {
             return FrozenExactValues {
                 values: None,
+                exact: false,
                 _reservation: None,
             };
         }
-        let frozen = freeze(values.drain().collect());
-        if frozen.is_contiguous() {
+        // Acquire the complete conversion-overlap envelope before allocating
+        // the transfer vector or the frozen representation. The retained
+        // handle intentionally keeps the upper envelope for the filter's
+        // lifetime; no allocation can occur before admission accounting.
+        let Ok(reservation) = memory.retain(freeze_additional_bytes) else {
             return FrozenExactValues {
                 values: None,
-                _reservation: None,
-            };
-        }
-        let Ok(reservation) = memory.retain(frozen.allocation_size()) else {
-            return FrozenExactValues {
-                values: None,
+                exact: false,
                 _reservation: None,
             };
         };
+        let frozen = freeze(values.drain().collect());
+        if frozen.is_contiguous() {
+            reservation.release();
+            return FrozenExactValues {
+                values: None,
+                exact: true,
+                _reservation: None,
+            };
+        }
         FrozenExactValues {
             values: Some(frozen),
+            exact: true,
             _reservation: Some(RuntimeFilterReservation(reservation)),
         }
     }
@@ -418,7 +474,9 @@ where
         if let Some(value) = incoming.max {
             self.max = Some(self.max.map_or(value, |current| current.max(value)));
         }
-        if self.policy != incoming.policy {
+        if self.policy.max_range_value_bytes != incoming.policy.max_range_value_bytes
+            || self.policy.membership != incoming.policy.membership
+        {
             debug_assert_eq!(
                 self.policy, incoming.policy,
                 "runtime filter policies must match across local sketches"
@@ -438,11 +496,11 @@ where
         FrozenExactDomain {
             min: self.min,
             max: self.max,
-            values: self
-                .values
-                .freeze_with(self.policy.max_exact_values, |values| {
-                    freeze(values, membership)
-                }),
+            values: self.values.freeze_with(
+                self.policy.max_exact_values,
+                self.policy.freeze_additional_bytes,
+                |values| freeze(values, membership),
+            ),
         }
     }
 }
@@ -457,20 +515,26 @@ struct FrozenExactDomain<T> {
 #[derive(Debug)]
 struct GenericDomain {
     comparable: bool,
+    max_value_bytes: usize,
     min: Option<Value>,
     max: Option<Value>,
 }
 
 impl GenericDomain {
-    fn new() -> Self {
+    fn new(max_value_bytes: usize) -> Self {
         Self {
-            comparable: true,
+            comparable: max_value_bytes > 0,
+            max_value_bytes,
             min: None,
             max: None,
         }
     }
 
     fn add_value(&mut self, value: Value) {
+        if !self.accepts(&value) {
+            self.disable();
+            return;
+        }
         Self::update_extreme(&mut self.min, &value, &mut self.comparable, true);
         if self.comparable {
             Self::update_extreme(&mut self.max, &value, &mut self.comparable, false);
@@ -478,6 +542,10 @@ impl GenericDomain {
     }
 
     fn add_string(&mut self, value: &str) {
+        if value.len() > self.max_value_bytes {
+            self.disable();
+            return;
+        }
         Self::update_string_extreme(&mut self.min, value, &mut self.comparable, true);
         if self.comparable {
             Self::update_string_extreme(&mut self.max, value, &mut self.comparable, false);
@@ -485,8 +553,8 @@ impl GenericDomain {
     }
 
     fn merge(&mut self, incoming: Self) {
-        if !incoming.comparable {
-            self.comparable = false;
+        if self.max_value_bytes != incoming.max_value_bytes || !incoming.comparable {
+            self.disable();
         }
         if !self.comparable {
             return;
@@ -497,6 +565,21 @@ impl GenericDomain {
         if let Some(value) = incoming.max {
             Self::update_extreme(&mut self.max, &value, &mut self.comparable, false);
         }
+    }
+
+    fn accepts(&self, value: &Value) -> bool {
+        match value {
+            Value::Varchar(value) => value.len() <= self.max_value_bytes,
+            Value::Blob(value) => value.len() <= self.max_value_bytes,
+            Value::List(_, _) | Value::Struct(_, _) | Value::Array(_, _, _) => false,
+            _ => self.max_value_bytes > 0,
+        }
+    }
+
+    fn disable(&mut self) {
+        self.comparable = false;
+        self.min = None;
+        self.max = None;
     }
 
     fn update_extreme(
@@ -558,20 +641,25 @@ enum RuntimeFilterDomainBuilder {
 
 impl RuntimeFilterDomainBuilder {
     fn for_type(
-        logical_type: &LogicalType,
+        _logical_type: &LogicalType,
+        representation: RuntimeFilterKeyRepresentation,
         policy: JoinRuntimeFilterPolicy,
         memory: MemoryAccountingContext,
     ) -> Self {
-        match logical_type {
-            LogicalType::Integer | LogicalType::Date => {
+        match representation {
+            RuntimeFilterKeyRepresentation::ExactI32 => {
                 Self::I32(ExactDomainBuilder::new(policy, memory))
             }
-            LogicalType::BigInt
-            | LogicalType::Decimal {
-                precision: 0..=18, ..
-            } => Self::I64(ExactDomainBuilder::new(policy, memory)),
-            LogicalType::Decimal { .. } => Self::I128(ExactDomainBuilder::new(policy, memory)),
-            _ => Self::Generic(GenericDomain::new()),
+            RuntimeFilterKeyRepresentation::ExactI64 => {
+                Self::I64(ExactDomainBuilder::new(policy, memory))
+            }
+            RuntimeFilterKeyRepresentation::ExactI128 => {
+                Self::I128(ExactDomainBuilder::new(policy, memory))
+            }
+            RuntimeFilterKeyRepresentation::Range => {
+                Self::Generic(GenericDomain::new(policy.max_range_value_bytes))
+            }
+            RuntimeFilterKeyRepresentation::Disabled => Self::Generic(GenericDomain::new(0)),
         }
     }
 
@@ -606,9 +694,12 @@ pub struct JoinRuntimeFilterBuilder {
 
 impl JoinRuntimeFilterBuilder {
     pub fn empty(key_types: &[LogicalType]) -> Self {
+        let contract = RuntimeFilterResourceContract::for_keys(key_types, 1)
+            .expect("runtime-filter test contract must be valid");
         Self::empty_with_policy(
             key_types,
-            JoinRuntimeFilterPolicy::default(),
+            &contract,
+            RuntimeFilterBuilderScope::Global,
             MemoryAccountingContext::detached(
                 MemoryTag::HashTable,
                 MemoryAccountingClass::Metadata,
@@ -616,24 +707,58 @@ impl JoinRuntimeFilterBuilder {
         )
     }
 
-    pub(crate) fn empty_with_memory(
+    pub(crate) fn empty_global_with_memory(
         key_types: &[LogicalType],
+        contract: &RuntimeFilterResourceContract,
         memory: MemoryAccountingContext,
     ) -> Self {
-        Self::empty_with_policy(key_types, JoinRuntimeFilterPolicy::default(), memory)
+        Self::empty_with_policy(
+            key_types,
+            contract,
+            RuntimeFilterBuilderScope::Global,
+            memory,
+        )
+    }
+
+    pub(crate) fn empty_local_with_memory(
+        key_types: &[LogicalType],
+        contract: &RuntimeFilterResourceContract,
+        memory: MemoryAccountingContext,
+    ) -> Self {
+        Self::empty_with_policy(
+            key_types,
+            contract,
+            RuntimeFilterBuilderScope::Local,
+            memory,
+        )
     }
 
     fn empty_with_policy(
         key_types: &[LogicalType],
-        policy: JoinRuntimeFilterPolicy,
+        contract: &RuntimeFilterResourceContract,
+        scope: RuntimeFilterBuilderScope,
         memory: MemoryAccountingContext,
     ) -> Self {
+        debug_assert!(contract.validate(key_types.len()).is_ok());
         Self {
             keys: key_types
                 .iter()
                 .cloned()
-                .map(|logical_type| {
-                    JoinRuntimeFilterKeyBuilder::new(logical_type, policy, memory.clone())
+                .zip(contract.keys.iter().copied())
+                .map(|(logical_type, representation)| {
+                    let policy =
+                        JoinRuntimeFilterPolicy::from_contract(contract, representation, scope);
+                    JoinRuntimeFilterKeyBuilder::new(
+                        logical_type,
+                        representation,
+                        policy,
+                        JoinRuntimeFilterPolicy::from_contract(
+                            contract,
+                            representation,
+                            RuntimeFilterBuilderScope::Global,
+                        ),
+                        memory.clone(),
+                    )
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -645,12 +770,14 @@ impl JoinRuntimeFilterBuilder {
         key_types: &[LogicalType],
         max_exact_values: usize,
     ) -> Self {
+        let mut contract = RuntimeFilterResourceContract::for_keys(key_types, 1)
+            .expect("runtime-filter test contract must be valid");
+        contract.max_global_exact_values = u32::try_from(max_exact_values).unwrap_or(u32::MAX);
+        contract.max_local_exact_values = contract.max_global_exact_values;
         Self::empty_with_policy(
             key_types,
-            JoinRuntimeFilterPolicy {
-                max_exact_values,
-                ..JoinRuntimeFilterPolicy::default()
-            },
+            &contract,
+            RuntimeFilterBuilderScope::Global,
             MemoryAccountingContext::detached(
                 MemoryTag::HashTable,
                 MemoryAccountingClass::Metadata,
@@ -686,6 +813,62 @@ impl JoinRuntimeFilterBuilder {
         Ok(())
     }
 
+    pub(crate) fn add_mapped_key_chunk(
+        &mut self,
+        keys: &Chunk,
+        condition_indices: &[usize],
+        selection: &SelectionVector,
+        selected_count: usize,
+    ) -> Result<()> {
+        if condition_indices.len() != self.keys.len() {
+            return Err(paro_error::internal(format!(
+                "hash join runtime filter mapping count mismatch: sketch={}, mapping={}",
+                self.keys.len(),
+                condition_indices.len()
+            )));
+        }
+        if selected_count > selection.len() {
+            return Err(paro_error::internal(format!(
+                "hash join runtime filter selected count exceeds selection length: selected={selected_count}, selection={}",
+                selection.len()
+            )));
+        }
+        for (key, &condition_index) in self.keys.iter_mut().zip(condition_indices) {
+            let vector = keys.column(condition_index).ok_or_else(|| {
+                paro_error::internal(
+                    "hash join runtime filter mapping references a missing key column",
+                )
+            })?;
+            key.add_selected(vector, keys.size(), selection, selected_count)?;
+        }
+        Ok(())
+    }
+
+    /// Finish local deduplication before entering the shared merge exchange.
+    /// As in a direct global merge, an unnormalized local tail is checked
+    /// against the global limit. Local insertion has already applied its own
+    /// budget at normalization boundaries. Combined builders use the global
+    /// budget even when neither owns the initial empty global builder.
+    pub(crate) fn prepare_merge(&mut self) {
+        for key in &mut self.keys {
+            match &mut key.domain {
+                RuntimeFilterDomainBuilder::I32(domain) => {
+                    domain.values.normalize(key.global_policy.max_exact_values);
+                    domain.policy = key.global_policy;
+                }
+                RuntimeFilterDomainBuilder::I64(domain) => {
+                    domain.values.normalize(key.global_policy.max_exact_values);
+                    domain.policy = key.global_policy;
+                }
+                RuntimeFilterDomainBuilder::I128(domain) => {
+                    domain.values.normalize(key.global_policy.max_exact_values);
+                    domain.policy = key.global_policy;
+                }
+                RuntimeFilterDomainBuilder::Generic(_) => {}
+            }
+        }
+    }
+
     pub(crate) fn merge(&mut self, incoming: Self) -> Result<()> {
         if self.keys.len() != incoming.keys.len() {
             return Err(paro_error::internal(format!(
@@ -717,17 +900,26 @@ impl JoinRuntimeFilterBuilder {
 struct JoinRuntimeFilterKeyBuilder {
     logical_type: LogicalType,
     non_null_count: u64,
+    global_policy: JoinRuntimeFilterPolicy,
     domain: RuntimeFilterDomainBuilder,
 }
 
 impl JoinRuntimeFilterKeyBuilder {
     fn new(
         logical_type: LogicalType,
+        representation: RuntimeFilterKeyRepresentation,
         policy: JoinRuntimeFilterPolicy,
+        global_policy: JoinRuntimeFilterPolicy,
         memory: MemoryAccountingContext,
     ) -> Self {
         Self {
-            domain: RuntimeFilterDomainBuilder::for_type(&logical_type, policy, memory),
+            global_policy,
+            domain: RuntimeFilterDomainBuilder::for_type(
+                &logical_type,
+                representation,
+                policy,
+                memory,
+            ),
             logical_type,
             non_null_count: 0,
         }
@@ -837,6 +1029,12 @@ impl JoinRuntimeFilter {
             .get(build_key_index)
             .and_then(|key| key.predicate_for_column(probe_column_id))
     }
+
+    pub(crate) fn key_is_exact(&self, build_key_index: usize) -> bool {
+        self.keys
+            .get(build_key_index)
+            .is_some_and(JoinRuntimeFilterKey::is_exact)
+    }
 }
 
 #[derive(Debug)]
@@ -847,6 +1045,23 @@ struct JoinRuntimeFilterKey {
 }
 
 impl JoinRuntimeFilterKey {
+    fn is_exact(&self) -> bool {
+        if self.non_null_count == 0 {
+            return false;
+        }
+        match &self.domain {
+            RuntimeFilterDomain::I32(domain) => domain.values.exact,
+            RuntimeFilterDomain::I64(domain) => domain.values.exact,
+            RuntimeFilterDomain::I128(domain) => domain.values.exact,
+            // Range-only domains are exact only when both endpoints identify
+            // the same value. With a declared-unique build key this is a
+            // complete one-row membership proof.
+            RuntimeFilterDomain::Generic(domain) => {
+                domain.comparable && domain.min.is_some() && domain.min == domain.max
+            }
+        }
+    }
+
     fn predicate_for_column(&self, column_id: ColumnId) -> Option<PredicateTree> {
         if self.non_null_count == 0 {
             return None;
@@ -912,6 +1127,13 @@ fn visit_fixed<T: Copy>(
     match view.data() {
         DataRef::Ptr(data) => {
             let data = data.cast::<T>();
+            if view.validity().all_valid() {
+                for &row in selected {
+                    let value = unsafe { *data.add(view.physical_index(row as usize)) };
+                    visit(Some(value));
+                }
+                return Ok(());
+            }
             for &row in selected {
                 let row_idx = row as usize;
                 if !view.is_valid(row_idx) {
@@ -967,6 +1189,17 @@ fn exact_or_range_predicate<T: Copy + Eq + Ord>(
         });
     }
     if let Some(values) = domain.values.values.as_ref() {
+        // Fixed-width integer domains are discrete. A gap-free exact set is
+        // therefore identical to its inclusive range, while the range form
+        // enables zonemap pruning and a two-bound scan kernel instead of one
+        // membership lookup per row.
+        if values.is_contiguous() {
+            return Some(Predicate::Range {
+                column_id,
+                lower: to_value(min),
+                upper: to_value(max),
+            });
+        }
         return Some(Predicate::FixedIn {
             column_id,
             values: values.clone(),
@@ -1027,7 +1260,9 @@ fn required<T>(value: Option<T>) -> Result<T> {
 mod tests {
     use super::*;
     use crate::memory_runtime::QueryMemoryPool;
-    use paro_common::test_utils::{test_allocator, test_i64_vector_with_allocator};
+    use paro_common::test_utils::{
+        test_allocator, test_i64_vector_with_allocator, test_string_vector_with_allocator,
+    };
 
     #[test]
     fn typed_exact_domain_freezes_in_order() {
@@ -1041,6 +1276,31 @@ mod tests {
 
         assert_eq!(
             filter.predicate_for_column(0, 9),
+            Some(PredicateTree::leaf(Predicate::FixedIn {
+                column_id: 9,
+                values: FixedMembership::i64(vec![10, 20, 30]),
+            }))
+        );
+    }
+
+    #[test]
+    fn mapped_domain_reads_only_runtime_filter_join_keys() {
+        let allocator = test_allocator();
+        let ignored = test_i64_vector_with_allocator(&[100, 200, 300], allocator.clone());
+        let filtered = test_i64_vector_with_allocator(&[30, 10, 20], allocator.clone());
+        let keys = Chunk::from_arc_vectors(
+            vec![std::sync::Arc::new(ignored), std::sync::Arc::new(filtered)],
+            allocator.clone(),
+        );
+        let selection = SelectionVector::try_incremental(3, allocator).unwrap();
+        let mut builder = JoinRuntimeFilterBuilder::empty(&[LogicalType::BigInt]);
+
+        builder
+            .add_mapped_key_chunk(&keys, &[1], &selection, 3)
+            .unwrap();
+
+        assert_eq!(
+            builder.freeze().predicate_for_column(0, 9),
             Some(PredicateTree::leaf(Predicate::FixedIn {
                 column_id: 9,
                 values: FixedMembership::i64(vec![10, 20, 30]),
@@ -1064,6 +1324,41 @@ mod tests {
                 value: Value::BigInt(42),
             }))
         );
+    }
+
+    #[test]
+    fn contiguous_exact_integer_domain_publishes_range() {
+        let allocator = test_allocator();
+        let vector = test_i64_vector_with_allocator(&[12, 10, 11, 12], allocator.clone());
+        let keys = Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
+        let selection = SelectionVector::try_incremental(4, allocator).unwrap();
+        let mut builder = JoinRuntimeFilterBuilder::empty(&[LogicalType::BigInt]);
+        builder.add_key_chunk(&keys, &selection, 4).unwrap();
+        let filter = builder.freeze();
+
+        assert_eq!(
+            filter.predicate_for_column(0, 9),
+            Some(PredicateTree::leaf(Predicate::Range {
+                column_id: 9,
+                lower: Value::BigInt(10),
+                upper: Value::BigInt(12),
+            }))
+        );
+        assert!(filter.key_is_exact(0));
+    }
+
+    #[test]
+    fn oversized_string_range_degrades_to_no_filter_within_its_contract() {
+        let allocator = test_allocator();
+        let oversized =
+            "x".repeat(RuntimeFilterResourceContract::MAX_RANGE_VALUE_BYTES as usize + 1);
+        let vector = test_string_vector_with_allocator(&[&oversized], allocator.clone());
+        let keys = Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
+        let selection = SelectionVector::try_incremental(1, allocator).unwrap();
+        let mut builder = JoinRuntimeFilterBuilder::empty(&[LogicalType::Varchar]);
+        builder.add_key_chunk(&keys, &selection, 1).unwrap();
+
+        assert_eq!(builder.freeze().predicate_for_column(0, 9), None);
     }
 
     #[test]
@@ -1095,13 +1390,54 @@ mod tests {
         let mut builder =
             JoinRuntimeFilterBuilder::empty_with_exact_value_limit(&[LogicalType::BigInt], 3);
         builder.add_key_chunk(&keys, &selection, 4).unwrap();
+        let filter = builder.freeze();
 
         assert_eq!(
-            builder.freeze().predicate_for_column(0, 9),
+            filter.predicate_for_column(0, 9),
             Some(PredicateTree::leaf(Predicate::Range {
                 column_id: 9,
                 lower: Value::BigInt(10),
                 upper: Value::BigInt(40),
+            }))
+        );
+        assert!(!filter.key_is_exact(0));
+    }
+
+    #[test]
+    fn global_exact_budget_survives_balanced_local_merges() {
+        let allocator = test_allocator();
+        let mut contract =
+            RuntimeFilterResourceContract::for_keys(&[LogicalType::BigInt], 4).unwrap();
+        contract.max_local_exact_values = 2;
+        contract.max_global_exact_values = 8;
+        contract.validate(1).unwrap();
+        let memory = || {
+            MemoryAccountingContext::detached(MemoryTag::HashTable, MemoryAccountingClass::Metadata)
+        };
+        let mut global = JoinRuntimeFilterBuilder::empty_global_with_memory(
+            &[LogicalType::BigInt],
+            &contract,
+            memory(),
+        );
+        for values in [[1_i64, 3], [5, 7], [9, 11], [13, 15]] {
+            let vector = test_i64_vector_with_allocator(&values, allocator.clone());
+            let keys =
+                Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
+            let selection = SelectionVector::try_incremental(2, allocator.clone()).unwrap();
+            let mut local = JoinRuntimeFilterBuilder::empty_local_with_memory(
+                &[LogicalType::BigInt],
+                &contract,
+                memory(),
+            );
+            local.add_key_chunk(&keys, &selection, 2).unwrap();
+            global.merge(local).unwrap();
+        }
+
+        assert_eq!(
+            global.freeze().predicate_for_column(0, 9),
+            Some(PredicateTree::leaf(Predicate::FixedIn {
+                column_id: 9,
+                values: FixedMembership::i64((1_i64..=15).step_by(2).collect()),
             }))
         );
     }
@@ -1121,6 +1457,7 @@ mod tests {
             }
         }
 
+        exact.normalize(max_values);
         let ExactValues::Enabled {
             values,
             canonical_len,
@@ -1135,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_domain_ordered_stream_stays_canonical() {
+    fn exact_domain_ordered_stream_and_duplicates_stay_exact() {
         let memory = MemoryAccountingContext::detached(
             MemoryTag::HashTable,
             MemoryAccountingClass::Metadata,
@@ -1146,12 +1483,12 @@ mod tests {
         for value in 0_i64..63 {
             exact.insert(value, max_values);
         }
-        // Duplicate values in a sorted domain are rejected by the canonical
-        // prefix rather than being staged for another sort.
+        // Repeated domains remain exact after batched deduplication.
         for value in 0_i64..63 {
             exact.insert(value, max_values);
         }
 
+        exact.normalize(max_values);
         let ExactValues::Enabled {
             values,
             canonical_len,
@@ -1162,7 +1499,7 @@ mod tests {
         };
         assert_eq!(canonical_len, 63);
         assert_eq!(values.len(), 63);
-        assert!(values.capacity() <= 64);
+        assert!(values.capacity() <= 128);
     }
 
     #[test]
@@ -1237,15 +1574,19 @@ mod tests {
         let selection = SelectionVector::try_incremental(values.len(), allocator).unwrap();
 
         let pool = std::sync::Arc::new(QueryMemoryPool::new(64));
-        let owner: std::sync::Arc<dyn paro_common::memory::MemoryOwner> = pool;
+        let owner: std::sync::Arc<dyn paro_common::memory::MemoryOwner> = pool.clone();
         let memory = MemoryAccountingContext::from_owner(
             owner,
             paro_common::memory::MemoryDomain::Host,
             MemoryTag::HashTable,
             MemoryAccountingClass::Metadata,
         );
-        let mut sketch =
-            JoinRuntimeFilterBuilder::empty_with_memory(&[LogicalType::Integer], memory);
+        let contract = RuntimeFilterResourceContract::for_keys(&[LogicalType::Integer], 1).unwrap();
+        let mut sketch = JoinRuntimeFilterBuilder::empty_global_with_memory(
+            &[LogicalType::Integer],
+            &contract,
+            memory,
+        );
         sketch
             .add_key_chunk(&keys, &selection, values.len())
             .unwrap();
@@ -1258,6 +1599,96 @@ mod tests {
                 lower: Value::Integer(0),
                 upper: Value::Integer(510),
             }))
+        );
+        assert!(!filter.key_is_exact(0));
+        drop(filter);
+        assert_eq!(pool.issued_bytes(), 0);
+        assert_eq!(pool.metadata_bytes(), 0);
+    }
+
+    #[test]
+    fn batched_multikey_merge_matches_single_builder_across_budgets() {
+        let allocator = test_allocator();
+        let types = [LogicalType::BigInt, LogicalType::BigInt];
+        for limit in [1, 8, 64, 4096] {
+            let mut single = JoinRuntimeFilterBuilder::empty_with_exact_value_limit(&types, limit);
+            let mut merged = JoinRuntimeFilterBuilder::empty_with_exact_value_limit(&types, limit);
+            for batch in 0..8 {
+                let values = (0..VECTOR_SIZE)
+                    .map(|row| ((row * 37 + batch * 11) % 101) as i64 * 2)
+                    .collect::<Vec<_>>();
+                let mut vector = test_i64_vector_with_allocator(&values, allocator.clone());
+                for row in (0..VECTOR_SIZE).step_by(5) {
+                    vector.set_null(row, true);
+                }
+                let mut nulls = test_i64_vector_with_allocator(&values, allocator.clone());
+                for row in 0..VECTOR_SIZE {
+                    nulls.set_null(row, true);
+                }
+                let keys = Chunk::from_arc_vectors(
+                    vec![std::sync::Arc::new(vector), std::sync::Arc::new(nulls)],
+                    allocator.clone(),
+                );
+                let selection =
+                    SelectionVector::try_incremental(VECTOR_SIZE, allocator.clone()).unwrap();
+                let mut local =
+                    JoinRuntimeFilterBuilder::empty_with_exact_value_limit(&types, limit);
+                local.add_key_chunk(&keys, &selection, VECTOR_SIZE).unwrap();
+                single
+                    .add_key_chunk(&keys, &selection, VECTOR_SIZE)
+                    .unwrap();
+                local.prepare_merge();
+                merged.merge(local).unwrap();
+            }
+            let (single, merged) = (single.freeze(), merged.freeze());
+            for key in 0..types.len() {
+                assert_eq!(
+                    single.predicate_for_column(key, key as u32),
+                    merged.predicate_for_column(key, key as u32)
+                );
+                assert_eq!(single.key_is_exact(key), merged.key_is_exact(key));
+            }
+        }
+    }
+
+    #[test]
+    fn preparing_local_tail_preserves_direct_global_merge_budget() {
+        let types = [LogicalType::BigInt];
+        let mut contract = RuntimeFilterResourceContract::for_keys(&types, 2).unwrap();
+        contract.max_local_exact_values = 4;
+        contract.max_global_exact_values = 8;
+        let memory = || {
+            MemoryAccountingContext::detached(MemoryTag::HashTable, MemoryAccountingClass::Metadata)
+        };
+        let allocator = test_allocator();
+        let keys = Chunk::from_arc_vectors(
+            vec![std::sync::Arc::new(test_i64_vector_with_allocator(
+                &[2, 4, 6, 1, 8],
+                allocator.clone(),
+            ))],
+            allocator.clone(),
+        );
+        let selection = SelectionVector::try_incremental(5, allocator).unwrap();
+        let local = || {
+            let mut builder =
+                JoinRuntimeFilterBuilder::empty_local_with_memory(&types, &contract, memory());
+            builder.add_key_chunk(&keys, &selection, 5).unwrap();
+            builder
+        };
+        let mut direct =
+            JoinRuntimeFilterBuilder::empty_global_with_memory(&types, &contract, memory());
+        direct.merge(local()).unwrap();
+        let mut prepared = local();
+        prepared.prepare_merge();
+        let mut exchanged =
+            JoinRuntimeFilterBuilder::empty_global_with_memory(&types, &contract, memory());
+        exchanged.merge(prepared).unwrap();
+        let (direct, exchanged) = (direct.freeze(), exchanged.freeze());
+        assert!(direct.key_is_exact(0));
+        assert!(exchanged.key_is_exact(0));
+        assert_eq!(
+            direct.predicate_for_column(0, 7),
+            exchanged.predicate_for_column(0, 7)
         );
     }
 }

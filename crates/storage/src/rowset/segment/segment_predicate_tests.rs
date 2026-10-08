@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::index::FixedMembership;
 use crate::rowset::column::OrderedRowIds;
 use crate::rowset::encoding::BinaryPlainPageBuilder;
 use crate::rowset::scan_cost::ScanAccessCostModel;
@@ -103,7 +104,7 @@ fn staged_later_short_read_falls_back_to_gather_and_realigns_iterators() {
     let mut matches = Vec::new();
     let mut stats = PredicateStageReadStats::default();
 
-    let rows = evaluator
+    let (rows, reusable_batches) = evaluator
         .evaluate_staged_batch(
             0,
             8,
@@ -114,6 +115,7 @@ fn staged_later_short_read_falls_back_to_gather_and_realigns_iterators() {
         .unwrap();
 
     assert_eq!(rows, 3);
+    assert!(reusable_batches.is_empty());
     assert_eq!(matches, [0, 1, 2]);
     assert_eq!(stats.stages[0].sequential_rows, 3);
     assert_eq!(stats.stages[1].sequential_rows, 1);
@@ -174,7 +176,7 @@ fn compile_tree_coalesces_same_column_comparisons_only_inside_and() {
 }
 
 #[test]
-fn equal_priority_fixed_ranges_read_narrower_column_first() {
+fn constant_conjuncts_keep_the_callers_selectivity_order() {
     let column_map = HashMap::from([(6, 0), (10, 1)]);
     let column_types = [
         LogicalType::Decimal {
@@ -183,39 +185,35 @@ fn equal_priority_fixed_ranges_read_narrower_column_first() {
         },
         LogicalType::Date,
     ];
-    let tree = PredicateEvaluator::compile_tree(
-        &PredicateTree::And(vec![
-            PredicateTree::leaf(Predicate::Range {
-                column_id: 6,
-                lower: Value::Decimal(5, 15, 2),
-                upper: Value::Decimal(7, 15, 2),
-            }),
-            PredicateTree::leaf(Predicate::Range {
-                column_id: 10,
-                lower: Value::Date(0),
-                upper: Value::Date(364),
-            }),
-        ]),
-        &column_map,
-        &column_types,
-    )
-    .unwrap();
-
-    let CompiledPredicateTree::And(children) = tree else {
-        panic!("expected compiled AND");
+    let discount = || {
+        PredicateTree::leaf(Predicate::Range {
+            column_id: 6,
+            lower: Value::Decimal(5, 15, 2),
+            upper: Value::Decimal(7, 15, 2),
+        })
     };
-    assert!(matches!(
-        children.first(),
-        Some(CompiledPredicateTree::Leaf(
-            CompiledPredicate::FixedComparisons { column_idx: 1, .. }
-        ))
-    ));
-    assert!(matches!(
-        children.get(1),
-        Some(CompiledPredicateTree::Leaf(
-            CompiledPredicate::FixedComparisons { column_idx: 0, .. }
-        ))
-    ));
+    let shipped = || {
+        PredicateTree::leaf(Predicate::FixedIn {
+            column_id: 10,
+            values: FixedMembership::i32(vec![0, 7, 364]),
+        })
+    };
+    // The scan orders conjuncts by runtime selectivity; storage must not
+    // replace that order by a static membership-before-range guess.
+    for (tree, first) in [
+        (PredicateTree::And(vec![discount(), shipped()]), 0),
+        (PredicateTree::And(vec![shipped(), discount()]), 1),
+    ] {
+        let tree = PredicateEvaluator::compile_tree(&tree, &column_map, &column_types).unwrap();
+        let CompiledPredicateTree::And(children) = tree else {
+            panic!("expected compiled AND");
+        };
+        assert!(matches!(
+            children.first(),
+            Some(CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons { column_idx, .. }))
+                if *column_idx == first
+        ));
+    }
 }
 
 #[test]

@@ -177,10 +177,10 @@ async fn property_graph_is_recovered_on_restart() {
         .get(&graph_runtime_key(graph_name))
         .expect("graph should be registered after restart");
     let graph_vertex_rowids = (0..graph
-        .vertex_map("Person")
+        .vertex_map("person")
         .expect("person label")
         .num_vertices())
-        .map(|local_id| graph.vertex_map("Person").unwrap().local_to_rowid(local_id))
+        .map(|local_id| graph.vertex_map("person").unwrap().local_to_rowid(local_id))
         .collect::<Vec<_>>();
     let live_vertex_rowids = table_rowids(&session, "public", "g_person");
     assert_eq!(graph_vertex_rowids, live_vertex_rowids);

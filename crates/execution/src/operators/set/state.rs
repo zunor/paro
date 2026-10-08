@@ -9,12 +9,6 @@ use crate::expression_executor::executor::ExpressionExecutor;
 use crate::runtime::breaker::{DelimHandle, RecursiveDedupSet, RecursiveTableHandle};
 
 #[derive(Debug, Default)]
-pub struct CteScanSourceLocal {
-    pub chunks: Option<Arc<[Chunk]>>,
-    pub cursor: usize,
-}
-
-#[derive(Debug, Default)]
 pub struct DelimScanSourceLocal {
     pub chunks: Option<Arc<[Chunk]>>,
     pub cursor: usize,
@@ -33,13 +27,11 @@ pub struct SetOperationEmitSourceLocal {
 }
 
 #[derive(Debug, Default)]
-pub struct CteMaterializeSinkLocal {
-    pub chunks: Vec<Chunk>,
-}
-
-#[derive(Debug, Default)]
 pub struct SetOperationInputSinkLocal {
-    pub chunks: Vec<Chunk>,
+    pub(crate) columns: Vec<usize>,
+    pub(crate) partitions: usize,
+    pub(crate) chunks: Vec<crate::runtime::breaker::radix::RadixChunk>,
+    pub(crate) router: crate::runtime::breaker::radix::RadixRouter,
 }
 
 #[derive(Debug)]

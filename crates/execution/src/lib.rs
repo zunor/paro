@@ -5,13 +5,12 @@
 //!
 //! Import types from their submodules; this crate does not expose crate-root re-exports.
 
-pub mod column_binding_resolver;
 pub mod explain;
 pub mod expression_executor;
 pub mod join_hashtable;
 pub mod memory_runtime;
 pub mod operators;
-pub mod physical;
+pub(crate) mod physical;
 pub mod pipeline;
 pub mod query_executor;
 pub mod result_type;

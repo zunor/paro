@@ -12,6 +12,8 @@ pub mod context;
 pub mod deep_copy;
 pub mod ir;
 pub mod plan;
+mod planning;
+pub use planning::{Planner, StatementProperties};
 #[cfg(test)]
 pub(crate) mod test_utils;
 
@@ -20,8 +22,8 @@ use crate::binder::context::BindContext;
 use crate::binder::ir::from::BoundFromItem;
 use crate::binder::ir::BoundStatementKind;
 use crate::expression::{Expression, ParameterExpression};
-use crate::operator::LogicalOperator;
-use crate::plan::{LogicalPlan, PlannedStatement};
+use crate::logical::operator::LogicalOperator;
+use crate::logical::plan::{OwnedLogicalPlan, PlannedStatement};
 use crate::stack::maybe_grow_planner_stack;
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{CatalogObjectId, Dependency, DependencyList, DependencyType};
@@ -148,10 +150,10 @@ impl Binder {
         self.session_context.as_ref()
     }
 
-    /// Wrap a logical operator as a child [`LogicalPlan`] using the current bind context.
+    /// Wrap a logical operator as a child [`OwnedLogicalPlan`] using the current bind context.
     #[inline]
-    pub(crate) fn wrap_plan(&self, op: LogicalOperator) -> crate::plan::LogicalPlan {
-        crate::plan::LogicalPlan::new(&self.bind_context, op)
+    pub(crate) fn wrap_plan(&self, op: LogicalOperator) -> crate::logical::plan::OwnedLogicalPlan {
+        crate::logical::plan::OwnedLogicalPlan::new(&self.bind_context, op)
     }
 
     /// Create a child binder for nested scopes (e.g., subqueries).
@@ -271,9 +273,13 @@ impl Binder {
 
     pub fn bind_protocol_parameter(&self, index: usize) -> Result<Expression> {
         let (index, logical_type) = self.protocol_parameter(index)?;
-        Ok(Expression::Parameter(ParameterExpression::new(
-            ParameterSlot::new(RuntimeParamId::new(index), logical_type.clone()),
-        )))
+        Ok(Expression::Parameter(
+            ParameterExpression::new(ParameterSlot::new(
+                RuntimeParamId::new(index),
+                logical_type.clone(),
+            ))
+            .into(),
+        ))
     }
 
     pub(crate) fn delayed_subquery_planning_enabled(&self) -> bool {
@@ -384,11 +390,11 @@ impl Binder {
         Ok(PlannedStatement { types, names, plan })
     }
 
-    pub fn create_plan(&mut self, statement: BoundStatementKind) -> Result<LogicalPlan> {
+    pub fn create_plan(&mut self, statement: BoundStatementKind) -> Result<OwnedLogicalPlan> {
         maybe_grow_planner_stack(|| self.create_plan_inner(statement))
     }
 
-    fn create_plan_inner(&mut self, statement: BoundStatementKind) -> Result<LogicalPlan> {
+    fn create_plan_inner(&mut self, statement: BoundStatementKind) -> Result<OwnedLogicalPlan> {
         let operator = match statement {
             BoundStatementKind::Query(node) => self.plan_query(*node),
             BoundStatementKind::Insert(info) => self.plan_insert(info),
@@ -413,7 +419,7 @@ impl Binder {
                 "Planning for statement: Dummy",
             )),
         }?;
-        Ok(LogicalPlan::new(&self.bind_context, operator))
+        Ok(OwnedLogicalPlan::new(&self.bind_context, operator))
     }
 
     /// Bind a table reference (FROM clause).
@@ -462,7 +468,7 @@ impl Binder {
         }
     }
 
-    pub fn flatten_dependent_joins(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    pub fn flatten_dependent_joins(&mut self, plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
         plan::subquery::flatten_all_dependent_joins(self, plan)
     }
 }
@@ -607,6 +613,48 @@ mod tests {
     }
 
     #[test]
+    fn where_input_column_precedes_same_named_select_alias() {
+        let mut binder = test_binder();
+        let bound = binder
+            .bind_statement_kind(parse_statement_sql(
+                "SELECT x AS x FROM (SELECT 1 AS x) t WHERE x = 1",
+            ))
+            .expect("bind statement");
+
+        let BoundStatementKind::Query(query) = bound else {
+            panic!("expected query statement");
+        };
+        let BoundQuery::Select(select) = *query else {
+            panic!("expected bound select");
+        };
+        let Some(crate::expression::Expression::Comparison(comparison)) = select.where_clause
+        else {
+            panic!("expected comparison predicate");
+        };
+        assert!(matches!(
+            comparison.left.as_ref(),
+            crate::expression::Expression::ColumnRef(_)
+        ));
+    }
+
+    #[test]
+    fn nested_scope_resolves_its_local_column_before_ambiguous_outer_columns() {
+        let mut binder = test_binder();
+        binder
+            .bind_statement_kind(parse_statement_sql(
+                "SELECT p.order_key \
+                 FROM (VALUES (1)) AS p(order_key) \
+                 JOIN (VALUES (1)) AS d(order_key) \
+                   ON d.order_key = p.order_key \
+                 WHERE p.order_key IN ( \
+                   SELECT order_key \
+                   FROM (VALUES (1)) AS inner_detail(order_key) \
+                 )",
+            ))
+            .expect("the unique inner column must shadow outer-scope candidates");
+    }
+
+    #[test]
     fn where_clause_does_not_lowercase_match_quoted_aliases() {
         let mut binder = test_binder();
         let err = binder
@@ -616,6 +664,18 @@ mod tests {
             .expect_err("quoted alias should require exact spelling");
 
         assert!(err.to_string().contains("Column not found: id"));
+    }
+
+    #[test]
+    fn unquoted_relation_aliases_are_case_folded() {
+        let mut binder = test_binder();
+        binder
+            .bind_statement_kind(parse_statement_sql(
+                "SELECT catalog.return_rank \
+                 FROM (SELECT rank() OVER (ORDER BY x) AS return_rank \
+                       FROM (VALUES (1), (2)) t(x)) CATALOG",
+            ))
+            .expect("unquoted aliases have one case-insensitive SQL identity");
     }
 
     #[test]

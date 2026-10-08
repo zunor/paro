@@ -126,6 +126,10 @@ impl CompiledPredicateProgram {
         self.stages.is_some()
     }
 
+    pub(super) fn has_single_stage(&self) -> bool {
+        self.stages.as_ref().is_some_and(|stages| stages.len() == 1)
+    }
+
     fn stages(&self) -> Option<&[PredicateStage]> {
         self.stages.as_deref()
     }
@@ -191,7 +195,7 @@ impl PredicateEvaluator {
         cost_model: ScanAccessCostModel,
         matches: &mut Vec<BatchRowOrdinal>,
         stats: &mut PredicateStageReadStats,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<PredicateColumnBatch>)> {
         validate_predicate_batch_rows(max_rows)?;
         let mut scratch = std::mem::take(&mut self.stage_scratch);
         let result = self.evaluate_staged_batch_inner(
@@ -214,7 +218,7 @@ impl PredicateEvaluator {
         matches: &mut Vec<BatchRowOrdinal>,
         stats: &mut PredicateStageReadStats,
         scratch: &mut PredicateStageScratch,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<PredicateColumnBatch>)> {
         let stage_count = self
             .program
             .stages()
@@ -223,6 +227,7 @@ impl PredicateEvaluator {
         matches.clear();
         let mut batch_rows = max_rows;
         let mut batch_end = start_ordinal;
+        let mut reusable_batches = Vec::new();
 
         for stage_idx in 0..stage_count {
             let stage = {
@@ -244,6 +249,9 @@ impl PredicateEvaluator {
                 stats.add_sequential(stage_idx, rows_read);
                 self.filter_stage(stage, &batch, rows_read, matches, true)?;
                 self.finish_stage_column(stage.column_idx, batch_end)?;
+                if stage_count == 1 {
+                    reusable_batches.push(batch);
+                }
                 continue;
             }
 
@@ -292,7 +300,7 @@ impl PredicateEvaluator {
             }
             self.finish_stage_column(stage.column_idx, batch_end)?;
         }
-        Ok(batch_rows)
+        Ok((batch_rows, reusable_batches))
     }
 
     fn read_stage_sequential(

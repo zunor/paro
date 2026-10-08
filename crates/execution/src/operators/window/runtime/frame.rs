@@ -11,8 +11,8 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{Vector, VECTOR_SIZE};
-use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
+use paro_common::vector::{Vector, VectorSelection, VECTOR_SIZE};
+use paro_function::aggregate::{AggregateCombineType, AggregateInputData, AggregateStateInput};
 use paro_function::window::WindowFunctionType;
 use paro_planner::expression::{
     AggregateType, Expression, OrderByExpression, WindowExpression, WindowFrameBound,
@@ -24,7 +24,8 @@ use super::{
     WindowRowKey,
 };
 use crate::operators::aggregate::aggregate_kernel::{
-    destroy_states, finalize_states, initialize_states, update_states, AggregatePayload,
+    build_state_vector, destroy_states, initialize_states, update_states,
+    with_aggregate_input_data_result, AggregatePayload,
 };
 use crate::operators::aggregate::aggregate_object::AggregateObject;
 use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
@@ -66,6 +67,15 @@ impl WindowFrameIndex {
 
     pub(super) fn relative_range(&self, absolute_idx: usize) -> Range<usize> {
         self.ranges[absolute_idx - self.partition.start].clone()
+    }
+
+    /// A fixed lower bound and monotonically growing upper bound admit delta
+    /// updates. This is a property of the evaluated frames, not a function name
+    /// or an assumption about ROWS versus RANGE/peer ordering.
+    pub(super) fn is_append_only(&self) -> bool {
+        self.ranges
+            .windows(2)
+            .all(|pair| pair[0].start == pair[1].start && pair[0].end <= pair[1].end)
     }
 }
 
@@ -246,6 +256,35 @@ pub(super) fn aggregate_window_value(
     expr: &WindowExpression,
     allocator: Arc<dyn Allocator>,
 ) -> Result<Value> {
+    let keys = sorted_keys
+        .get(frame.clone())
+        .ok_or_else(|| paro_error::internal("aggregate frame outside input"))?;
+    let mut value = None;
+    visit_append_only_aggregate_frames(
+        chunks,
+        keys,
+        std::iter::once(0..keys.len()),
+        expr,
+        allocator,
+        |_, result| {
+            value = Some(result);
+            Ok(())
+        },
+    )?;
+    value.ok_or_else(|| paro_error::internal("aggregate frame produced no result"))
+}
+
+/// Evaluate one append-only frame sequence with the exact bound aggregate ABI.
+/// Finalization is observational; only destruction owns the state. The single
+/// frame fallback above is also the independent recomputation oracle in tests.
+pub(super) fn visit_append_only_aggregate_frames(
+    chunks: &[Chunk],
+    sorted_keys: &[WindowRowKey],
+    frames: impl IntoIterator<Item = Range<usize>>,
+    expr: &WindowExpression,
+    allocator: Arc<dyn Allocator>,
+    mut emit: impl FnMut(usize, Value) -> Result<()>,
+) -> Result<()> {
     let aggregate = expr.aggregate_invocation().ok_or_else(|| {
         paro_error::internal("aggregate window kernel received a native invocation")
     })?;
@@ -276,60 +315,146 @@ pub(super) fn aggregate_window_value(
     let aggregate_inputs = [(0..aggregate.children.len()).collect::<Vec<_>>()];
 
     let result = (|| {
-        let mut address_batch = pointer_vector(VECTOR_SIZE, state_ptr, allocator.clone())?;
-        for batch in frame.clone().step_by(VECTOR_SIZE) {
-            let count = (frame.end - batch).min(VECTOR_SIZE);
-            let batch_keys = &sorted_keys[batch..batch + count];
-            let selected_keys = if let Some(filter) = aggregate.filter.as_deref() {
-                batch_keys
-                    .iter()
-                    .copied()
-                    .filter(|key| {
-                        matches!(value_from_expr(chunks, key, filter), Value::Boolean(true))
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            let input_keys = if aggregate.filter.is_some() {
-                selected_keys.as_slice()
-            } else {
-                batch_keys
-            };
-            if input_keys.is_empty() {
-                continue;
+        // Prefix finalization observes the same single state on every row.
+        // Reuse its ABI address vector instead of allocating/freeing one in
+        // the generic multi-aggregate finalizer for every prefix.
+        let finalize_addresses = build_state_vector(&single_address, &layout, 0, None, 1)?;
+        let capacity = sorted_keys.len().clamp(1, VECTOR_SIZE);
+        let mut address_batch = pointer_vector(capacity, state_ptr, allocator.clone())?;
+        // The bound finalize ABI writes one Vector, not a Chunk. Keep that
+        // vector uniquely owned so each prefix avoids Chunk reset metadata,
+        // spare-vector ownership and Arc mutable-access bookkeeping.
+        let mut result_vector =
+            Vector::try_new(aggregate.return_type.clone(), 1, allocator.clone())?;
+        // Own a bounded payload batch. Unfiltered prefixes reuse range views;
+        // filtered deltas refill it after row selection. Aggregate update may
+        // consume these views but cannot retain them.
+        let input_types = aggregate
+            .children
+            .iter()
+            .map(Expression::return_type)
+            .collect::<Vec<_>>();
+        let mut payload_chunk = Chunk::try_initialize(&input_types, capacity, allocator.clone())?;
+        let mut selected_keys = Vec::with_capacity(capacity);
+        let mut cached = 0..0;
+        let mut previous: Option<Range<usize>> = None;
+        for (index, frame) in frames.into_iter().enumerate() {
+            if frame.start > frame.end
+                || frame.end > sorted_keys.len()
+                || previous
+                    .as_ref()
+                    .is_some_and(|last| last.start != frame.start || last.end > frame.end)
+            {
+                return Err(paro_error::internal("aggregate frames are not append-only"));
             }
-            address_batch.try_set_count(input_keys.len())?;
-            let inputs =
-                materialize_aggregate_inputs(chunks, input_keys, aggregate, allocator.clone())?;
-            let payload_chunk = Chunk::try_from_arc_vectors_with_cardinality(
-                inputs.into_iter().map(Arc::new).collect(),
-                input_keys.len(),
-                allocator.clone(),
-            )?;
-            let payload = AggregatePayload {
-                chunk: &payload_chunk,
-                aggregate_inputs: &aggregate_inputs,
-            };
-            update_states(
-                &objects,
-                &mut input_data,
-                &payload,
-                &address_batch,
-                input_keys.len(),
-            )?;
+            let start = previous.as_ref().map_or(frame.start, |last| last.end);
+            if aggregate.filter.is_none() {
+                // Materialize a bounded look-ahead batch once. Growing prefixes
+                // consume range views of it instead of resetting and copying a
+                // capacity-sized payload for every single-row delta.
+                let mut position = start;
+                while position < frame.end {
+                    if !cached.contains(&position) {
+                        cached = position..(position + capacity).min(sorted_keys.len());
+                        payload_chunk.try_reset(allocator.clone())?;
+                        materialize_aggregate_inputs(
+                            chunks,
+                            &sorted_keys[cached.clone()],
+                            aggregate,
+                            &mut payload_chunk,
+                        )?;
+                    }
+                    let count = (frame.end - position).min(cached.end - position);
+                    let views = payload_chunk
+                        .data
+                        .iter()
+                        .map(|column| {
+                            Vector::try_gather_ref(
+                                column.clone(),
+                                VectorSelection::range(position - cached.start, count),
+                            )
+                        })
+                        .collect::<Result<smallvec::SmallVec<[Vector; 4]>>>()?;
+                    let inputs = views.iter().collect::<smallvec::SmallVec<[&Vector; 4]>>();
+                    let states = AggregateStateInput::try_new(
+                        &address_batch,
+                        layout.state_offset(0),
+                        None,
+                        count,
+                    )?;
+                    with_aggregate_input_data_result(
+                        &objects[0],
+                        &mut input_data,
+                        |aggregate_input| {
+                            // SAFETY: state addresses remain initialized until the
+                            // common destruction path, and views live through update.
+                            unsafe {
+                                (objects[0].function.update)(
+                                    &inputs,
+                                    &aggregate_input,
+                                    &states,
+                                    count,
+                                );
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    position += count;
+                }
+            } else {
+                for batch in (start..frame.end).step_by(VECTOR_SIZE) {
+                    let count = (frame.end - batch).min(VECTOR_SIZE);
+                    let batch_keys = &sorted_keys[batch..batch + count];
+                    selected_keys.clear();
+                    let filter = aggregate.filter.as_deref().expect("filtered aggregate");
+                    selected_keys.extend(batch_keys.iter().copied().filter(|key| {
+                        matches!(value_from_expr(chunks, key, filter), Value::Boolean(true))
+                    }));
+                    let input_keys = selected_keys.as_slice();
+                    if input_keys.is_empty() {
+                        continue;
+                    }
+                    address_batch.try_set_count(input_keys.len())?;
+                    payload_chunk.try_reset(allocator.clone())?;
+                    materialize_aggregate_inputs(
+                        chunks,
+                        input_keys,
+                        aggregate,
+                        &mut payload_chunk,
+                    )?;
+                    let payload = AggregatePayload {
+                        chunk: &payload_chunk,
+                        aggregate_inputs: &aggregate_inputs,
+                    };
+                    update_states(
+                        &objects,
+                        &mut input_data,
+                        &payload,
+                        &address_batch,
+                        input_keys.len(),
+                    )?;
+                }
+            }
+            // Reset validity and variable-width output ownership between peeks;
+            // a NULL result in an empty prefix must not poison later values.
+            result_vector.try_reset_for_execution(1, allocator.clone())?;
+            result_vector.try_set_count(1)?;
+            with_aggregate_input_data_result(&objects[0], &mut input_data, |aggregate_input| {
+                // SAFETY: the cached vector addresses the initialized bound
+                // state, which remains alive until destroy_states below.
+                unsafe {
+                    (objects[0].function.finalize)(
+                        &finalize_addresses,
+                        &aggregate_input,
+                        &mut result_vector,
+                        1,
+                    )
+                }
+            })?;
+            emit(index, result_vector.get_value(0))?;
+            previous = Some(frame);
         }
-
-        let mut output = Chunk::try_initialize(
-            std::slice::from_ref(&aggregate.return_type),
-            1,
-            allocator.clone(),
-        )?;
-        finalize_states(&objects, &mut input_data, &single_address, &mut output, 1)?;
-        Ok(output
-            .column(0)
-            .expect("aggregate result column")
-            .get_value(0))
+        Ok(())
     })();
 
     let destroy_result = destroy_states(&objects, &mut input_data, &single_address, 1);
@@ -363,13 +488,13 @@ fn materialize_aggregate_inputs(
     chunks: &[Chunk],
     keys: &[WindowRowKey],
     aggregate: &paro_planner::expression::AggregateExpression,
-    allocator: Arc<dyn Allocator>,
-) -> Result<Vec<Vector>> {
-    let mut inputs = Vec::with_capacity(aggregate.children.len());
-    for child in &aggregate.children {
-        let mut vector =
-            Vector::try_new(child.return_type(), keys.len().max(1), allocator.clone())?;
-        vector.try_set_count(keys.len())?;
+    payload: &mut Chunk,
+) -> Result<()> {
+    payload.try_set_cardinality(keys.len())?;
+    for (column, child) in aggregate.children.iter().enumerate() {
+        let vector = payload.column_mut(column).ok_or_else(|| {
+            paro_error::internal("aggregate window payload is missing an argument")
+        })?;
         for (row, key) in keys.iter().enumerate() {
             match child {
                 Expression::Constant(constant) => vector.set_value(row, &constant.value),
@@ -404,9 +529,8 @@ fn materialize_aggregate_inputs(
                 }
             }
         }
-        inputs.push(vector);
     }
-    Ok(inputs)
+    Ok(())
 }
 
 fn frame_range(

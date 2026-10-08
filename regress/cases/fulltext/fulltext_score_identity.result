@@ -1,0 +1,175 @@
+CREATE TABLE score_identity(id INT, content VARCHAR);
+CREATE TABLE
+
+INSERT INTO score_identity VALUES
+    (1, 'vector database vector'), (2, 'vector database'),
+    (3, 'database vector'), (4, 'vector'), (5, 'noise');
+INSERT 0 5
+
+SELECT id, ts_rank(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC, id;
+id	score
+1	2.375000
+2	2.000000
+3	2.000000
+
+SELECT id, ts_rank_cd(to_tsvector('simple', content),
+                     plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC, id;
+id	score
+1	2.000000
+2	2.000000
+3	2.000000
+
+CREATE INDEX score_identity_index ON score_identity USING GIN (to_tsvector('simple', content));
+CREATE INDEX
+
+-- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
+EXPLAIN ANALYZE
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+QUERY PLAN
+PIPELINE 0
+  SOURCE #0 FULLTEXT_SCAN (actual time=<time-range> rows=<rows> loops=<loops>) logical_node_id=55
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=<rows> loops=<loops>) logical_node_id=56
+  SINK #2 CLIENT_RESULT (actual time=<time-range> rows=<rows> loops=<loops>)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
+Execution Time: <time-ms>
+Rows Returned: 1
+
+SELECT id, ts_rank(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC, id;
+id	score
+1	2.375000
+2	2.000000
+3	2.000000
+
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+id
+1
+
+-- @normalize explain_operator_timing,explain_operator_counters,explain_summary_timing,explain_runtime_bytes,explain_logical_ids
+EXPLAIN ANALYZE
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank_cd(to_tsvector('simple', content),
+                    plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+QUERY PLAN
+PIPELINE 0
+  SOURCE #0 FULLTEXT_SCAN (actual time=<time-range> rows=<rows> loops=<loops>) logical_node_id=55
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=<rows> loops=<loops>) logical_node_id=56
+  SINK #2 CLIENT_RESULT (actual time=<time-range> rows=<rows> loops=<loops>)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
+Execution Time: <time-ms>
+Rows Returned: 1
+
+SELECT ts_rank_cd(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank_cd(to_tsvector('simple', content),
+                    plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+score
+2.000000
+
+INSERT INTO score_identity VALUES (6, 'unrelated document');
+INSERT 0 1
+
+SELECT id, ts_rank(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC, id;
+id	score
+1	2.375000
+2	2.000000
+3	2.000000
+
+BEGIN;
+BEGIN
+
+INSERT INTO score_identity VALUES (7, 'vector vector database database');
+INSERT 0 1
+
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+id
+7
+
+ROLLBACK;
+ROLLBACK
+
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC LIMIT 1;
+id
+1
+
+BEGIN;
+BEGIN
+
+DELETE FROM score_identity WHERE id = 1;
+DELETE 1
+
+SELECT ts_rank(to_tsvector('simple', content),
+               plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC LIMIT 1;
+score
+2.000000
+
+ROLLBACK;
+ROLLBACK
+
+SELECT ts_rank(to_tsvector('simple', content),
+               plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity
+WHERE id <> 1 AND to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY score DESC LIMIT 1;
+score
+2.000000
+
+SELECT id FROM score_identity
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(to_tsvector('simple', content),
+                 plainto_tsquery('simple', 'vector database')) DESC, id LIMIT 2 OFFSET 1;
+id
+2
+3
+
+INSERT INTO score_identity VALUES (8, NULL);
+INSERT 0 1
+
+SELECT id, ts_rank(to_tsvector('simple', content),
+                  plainto_tsquery('simple', 'vector database')) AS score
+FROM score_identity ORDER BY score ASC NULLS LAST, id LIMIT 8;
+id	score
+4	0.000000
+5	0.000000
+6	0.000000
+2	2.000000
+3	2.000000
+1	2.375000
+8	NULL
+
+DROP TABLE score_identity;
+DROP TABLE

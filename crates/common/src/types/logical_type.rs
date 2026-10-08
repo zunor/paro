@@ -159,7 +159,88 @@ pub enum LogicalType {
     Struct(Vec<(String, LogicalType)>),
 }
 
+/// Canonical physical equality representation for a flat grouping key.
+///
+/// This is the single admission vocabulary shared by planning, tuple
+/// storage, and immutable group indexes. New logical types must be classified
+/// explicitly here before any flat-group implementation can admit them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatGroupKeyKind {
+    Boolean,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    F32Bits,
+    F64Bits,
+    Decimal64,
+    Decimal128,
+    Interval,
+    VarlenBytes,
+}
+
+impl FlatGroupKeyKind {
+    pub const fn is_varlen(self) -> bool {
+        matches!(self, Self::VarlenBytes)
+    }
+}
+
 impl LogicalType {
+    pub fn flat_group_key_kind(&self) -> Option<FlatGroupKeyKind> {
+        match self {
+            Self::Boolean => Some(FlatGroupKeyKind::Boolean),
+            Self::TinyInt => Some(FlatGroupKeyKind::I8),
+            Self::SmallInt => Some(FlatGroupKeyKind::I16),
+            Self::Integer | Self::Date => Some(FlatGroupKeyKind::I32),
+            Self::BigInt | Self::Timestamp | Self::TimestampTz | Self::Time => {
+                Some(FlatGroupKeyKind::I64)
+            }
+            Self::HugeInt => Some(FlatGroupKeyKind::I128),
+            Self::UTinyInt => Some(FlatGroupKeyKind::U8),
+            Self::USmallInt => Some(FlatGroupKeyKind::U16),
+            Self::UInteger => Some(FlatGroupKeyKind::U32),
+            Self::UBigInt => Some(FlatGroupKeyKind::U64),
+            Self::UHugeInt | Self::Uuid => Some(FlatGroupKeyKind::U128),
+            Self::Float => Some(FlatGroupKeyKind::F32Bits),
+            Self::Double => Some(FlatGroupKeyKind::F64Bits),
+            Self::Decimal { precision, .. } if *precision <= 18 => {
+                Some(FlatGroupKeyKind::Decimal64)
+            }
+            Self::Decimal { .. } => Some(FlatGroupKeyKind::Decimal128),
+            Self::Interval => Some(FlatGroupKeyKind::Interval),
+            Self::Varchar
+            | Self::VarcharCollation(_)
+            | Self::TsVector
+            | Self::TsQuery
+            | Self::Blob
+            | Self::Json
+            | Self::Jsonb => Some(FlatGroupKeyKind::VarlenBytes),
+            Self::Null
+            | Self::IntegerLiteral(_)
+            | Self::StringLiteral
+            | Self::Unknown
+            | Self::Array(_, _)
+            | Self::List(_)
+            | Self::Struct(_) => None,
+        }
+    }
+
+    /// Whether the type has one canonical flat-vector representation for SQL
+    /// grouping equality and hashing.
+    ///
+    /// Nested and binding-only types must be lowered before entering a flat
+    /// hash-group domain. Callers that offer an alternative implementation
+    /// should use this as an admission check rather than fail at execution.
+    pub fn supports_flat_group_key(&self) -> bool {
+        self.flat_group_key_kind().is_some()
+    }
+
     /// Returns the type ID for serialization.
     ///
     /// This is used for compact binary serialization in WAL entries.

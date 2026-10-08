@@ -22,6 +22,7 @@ mod iterator;
 mod operator_expression;
 mod parameter_expression;
 mod reference_expression;
+mod shared_payload;
 mod subquery_expression;
 mod window_expression;
 
@@ -32,13 +33,16 @@ pub use columnref_expression::ColumnRefExpression;
 pub use comparison_expression::{ComparisonExpression, ComparisonType};
 pub use conjunction_expression::{ConjunctionExpression, ConjunctionType};
 pub use constant_expression::ConstantExpression;
-pub use evaluation::EvaluationProperties;
+pub use evaluation::{evaluate_constant_expression, EvaluationProperties};
 pub use expression_node::Expression;
 pub use function_expression::FunctionExpression;
 pub use iterator::{ExpressionIterator, ExpressionVisitDecision};
 pub use operator_expression::{OperatorExpression, OperatorType};
 pub use parameter_expression::ParameterExpression;
 pub use reference_expression::ReferenceExpression;
+pub use shared_payload::{
+    ExpressionIdentity, ExpressionPayload, ExpressionWitness, SharedExpressionPayload,
+};
 pub use subquery_expression::{SubqueryExpression, SubqueryPlanningState, SubqueryType};
 pub use window_expression::{
     OrderByExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,

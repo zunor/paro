@@ -8,6 +8,23 @@ import pytest
 from harness.normalizers import apply_normalizers, normalizer_profiles
 
 
+def test_lineage_alpha_renaming_preserves_presence_roles_and_shared_identity() -> None:
+    def normalize(lines):
+        return apply_normalizers(lines, ("explain_logical_ids",))
+    original = ["SOURCE logical_node_id=90", "BUILD logical_node_id=91",
+                '{"logical_node_id":90,"role":"probe"}']
+    renamed = ["SOURCE logical_node_id=5", "BUILD logical_node_id=7",
+               '{"logical_node_id":5,"role":"probe"}']
+    assert normalize(original) == normalize(renamed)
+    for wrong in [
+        ["SOURCE", *renamed[1:]],
+        [renamed[0], "BUILD logical_node_id=5", renamed[2]],
+        [*renamed[:2], '{"logical_node_id":7,"role":"probe"}'],
+        [*renamed[:2], '{"logical_node_id":5,"role":"build"}'],
+    ]:
+        assert normalize(original) != normalize(wrong)
+
+
 def test_apply_explain_operator_timing_normalizer_rewrites_actual_time() -> None:
     lines = [
         "FILTER  (actual time=0.018..0.024 rows=2)",
@@ -140,6 +157,30 @@ def test_apply_explain_runtime_bytes_normalizer_rewrites_only_target_fields() ->
     ]
 
 
+def test_apply_explain_adaptive_runtime_preserves_fields_not_heuristic_values() -> None:
+    lines = [
+        (
+            "HASH_AGGREGATE_BUILD (aggregate_hash_full_key_fallback_count=2 "
+            "aggregate_hash_max_prefix_probe_distance=79 repartition_depth=1)"
+        ),
+        (
+            '{"actual":{"aggregate_hash_full_key_fallback_count":2,'
+            '"aggregate_hash_max_prefix_probe_distance":79,"rows":4}}'
+        ),
+    ]
+
+    assert apply_normalizers(lines, ("explain_adaptive_runtime",)) == [
+        (
+            "HASH_AGGREGATE_BUILD (aggregate_hash_full_key_fallback_count=<adaptive> "
+            "aggregate_hash_max_prefix_probe_distance=<adaptive> repartition_depth=1)"
+        ),
+        (
+            '{"actual":{"aggregate_hash_full_key_fallback_count": "<adaptive>",'
+            '"aggregate_hash_max_prefix_probe_distance": "<adaptive>","rows":4}}'
+        ),
+    ]
+
+
 def test_apply_explain_routine_ids_normalizer_rewrites_catalog_ids_only() -> None:
     lines = [
         "Routines: py_explain[10315@1]",
@@ -173,6 +214,38 @@ def test_apply_explain_search_ids_normalizer_rewrites_dynamic_ids_only() -> None
         "    Search Capability: Queryable",
         "    Column: 2",
         "    Mode: Filter",
+    ]
+
+
+def test_apply_explain_schema_order_preserves_nested_types_and_all_fields() -> None:
+    assert apply_normalizers(
+        [
+            '    Output Schema: s.id INTEGER, b.payload VARCHAR',
+            '    Output Schema: z DECIMAL(18, 2), a STRUCT(x INTEGER, y VARCHAR)',
+            '    Output: s.id, b.payload',
+        ],
+        ("explain_schema_order",),
+    ) == [
+        '    Output Schema: b.payload VARCHAR, s.id INTEGER',
+        '    Output Schema: a STRUCT(x INTEGER, y VARCHAR), z DECIMAL(18, 2)',
+        '    Output: s.id, b.payload',
+    ]
+
+
+def test_apply_explain_cte_ids_normalizer_preserves_identity_relationships() -> None:
+    assert apply_normalizers(
+        [
+            "  CTE Index: 78",
+            "  CTE Index: 99",
+            "  CTE Index: 78",
+            "  Table Index: 78",
+        ],
+        ("explain_cte_ids",),
+    ) == [
+        "  CTE Index: <cte-1>",
+        "  CTE Index: <cte-2>",
+        "  CTE Index: <cte-1>",
+        "  Table Index: 78",
     ]
 
 
@@ -319,8 +392,12 @@ def test_normalizer_profiles_returns_registered_names() -> None:
         "explain_operator_counters",
         "explain_summary_timing",
         "explain_runtime_bytes",
+        "explain_adaptive_runtime",
         "explain_routine_ids",
         "explain_search_ids",
+        "explain_logical_ids",
+        "explain_schema_order",
+        "explain_cte_ids",
         "explain_external_runtime",
         "explain_runtime",
         "copy_rowcount",

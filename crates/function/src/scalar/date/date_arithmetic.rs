@@ -199,6 +199,18 @@ pub fn register_temporal_arithmetic_functions(set: &mut ScalarFunctionSet) {
         "+" => {
             set.add_function(ScalarFunction::new(
                 "+".to_string(),
+                vec![LogicalType::Date, LogicalType::BigInt],
+                LogicalType::Date,
+                date_add_days_impl,
+            ));
+            set.add_function(ScalarFunction::new(
+                "+".to_string(),
+                vec![LogicalType::BigInt, LogicalType::Date],
+                LogicalType::Date,
+                days_date_add_impl,
+            ));
+            set.add_function(ScalarFunction::new(
+                "+".to_string(),
                 vec![LogicalType::Date, LogicalType::Interval],
                 LogicalType::Timestamp,
                 date_interval_add_impl,
@@ -223,6 +235,18 @@ pub fn register_temporal_arithmetic_functions(set: &mut ScalarFunctionSet) {
             ));
         }
         "-" => {
+            set.add_function(ScalarFunction::new(
+                "-".to_string(),
+                vec![LogicalType::Date, LogicalType::BigInt],
+                LogicalType::Date,
+                date_sub_days_impl,
+            ));
+            set.add_function(ScalarFunction::new(
+                "-".to_string(),
+                vec![LogicalType::Date, LogicalType::Date],
+                LogicalType::BigInt,
+                date_date_sub_impl,
+            ));
             set.add_function(ScalarFunction::new(
                 "-".to_string(),
                 vec![LogicalType::Date, LogicalType::Interval],
@@ -256,9 +280,52 @@ fn date_sub_days_impl(
     execute_date_days(input, result, true)
 }
 
+fn days_date_add_impl(
+    input: &Chunk,
+    _state: &dyn ExpressionState,
+    result: &mut Vector,
+) -> Result<()> {
+    execute_date_days_at(input, result, 1, 0, false)
+}
+
+fn date_date_sub_impl(
+    input: &Chunk,
+    _state: &dyn ExpressionState,
+    result: &mut Vector,
+) -> Result<()> {
+    let left = column(input, 0, "left date")?;
+    let right = column(input, 1, "right date")?;
+    let count = input.size();
+    result.set_count(count);
+    for row in 0..count {
+        if left.is_null(row) || right.is_null(row) {
+            result.set_null(row, true);
+            continue;
+        }
+        let left = left
+            .get_i32(row)
+            .ok_or_else(|| paro_error::internal("DATE vector has no physical INT32 value"))?;
+        let right = right
+            .get_i32(row)
+            .ok_or_else(|| paro_error::internal("DATE vector has no physical INT32 value"))?;
+        result.set_i64(row, i64::from(left) - i64::from(right));
+    }
+    Ok(())
+}
+
 fn execute_date_days(input: &Chunk, result: &mut Vector, subtract: bool) -> Result<()> {
-    let date = column(input, 0, "date")?;
-    let days = column(input, 1, "days")?;
+    execute_date_days_at(input, result, 0, 1, subtract)
+}
+
+fn execute_date_days_at(
+    input: &Chunk,
+    result: &mut Vector,
+    date_index: usize,
+    days_index: usize,
+    subtract: bool,
+) -> Result<()> {
+    let date = column(input, date_index, "date")?;
+    let days = column(input, days_index, "days")?;
     let count = input.size();
     result.set_count(count);
     for row in 0..count {
@@ -507,6 +574,15 @@ mod tests {
 
     #[test]
     fn standard_operators_bind_temporal_interval_overloads() {
+        let mut add = ScalarFunctionSet::new("+".to_string());
+        register_temporal_arithmetic_functions(&mut add);
+        let (function, arguments) = add.bind(&[LogicalType::Date, LogicalType::BigInt]).unwrap();
+        assert_eq!(arguments, vec![LogicalType::Date, LogicalType::BigInt]);
+        assert_eq!(function.return_type, LogicalType::Date);
+        let (function, arguments) = add.bind(&[LogicalType::BigInt, LogicalType::Date]).unwrap();
+        assert_eq!(arguments, vec![LogicalType::BigInt, LogicalType::Date]);
+        assert_eq!(function.return_type, LogicalType::Date);
+
         let mut subtract = ScalarFunctionSet::new("-".to_string());
         register_temporal_arithmetic_functions(&mut subtract);
         let (function, arguments) = subtract
@@ -514,5 +590,10 @@ mod tests {
             .unwrap();
         assert_eq!(arguments, vec![LogicalType::Date, LogicalType::Interval]);
         assert_eq!(function.return_type, LogicalType::Timestamp);
+        let (function, arguments) = subtract
+            .bind(&[LogicalType::Date, LogicalType::Date])
+            .unwrap();
+        assert_eq!(arguments, vec![LogicalType::Date, LogicalType::Date]);
+        assert_eq!(function.return_type, LogicalType::BigInt);
     }
 }

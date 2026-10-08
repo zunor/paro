@@ -6,7 +6,7 @@
 //! Tracks pointers into the hash table, collision chains, and match flags for outer joins.
 
 use paro_common::allocator::Allocator;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
@@ -15,9 +15,10 @@ use std::sync::Arc;
 use crate::join_hashtable::hash_kernel::PreparedProbeKeys;
 use crate::join_hashtable::JoinHashTable;
 use crate::operators::join::join_result_helpers::{
-    construct_anti_join_result, construct_left_outer_result, construct_mark_join_result,
-    construct_semi_join_result,
+    construct_anti_join_result, construct_mark_join_result, construct_permuted_left_outer_result,
+    construct_semi_join_result, mapped_output_index, project_columns_permuted,
 };
+use crate::physical::OutputPermutation;
 
 /// Scan structure for probing the hash table and iterating over results.
 ///
@@ -115,6 +116,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
         mut residual_filter: F,
     ) -> Result<usize>
     where
@@ -123,6 +125,7 @@ impl ScanStructure {
         if self.finished {
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         let mut base_count = 0;
@@ -185,7 +188,14 @@ impl ScanStructure {
         }
 
         if base_count > 0 {
-            self.gather_result(left, result, base_count, hash_table, left_projection_map)?;
+            self.gather_result(
+                left,
+                result,
+                base_count,
+                hash_table,
+                left_projection_map,
+                output_permutation,
+            )?;
         } else {
             result.set_cardinality(0);
         }
@@ -230,6 +240,21 @@ impl ScanStructure {
             has_long_chains: false,
             exact_key_matches: false,
         })
+    }
+
+    /// Materialize every selection that may be shared with the preceding
+    /// zero-copy output batch before entering an infallible hot write loop.
+    /// Allocation failure belongs to the query error channel, never to a
+    /// worker-thread panic from `SelectionVector::set` or `as_mut_slice`.
+    fn try_prepare_mutable_selections(&mut self) -> Result<()> {
+        self.sel_vector.try_make_exclusive()?;
+        self.probe_sel.try_make_exclusive()?;
+        self.continue_sel.try_make_exclusive()?;
+        self.chain_match_sel.try_make_exclusive()?;
+        self.scratch_sel.try_make_exclusive()?;
+        self.lhs_sel.try_make_exclusive()?;
+        self.rhs_dictionary_sel.try_make_exclusive()?;
+        Ok(())
     }
 
     /// Ensure the scan structure can address all probe rows in the current batch.
@@ -411,7 +436,7 @@ impl ScanStructure {
             .any(|(col_idx, condition)| {
                 !matches!(
                     condition.comparison,
-                    paro_planner::operator::join::JoinComparisonType::NotDistinctFrom
+                    paro_planner::logical::operator::join::JoinComparisonType::NotDistinctFrom
                 ) && keys.data[col_idx].is_null(row_idx)
             })
     }
@@ -425,6 +450,7 @@ impl ScanStructure {
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
+        self.try_prepare_mutable_selections()?;
         let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         while self.count > 0 {
             let match_count = self.resolve_predicates(prepared_keys.as_ref(), hash_table, 0);
@@ -480,6 +506,7 @@ impl ScanStructure {
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
+        self.try_prepare_mutable_selections()?;
         let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         while self.count > 0 {
             let match_count = self.resolve_predicates(prepared_keys.as_ref(), hash_table, 0);
@@ -516,6 +543,7 @@ impl ScanStructure {
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut [u8]) -> Result<()>,
     {
+        self.try_prepare_mutable_selections()?;
         let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         while self.count > 0 {
             let match_count = self.resolve_predicates(prepared_keys.as_ref(), hash_table, 0);
@@ -545,6 +573,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
         residual_filter: F,
     ) -> Result<usize>
     where
@@ -554,6 +583,7 @@ impl ScanStructure {
             result.set_cardinality(0);
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         if !self.probe_matches_ready {
             self.scan_key_matches_with_filter(keys, hash_table, residual_filter)?;
@@ -577,6 +607,7 @@ impl ScanStructure {
                 &self.scratch_sel,
                 selected_count,
                 left_projection_map,
+                output_permutation,
                 result,
             )?;
         } else {
@@ -585,6 +616,7 @@ impl ScanStructure {
                 &self.scratch_sel,
                 selected_count,
                 left_projection_map,
+                output_permutation,
                 result,
             )?;
         }
@@ -605,11 +637,13 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
     ) -> Result<usize> {
         if self.finished {
             result.set_cardinality(0);
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         if !self.probe_matches_ready {
             self.scan_key_matches_with_filter(keys, hash_table, Self::accept_all_matches)?;
@@ -630,6 +664,7 @@ impl ScanStructure {
             &self.scratch_sel,
             selected_count,
             left_projection_map,
+            output_permutation,
             result,
         )?;
         self.finished = finished;
@@ -714,10 +749,18 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
     ) -> Result<usize> {
-        if self.exact_key_matches && hash_table.join_type == paro_planner::operator::JoinType::Inner
+        if self.exact_key_matches
+            && hash_table.join_type == paro_planner::logical::operator::JoinType::Inner
         {
-            return self.next_exact_inner_join(left, result, hash_table, left_projection_map);
+            return self.next_exact_inner_join(
+                left,
+                result,
+                hash_table,
+                left_projection_map,
+                output_permutation,
+            );
         }
         self.next_inner_join_impl(
             keys,
@@ -725,6 +768,7 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
+            output_permutation,
             |_, _, match_count, output_sel| {
                 for i in 0..match_count {
                     output_sel.set(i, i);
@@ -749,16 +793,18 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
     ) -> Result<usize> {
         debug_assert!(self.exact_key_matches);
         debug_assert_eq!(
             hash_table.join_type,
-            paro_planner::operator::JoinType::Inner
+            paro_planner::logical::operator::JoinType::Inner
         );
         if self.finished {
             result.try_set_cardinality(0)?;
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         let mut output_count = 0usize;
         while self.count > 0 {
@@ -779,7 +825,14 @@ impl ScanStructure {
         if output_count == 0 {
             result.try_set_cardinality(0)?;
         } else {
-            self.gather_result(left, result, output_count, hash_table, left_projection_map)?;
+            self.gather_result(
+                left,
+                result,
+                output_count,
+                hash_table,
+                left_projection_map,
+                output_permutation,
+            )?;
         }
         self.finished = self.count == 0;
         Ok(output_count)
@@ -797,6 +850,7 @@ impl ScanStructure {
         left: &paro_common::chunk::Chunk,
         result: &mut paro_common::chunk::Chunk,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
     ) -> Result<usize> {
         debug_assert!(self.exact_key_matches);
         debug_assert!(!self.has_long_chains);
@@ -813,6 +867,7 @@ impl ScanStructure {
             left_projection_map,
             &self.sel_vector,
             &[],
+            output_permutation,
         )?;
         self.count = 0;
         self.finished = true;
@@ -827,6 +882,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
         residual_filter: F,
     ) -> Result<usize>
     where
@@ -838,6 +894,7 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
+            output_permutation,
             residual_filter,
         )
     }
@@ -849,6 +906,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
     ) -> Result<usize> {
         self.next_left_join_with_filter(
             keys,
@@ -856,6 +914,7 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
+            output_permutation,
             Self::accept_all_matches,
         )
     }
@@ -867,6 +926,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
         mut residual_filter: F,
     ) -> Result<usize>
     where
@@ -876,6 +936,7 @@ impl ScanStructure {
             result.set_cardinality(0);
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         let mut base_count = 0;
@@ -915,7 +976,14 @@ impl ScanStructure {
         }
 
         if base_count > 0 {
-            self.gather_result(left, result, base_count, hash_table, left_projection_map)?;
+            self.gather_result(
+                left,
+                result,
+                base_count,
+                hash_table,
+                left_projection_map,
+                output_permutation,
+            )?;
             return Ok(base_count);
         }
 
@@ -933,12 +1001,13 @@ impl ScanStructure {
         if unmatched_count == 0 {
             result.set_cardinality(0);
         } else {
-            construct_left_outer_result(
+            construct_permuted_left_outer_result(
                 left,
                 &self.scratch_sel,
                 unmatched_count,
                 left_projection_map,
                 hash_table.build_output_types(),
+                output_permutation,
                 result,
             )?;
         }
@@ -954,6 +1023,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
     ) -> Result<usize> {
         self.next_semi_join_with_filter(
             keys,
@@ -961,6 +1031,7 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
+            output_permutation,
             Self::accept_all_matches,
         )
     }
@@ -972,6 +1043,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
         residual_filter: F,
     ) -> Result<usize>
     where
@@ -983,6 +1055,7 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
+            output_permutation,
             residual_filter,
         )
     }
@@ -994,6 +1067,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
     ) -> Result<usize> {
         self.next_anti_join_with_filter(
             keys,
@@ -1001,6 +1075,7 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
+            output_permutation,
             Self::accept_all_matches,
         )
     }
@@ -1012,6 +1087,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
         residual_filter: F,
     ) -> Result<usize>
     where
@@ -1023,6 +1099,7 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
+            output_permutation,
             residual_filter,
         )
     }
@@ -1034,6 +1111,8 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
+        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
     ) -> Result<usize> {
         self.next_mark_join_with_filter(
             keys,
@@ -1041,6 +1120,8 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
+            output_permutation,
+            mark_semantics,
             Self::accept_all_matches,
         )
     }
@@ -1052,15 +1133,28 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
+        mark_semantics: paro_planner::logical::operator::MarkJoinSemantics,
         residual_filter: F,
     ) -> Result<usize>
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
+        let nulls_produce_unknown = match mark_semantics {
+            paro_planner::logical::operator::MarkJoinSemantics::TwoValued => false,
+            paro_planner::logical::operator::MarkJoinSemantics::ThreeValuedFrom(0) => true,
+            paro_planner::logical::operator::MarkJoinSemantics::NotMark
+            | paro_planner::logical::operator::MarkJoinSemantics::ThreeValuedFrom(_) => {
+                return Err(paro_error::internal(
+                    "hash MARK probe received an unsupported truth-value contract",
+                ));
+            }
+        };
         if self.finished {
             result.set_cardinality(0);
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         self.scan_key_matches_with_filter(keys, hash_table, residual_filter)?;
 
@@ -1068,10 +1162,11 @@ impl ScanStructure {
             .map(|idx| {
                 if self.found_match[idx] {
                     Some(true)
-                } else if Self::probe_row_has_null(keys, hash_table, idx)
-                    || hash_table
-                        .has_null
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                } else if nulls_produce_unknown
+                    && (Self::probe_row_has_null(keys, hash_table, idx)
+                        || hash_table
+                            .has_null
+                            .load(std::sync::atomic::Ordering::Relaxed))
                 {
                     None
                 } else {
@@ -1080,7 +1175,13 @@ impl ScanStructure {
             })
             .collect();
 
-        construct_mark_join_result(left, left_projection_map, &markers, result)?;
+        construct_mark_join_result(
+            left,
+            left_projection_map,
+            &markers,
+            output_permutation,
+            result,
+        )?;
         self.finished = true;
         Ok(result.size())
     }
@@ -1092,6 +1193,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
     ) -> Result<usize> {
         self.next_single_join_with_filter(
             keys,
@@ -1099,6 +1201,7 @@ impl ScanStructure {
             result,
             hash_table,
             left_projection_map,
+            output_permutation,
             Self::accept_all_matches,
         )
     }
@@ -1110,6 +1213,7 @@ impl ScanStructure {
         result: &mut paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
         mut residual_filter: F,
     ) -> Result<usize>
     where
@@ -1119,6 +1223,7 @@ impl ScanStructure {
             result.set_cardinality(0);
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         if !self.probe_matches_ready {
             let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
@@ -1151,7 +1256,11 @@ impl ScanStructure {
         }
 
         let right_offset = left_projection_map.len();
-        result.try_reset_writable_suffix(right_offset, result.allocator().clone())?;
+        if output_permutation.is_identity() {
+            result.try_reset_writable_suffix(right_offset, result.allocator().clone())?;
+        } else {
+            result.try_reset(result.allocator().clone())?;
+        }
         let output_capacity = result.capacity();
         if output_capacity == 0 {
             return Err(paro_common::error::internal(
@@ -1166,24 +1275,36 @@ impl ScanStructure {
                 .set(output_idx, self.probe_output_offset + output_idx);
         }
         let left_sel = self.scratch_sel.clone();
-        for (out_idx, left_idx) in left_projection_map.iter().enumerate() {
-            let left_column = left.data.get(*left_idx).ok_or_else(|| {
-                paro_common::error::internal(format!(
-                    "single join left projection index {left_idx} is out of range for {} columns",
-                    left.column_count()
-                ))
-            })?;
-            result.data[out_idx] = Arc::new(Vector::try_dictionary(
-                Arc::clone(left_column),
-                left_sel.clone(),
-            )?);
+        if output_permutation.is_identity() {
+            for (out_idx, left_idx) in left_projection_map.iter().enumerate() {
+                let left_column = left.data.get(*left_idx).ok_or_else(|| {
+                    paro_common::error::internal(format!(
+                        "single join left projection index {left_idx} is out of range for {} columns",
+                        left.column_count()
+                    ))
+                })?;
+                result.data[out_idx] = Arc::new(Vector::try_dictionary(
+                    Arc::clone(left_column),
+                    left_sel.clone(),
+                )?);
+            }
+        } else {
+            project_columns_permuted(
+                left,
+                &left_sel,
+                left_projection_map,
+                result,
+                0,
+                output_permutation,
+            )?;
         }
 
         for build_idx in 0..hash_table.build_output_count() {
-            let vector = result.column_mut(right_offset + build_idx).ok_or_else(|| {
+            let output_index =
+                mapped_output_index(output_permutation, right_offset + build_idx, result)?;
+            let vector = result.column_mut(output_index).ok_or_else(|| {
                 paro_common::error::internal(format!(
-                    "single join output column {} is missing",
-                    right_offset + build_idx
+                    "single join output column {output_index} is missing"
                 ))
             })?;
             let start = self.probe_output_offset;
@@ -1233,6 +1354,7 @@ impl ScanStructure {
         count: usize,
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
+        output_permutation: &OutputPermutation,
     ) -> Result<()> {
         prepare_left_join_output(
             left,
@@ -1241,6 +1363,7 @@ impl ScanStructure {
             left_projection_map,
             &self.lhs_sel,
             hash_table.build_output_types(),
+            output_permutation,
         )?;
 
         // 2. Gather projected RHS columns
@@ -1253,8 +1376,20 @@ impl ScanStructure {
         if needs_dictionary {
             self.prepare_rhs_dictionary(count)?;
         }
+        let identity_layout = output_permutation.is_identity();
         for (build_idx, build_type) in hash_table.build_output_types().iter().enumerate() {
-            let output_idx = right_result_offset + build_idx;
+            let natural_output_idx = right_result_offset + build_idx;
+            let output_idx = if identity_layout {
+                natural_output_idx
+            } else {
+                output_permutation
+                    .destination_of(natural_output_idx)
+                    .ok_or_else(|| {
+                        paro_common::error::internal(format!(
+                            "join output permutation has no natural column {natural_output_idx}"
+                        ))
+                    })?
+            };
             let use_dictionary = needs_dictionary
                 && dictionary_gather_is_smaller(build_type, count, unique_rhs_count);
             let row_ptrs = if use_dictionary {
@@ -1321,6 +1456,7 @@ fn prepare_left_join_output(
     left_projection_map: &[usize],
     selection: &SelectionVector,
     build_output_types: &[LogicalType],
+    output_permutation: &OutputPermutation,
 ) -> Result<()> {
     if selection.len() < count {
         return Err(paro_common::error::internal(format!(
@@ -1329,25 +1465,50 @@ fn prepare_left_join_output(
         )));
     }
     let expected_column_count = left_projection_map.len() + build_output_types.len();
-    let left_layout_matches = left_projection_map
-        .iter()
-        .enumerate()
-        .all(|(out_idx, &left_idx)| {
-            left.data
-                .get(left_idx)
-                .zip(result.data.get(out_idx))
-                .is_some_and(|(left_column, result_column)| {
-                    left_column.logical_type() == result_column.logical_type()
-                })
-        });
+    if output_permutation.len() != expected_column_count {
+        return Err(paro_common::error::internal(format!(
+            "join output permutation has {} columns but natural output has {expected_column_count}",
+            output_permutation.len()
+        )));
+    }
+    let identity_layout = output_permutation.is_identity();
+    let left_layout_matches =
+        left_projection_map
+            .iter()
+            .enumerate()
+            .all(|(natural_idx, &left_idx)| {
+                let out_idx = if identity_layout {
+                    natural_idx
+                } else {
+                    let Some(out_idx) = output_permutation.destination_of(natural_idx) else {
+                        return false;
+                    };
+                    out_idx
+                };
+                left.data
+                    .get(left_idx)
+                    .zip(result.data.get(out_idx))
+                    .is_some_and(|(left_column, result_column)| {
+                        left_column.logical_type() == result_column.logical_type()
+                    })
+            });
     let right_layout_matches =
         build_output_types
             .iter()
             .enumerate()
             .all(|(build_idx, build_type)| {
+                let natural_idx = left_projection_map.len() + build_idx;
+                let output_idx = if identity_layout {
+                    natural_idx
+                } else {
+                    let Some(output_idx) = output_permutation.destination_of(natural_idx) else {
+                        return false;
+                    };
+                    output_idx
+                };
                 result
                     .data
-                    .get(left_projection_map.len() + build_idx)
+                    .get(output_idx)
                     .is_some_and(|column| column.logical_type() == build_type)
             });
     if result.column_count() != expected_column_count
@@ -1355,7 +1516,7 @@ fn prepare_left_join_output(
         || !left_layout_matches
         || !right_layout_matches
     {
-        let mut expected_types = Vec::with_capacity(expected_column_count);
+        let mut natural_types = Vec::with_capacity(expected_column_count);
         for &left_idx in left_projection_map {
             let left_column = left.data.get(left_idx).ok_or_else(|| {
                 paro_common::error::internal(format!(
@@ -1363,9 +1524,23 @@ fn prepare_left_join_output(
                     left.column_count()
                 ))
             })?;
-            expected_types.push(left_column.logical_type().clone());
+            natural_types.push(left_column.logical_type().clone());
         }
-        expected_types.extend(build_output_types.iter().cloned());
+        natural_types.extend(build_output_types.iter().cloned());
+        let expected_types = if identity_layout {
+            natural_types
+        } else {
+            let mut expected_types = Vec::with_capacity(expected_column_count);
+            for output_idx in 0..expected_column_count {
+                let natural_idx = output_permutation.natural_of(output_idx).ok_or_else(|| {
+                    paro_common::error::internal(format!(
+                        "join output permutation has no source for output column {output_idx}"
+                    ))
+                })?;
+                expected_types.push(natural_types[natural_idx].clone());
+            }
+            expected_types
+        };
         *result = paro_common::chunk::Chunk::try_initialize(
             &expected_types,
             VECTOR_SIZE.max(count),
@@ -1386,13 +1561,20 @@ fn prepare_left_join_output(
             .iter()
             .enumerate()
             .all(|(row_idx, &selected)| selected as usize == row_idx);
-    for (output_idx, &left_idx) in left_projection_map.iter().enumerate() {
+    for (natural_idx, &left_idx) in left_projection_map.iter().enumerate() {
         let left_column = left.data.get(left_idx).ok_or_else(|| {
             paro_common::error::internal(format!(
                 "join left projection index {left_idx} is out of range for {} columns",
                 left.column_count()
             ))
         })?;
+        let output_idx = if identity_layout {
+            natural_idx
+        } else {
+            output_permutation
+                .destination_of(natural_idx)
+                .expect("permutation arity checked above")
+        };
         result.data[output_idx] = if selection_is_identity {
             // A total, order-preserving match needs no dictionary wrapper.
             Arc::clone(left_column)

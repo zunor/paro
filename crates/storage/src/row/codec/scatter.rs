@@ -211,7 +211,22 @@ impl<'a> PreparedRowScatter<'a> {
     /// scatter program. Shapes containing sequences, NULLs, varlen, or nested
     /// values keep using [`Self::scatter_row_unchecked`].
     pub fn fixed_all_valid(&self, layout: &RowLayout) -> Option<PreparedFixedRowScatter<'a>> {
-        if !self.all_valid || self.columns.len() != layout.column_count() {
+        self.fixed_with_known_valid_prefix(layout, 0)
+    }
+
+    /// Compile a direct fixed-width scatter for a selected row domain.
+    ///
+    /// `known_valid_prefix` is a caller-owned proof that every selected row is
+    /// non-NULL in that many leading columns. This is useful after a selection
+    /// kernel has already rejected NULL equality keys: the source vector may
+    /// still carry a validity mask for rows outside the selection, but checking
+    /// it again while serializing each selected row is redundant.
+    pub fn fixed_with_known_valid_prefix(
+        &self,
+        layout: &RowLayout,
+        known_valid_prefix: usize,
+    ) -> Option<PreparedFixedRowScatter<'a>> {
+        if known_valid_prefix > self.columns.len() || self.columns.len() != layout.column_count() {
             return None;
         }
         let mut columns = Vec::with_capacity(self.columns.len());
@@ -219,6 +234,9 @@ impl<'a> PreparedRowScatter<'a> {
             let PreparedColumn::Fixed { view, width, .. } = column else {
                 return None;
             };
+            if column_idx >= known_valid_prefix && !column.all_valid() {
+                return None;
+            }
             let DataRef::Ptr(data) = view.data() else {
                 return None;
             };
@@ -541,5 +559,32 @@ mod tests {
 
         assert!(!scatter.has_heap_values());
         assert_eq!(scatter.heap_usage(1).unwrap(), RowHeapUsage::default());
+    }
+
+    #[test]
+    fn selected_non_null_prefix_enables_direct_fixed_scatter() {
+        let allocator = Arc::new(DefaultAllocator::new());
+        let mut integers = Vector::try_new(LogicalType::Integer, 2, allocator).unwrap();
+        integers.set_i32(0, 10);
+        integers.set_i32(1, 20);
+        integers.set_null(0, true);
+        integers.set_count(2);
+
+        let layout = RowLayout::from_types(
+            vec![LogicalType::Integer],
+            RowValidityType::CanHaveNullValues,
+        );
+        let scatter = PreparedRowScatter::try_new(&layout, &[&integers], 2).unwrap();
+        assert!(scatter.fixed_all_valid(&layout).is_none());
+        let direct = scatter
+            .fixed_with_known_valid_prefix(&layout, 1)
+            .expect("selection proves the serialized key is non-null");
+
+        let mut row = vec![0_u8; layout.row_width()];
+        unsafe { direct.scatter_row_unchecked(row.as_mut_ptr(), 1) };
+        assert_eq!(
+            unsafe { unsafe_api::read_row_value(&layout, row.as_ptr(), 0) },
+            Value::Integer(20)
+        );
     }
 }

@@ -7,9 +7,12 @@ use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_function::aggregate::{AggregateFunction, FunctionData};
+use paro_function::aggregate::{
+    AggregateDirectUpdate, AggregateFunction, DirectGroupedAggregateProgram, FunctionData,
+};
 use paro_planner::expression::{AggregateExpression, AggregateType, Expression};
 
+use super::aggregate_state::AggregateStateLayout;
 use super::grouped_aggregate_data::{reference_index, GroupedAggregateData};
 
 const MIN_STATE_ALIGNMENT: usize = 8;
@@ -140,6 +143,38 @@ pub fn create_validated_aggregate_objects(
     Ok(objects)
 }
 
+/// Compile the direct grouped-state program shared by perfect and generic
+/// hash aggregation.
+pub(crate) fn compile_direct_update_program(
+    aggregate_objects: &[AggregateObject],
+    aggregate_inputs: &[Vec<usize>],
+    state_layout: &AggregateStateLayout,
+) -> DirectGroupedAggregateProgram {
+    let mut program = DirectGroupedAggregateProgram::new(aggregate_objects.len());
+    for (aggregate_index, object) in aggregate_objects.iter().enumerate() {
+        let Some(inputs) = aggregate_inputs.get(aggregate_index) else {
+            continue;
+        };
+        if object.is_distinct() || !object.order_bys.is_empty() {
+            continue;
+        }
+        let input = if object.function.direct_update == Some(AggregateDirectUpdate::CountStar) {
+            None
+        } else {
+            inputs.first().copied()
+        };
+        program.try_add_filtered(
+            aggregate_index,
+            object.function.direct_update,
+            state_layout.state_offset(aggregate_index),
+            input,
+            object.filter,
+            object.function.state_is_trivially_copyable(),
+        );
+    }
+    program
+}
+
 fn align_to(value: usize, alignment: usize) -> Result<usize> {
     debug_assert!(alignment.is_power_of_two());
     let addend = alignment - 1;
@@ -202,7 +237,7 @@ mod tests {
     }
 
     fn make_ref(index: usize, ty: LogicalType) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, ty))
+        Expression::Reference(ReferenceExpression::new(index, ty).into())
     }
 
     #[test]
@@ -249,7 +284,7 @@ mod tests {
         }]);
 
         let aggregate_data = GroupedAggregateData {
-            aggregates: vec![Expression::Aggregate(aggregate)],
+            aggregates: vec![Expression::Aggregate(aggregate.into())],
             aggregate_inputs: vec![vec![0]],
             aggregate_filters: vec![Some(1)],
             aggregate_orders: vec![vec![2]],

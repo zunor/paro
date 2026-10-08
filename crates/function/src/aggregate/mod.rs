@@ -396,11 +396,25 @@ pub enum DecimalDirectUpdate {
 /// This is a semantic contract used by rewrites that change outer-preserving
 /// aggregation into null-rejecting joins. It is intentionally independent of
 /// the SQL function name and of the aggregate's internal state identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggregateEmptyInput {
+    /// No reusable empty-input value has been declared.
     Unknown,
+    /// Finalizing an initialized state without input produces SQL NULL.
     Null,
-    NonNull,
+    /// Exact, already result-typed value produced without input rows.
+    Exact(Value),
+}
+
+impl AggregateEmptyInput {
+    /// Return an exact non-NULL value only when it already inhabits the
+    /// aggregate result domain. Proof metadata never performs implicit casts.
+    pub fn exact_value(&self, return_type: &LogicalType) -> Option<&Value> {
+        let Self::Exact(value) = self else {
+            return None;
+        };
+        (!value.is_null() && value.logical_type() == *return_type).then_some(value)
+    }
 }
 
 /// Exact scalar result of merging zero or one finalized partial value.
@@ -460,7 +474,13 @@ impl AggregateSingletonMerge {
 /// - `varargs`: Optional type for variable arguments
 /// - `bind_data`: Optional bind-time data
 #[derive(Clone)]
-pub struct AggregateFunction {
+pub struct AggregateFunction(Arc<AggregateFunctionData>);
+
+/// Shared bound kernel storage. Mutation during binding/specialization is
+/// copy-on-write; cloning a plan or native invocation never copies its kernel,
+/// signature vectors, or correctness-bearing capabilities.
+#[derive(Clone)]
+pub struct AggregateFunctionData {
     pub name: String,
     pub arguments: Vec<LogicalType>,
     pub return_type: LogicalType,
@@ -470,6 +490,11 @@ pub struct AggregateFunction {
 
     /// Algebraic identity available to logical aggregate rewrites.
     pub algebra: Option<AggregateAlgebra>,
+
+    /// Every non-NULL finalized value is drawn unchanged from the aggregate's
+    /// first input domain. Optimizers may preserve min/max and NDV statistics
+    /// only when this capability is declared by the bound implementation.
+    preserves_input_domain: bool,
 
     /// Optional aggregate over finalized partial results.
     partial_merge: Option<AggregatePartialMergeFn>,
@@ -535,6 +560,21 @@ pub struct AggregateFunction {
     pub bind_data: Option<Arc<dyn FunctionData>>,
 }
 
+impl std::ops::Deref for AggregateFunction {
+    type Target = AggregateFunctionData;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for AggregateFunction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<AggregateFunction>() <= 16);
+
 impl fmt::Debug for AggregateFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AggregateFunction")
@@ -542,6 +582,7 @@ impl fmt::Debug for AggregateFunction {
             .field("arguments", &self.arguments)
             .field("return_type", &self.return_type)
             .field("empty_input", &self.empty_input)
+            .field("preserves_input_domain", &self.preserves_input_domain)
             .field("state_size", &self.state_size)
             .field("has_partial_merge", &self.partial_merge.is_some())
             .field("singleton_merge", &self.singleton_merge)
@@ -554,6 +595,10 @@ impl fmt::Debug for AggregateFunction {
 }
 
 impl AggregateFunction {
+    pub fn shares_binding_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn new(
         name: String,
         arguments: Vec<LogicalType>,
@@ -566,12 +611,13 @@ impl AggregateFunction {
         simple_update: Option<AggregateSimpleUpdateFn>,
         destructor: Option<AggregateDestructorFn>,
     ) -> Self {
-        Self {
+        Self(Arc::new(AggregateFunctionData {
             name,
             arguments,
             return_type,
             empty_input: AggregateEmptyInput::Unknown,
             algebra: None,
+            preserves_input_domain: false,
             partial_merge: None,
             singleton_merge: None,
             input_rollup: None,
@@ -592,7 +638,7 @@ impl AggregateFunction {
             state_deserialize: None,
             varargs: None,
             bind_data: None,
-        }
+        }))
     }
 
     pub fn with_state_filter(mut self, filter: AggregateStateFilterFn) -> Self {
@@ -613,6 +659,15 @@ impl AggregateFunction {
     pub fn with_empty_input(mut self, empty_input: AggregateEmptyInput) -> Self {
         self.empty_input = empty_input;
         self
+    }
+
+    pub fn with_preserves_input_domain(mut self) -> Self {
+        self.preserves_input_domain = true;
+        self
+    }
+
+    pub fn preserves_input_domain(&self) -> bool {
+        self.preserves_input_domain
     }
 
     pub fn with_partial_merge(mut self, merge: AggregatePartialMergeFn) -> Self {
@@ -662,6 +717,9 @@ impl AggregateFunction {
     /// correctness-bearing capability are included. Physical-plan validators
     /// should use this method instead of reconstructing this identity ad hoc.
     pub fn execution_semantics_equal(&self, other: &Self) -> bool {
+        if self.shares_binding_with(other) {
+            return true;
+        }
         macro_rules! optional_fn_equal {
             ($left:expr, $right:expr) => {
                 match ($left, $right) {
@@ -676,6 +734,7 @@ impl AggregateFunction {
             && self.return_type == other.return_type
             && self.empty_input == other.empty_input
             && self.algebra == other.algebra
+            && self.preserves_input_domain == other.preserves_input_domain
             && optional_fn_equal!(self.partial_merge, other.partial_merge)
             && optional_fn_equal!(self.input_rollup, other.input_rollup)
             && optional_fn_equal!(self.non_null_input, other.non_null_input)
@@ -809,7 +868,14 @@ impl AggregateFunctionSet {
 
     pub fn with_empty_input(mut self, empty_input: AggregateEmptyInput) -> Self {
         for function in &mut self.functions {
-            function.empty_input = empty_input;
+            function.empty_input = empty_input.clone();
+        }
+        self
+    }
+
+    pub fn with_preserves_input_domain(mut self) -> Self {
+        for function in &mut self.functions {
+            function.preserves_input_domain = true;
         }
         self
     }
@@ -1284,6 +1350,33 @@ mod tests {
             .with_singleton_merge(AggregateSingletonMerge::Input);
 
         assert!(plain.execution_semantics_equal(&annotated));
+    }
+
+    #[test]
+    fn aggregate_kernel_and_proofs_share_immutable_storage_until_specialized() {
+        let original = create_dummy_aggregate(
+            "shared_aggregate",
+            vec![LogicalType::Integer],
+            LogicalType::BigInt,
+        );
+        let cloned = original.clone();
+        assert!(original.shares_binding_with(&cloned));
+        assert_eq!(original.arguments.as_ptr(), cloned.arguments.as_ptr());
+        let mut specialized = cloned.with_singleton_merge(AggregateSingletonMerge::Input);
+        assert!(!original.shares_binding_with(&specialized));
+        assert!(original.singleton_merge().is_none());
+        assert_eq!(
+            specialized.singleton_merge(),
+            Some(&AggregateSingletonMerge::Input)
+        );
+        assert!(original.execution_semantics_equal(&specialized));
+        specialized.arguments[0] = LogicalType::BigInt;
+        assert_eq!(original.arguments, [LogicalType::Integer]);
+        assert!(!original.execution_semantics_equal(&specialized));
+        assert_eq!(
+            std::mem::size_of::<AggregateFunction>(),
+            std::mem::size_of::<usize>()
+        );
     }
 
     #[test]

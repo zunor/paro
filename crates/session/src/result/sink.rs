@@ -88,6 +88,18 @@ use crate::completion::StatementCompletion;
 /// - Future: CLI sink, HTTP response sink, etc.
 #[async_trait]
 pub trait ResultSink: Send {
+    /// Diagnostic payload retention must preserve its process-budget owner.
+    /// A retaining sink must override this method; ordinary row copying is not
+    /// a proof that diagnostic memory was released.
+    async fn push_diagnostic_chunk(
+        &mut self,
+        _chunk: &Chunk,
+        _owner: std::sync::Arc<dyn paro_common::vector::VectorLifetimeOwner>,
+    ) -> Result<()> {
+        Err(paro_common::error::not_supported(
+            "this result sink does not support bounded compile diagnostics",
+        ))
+    }
     /// Called when a statement starts producing a result set.
     ///
     /// This is called for statements that return rows (SELECT, SHOW, EXPLAIN, etc.).

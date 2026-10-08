@@ -18,7 +18,7 @@ impl ResultHandler {
                         .reason()
                         .unwrap_or(paro_context::StatementCancelReason::UserRequest),
                 ));
-                self.mark_closed();
+                self.mark_cancelled("background execution cancelled");
                 self.cancellation.check()?;
                 return Ok(None);
             }
@@ -33,7 +33,11 @@ impl ResultHandler {
 
             if self.background_driver_finished()? {
                 let result = self.finish_background_driver();
-                self.mark_closed();
+                if result.is_err() {
+                    self.mark_failed("background execution failed");
+                } else {
+                    self.mark_closed();
+                }
                 result?;
                 return Ok(None);
             }

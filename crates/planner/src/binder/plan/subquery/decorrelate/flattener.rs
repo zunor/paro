@@ -10,8 +10,8 @@ use crate::binder::context::BindShared;
 use crate::binder::ir::OrderByNode;
 use crate::binder::{Binder, CorrelatedColumnInfo};
 use crate::expression::*;
-use crate::operator::Window;
-use crate::operator::{
+use crate::logical::operator::Window;
+use crate::logical::operator::{
     ColumnBinding, ComparisonJoin, CrossProduct, DelimGet, DependentJoin, DependentJoinKind,
     DistinctType, Filter, Join, JoinComparisonType, JoinCondition, JoinSide, JoinType,
     LogicalOperator, MarkJoinSemantics, MarkSubqueryKind, Projection,
@@ -27,7 +27,7 @@ use crate::binder::plan::subquery::{
     build_correlated_column_map, expression_has_correlated_columns_at_depth,
     operator_has_correlated_columns_at_depth, CorrelatedColumnMap, RewriteCorrelatedExpressions,
 };
-use crate::plan::LogicalPlan;
+use crate::logical::plan::OwnedLogicalPlan;
 
 use super::helpers::{
     can_push_to_left_child, can_push_to_right_child, push_filter_to_child,
@@ -35,7 +35,7 @@ use super::helpers::{
 };
 
 struct PushDownResult {
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     base_binding: ColumnBinding,
     visible_columns: Vec<usize>,
 }
@@ -105,9 +105,12 @@ impl DependentJoinFlattener {
         self.correlated_base_binding = Some(base_binding);
 
         match kind {
-            DependentJoinKind::Scalar => {
-                self.flatten_scalar_subquery(left, rewritten_right, visible_columns)
-            }
+            DependentJoinKind::Scalar { presence_binding } => self.flatten_scalar_subquery(
+                left,
+                rewritten_right,
+                visible_columns,
+                presence_binding,
+            ),
             DependentJoinKind::Mark {
                 mark_index,
                 subquery: MarkSubqueryKind::Exists,
@@ -158,9 +161,10 @@ impl DependentJoinFlattener {
 
     fn flatten_scalar_subquery(
         &mut self,
-        left: LogicalPlan,
-        right: LogicalPlan,
-        right_visible_columns: Vec<usize>,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
+        mut right_visible_columns: Vec<usize>,
+        presence_binding: Option<ColumnBinding>,
     ) -> Result<LogicalOperator> {
         let right_types = right.types();
         if right_types.is_empty() {
@@ -182,6 +186,18 @@ impl DependentJoinFlattener {
                 right_types.len()
             )));
         }
+        if let Some(presence_binding) = presence_binding {
+            let presence_index = right
+                .get_column_bindings()
+                .iter()
+                .position(|binding| *binding == presence_binding)
+                .ok_or_else(|| {
+                    paro_error::internal(
+                        "scalar subquery presence carrier disappeared during decorrelation",
+                    )
+                })?;
+            right_visible_columns.push(presence_index);
+        }
 
         let conditions = self.create_correlated_join_conditions()?;
 
@@ -199,8 +215,8 @@ impl DependentJoinFlattener {
         &mut self,
         binder: &mut Binder,
         join_type: JoinType,
-        mut left: LogicalPlan,
-        mut right: LogicalPlan,
+        mut left: OwnedLogicalPlan,
+        mut right: OwnedLogicalPlan,
         right_visible_columns: Vec<usize>,
         join_condition: Option<Expression>,
     ) -> Result<LogicalOperator> {
@@ -257,8 +273,8 @@ impl DependentJoinFlattener {
     fn flatten_exists_subquery(
         &mut self,
         binder: &mut Binder,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         mark_index: usize,
         is_not_exists: bool,
     ) -> Result<LogicalOperator> {
@@ -278,8 +294,8 @@ impl DependentJoinFlattener {
     fn flatten_any_subquery(
         &mut self,
         binder: &mut Binder,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         comparison_type: ComparisonType,
         mark_index: usize,
         expression_children: &[Expression],
@@ -338,8 +354,8 @@ impl DependentJoinFlattener {
     fn flatten_all_subquery(
         &mut self,
         binder: &mut Binder,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         comparison_type: ComparisonType,
         mark_index: usize,
         expression_children: &[Expression],
@@ -426,15 +442,21 @@ impl DependentJoinFlattener {
         let mut conditions = Vec::new();
 
         for (idx, corr) in self.outer_correlated_columns.iter().enumerate() {
-            let left_expr = Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(corr.table_index, corr.column_index),
-                corr.return_type.clone(),
-            ));
+            let left_expr = Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(corr.table_index, corr.column_index),
+                    corr.return_type.clone(),
+                )
+                .into(),
+            );
 
-            let right_expr = Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(base_binding.table_index, base_binding.column_index + idx),
-                corr.return_type.clone(),
-            ));
+            let right_expr = Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(base_binding.table_index, base_binding.column_index + idx),
+                    corr.return_type.clone(),
+                )
+                .into(),
+            );
 
             conditions.push(JoinCondition::new(
                 left_expr,
@@ -449,9 +471,9 @@ impl DependentJoinFlattener {
     fn compact_mark_subquery_right(
         &self,
         binder: &mut Binder,
-        right: LogicalPlan,
+        right: OwnedLogicalPlan,
         payload_positions: &[usize],
-    ) -> Result<(LogicalPlan, ColumnBinding)> {
+    ) -> Result<(OwnedLogicalPlan, ColumnBinding)> {
         let base_binding = self.correlated_base_binding.ok_or_else(|| {
             paro_error::internal(
                 "PushDownDependentJoin must establish a base binding before mark-subquery compaction",
@@ -519,7 +541,7 @@ impl DependentJoinFlattener {
     fn attach_delim_cross_product(
         &mut self,
         binder: &mut Binder,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
     ) -> PushDownResult {
         let original_visible_count = plan.get_column_bindings().len();
         let (delim_get, base_binding) = self.make_delim_get();
@@ -537,10 +559,16 @@ impl DependentJoinFlattener {
             .iter()
             .enumerate()
             .map(|(idx, corr)| {
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(base_binding.table_index, base_binding.column_index + idx),
-                    corr.return_type.clone(),
-                ))
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(
+                            base_binding.table_index,
+                            base_binding.column_index + idx,
+                        ),
+                        corr.return_type.clone(),
+                    )
+                    .into(),
+                )
             })
             .collect()
     }
@@ -549,10 +577,13 @@ impl DependentJoinFlattener {
         self.outer_correlated_columns
             .iter()
             .map(|corr| {
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(corr.table_index, corr.column_index),
-                    corr.return_type.clone(),
-                ))
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(corr.table_index, corr.column_index),
+                        corr.return_type.clone(),
+                    )
+                    .into(),
+                )
             })
             .collect()
     }
@@ -589,7 +620,7 @@ impl DependentJoinFlattener {
 
     fn apply_projection_map_to_visible_columns(
         visible_columns: &[usize],
-        projection_map: &crate::operator::ProjectionMap,
+        projection_map: &crate::logical::operator::ProjectionMap,
     ) -> Vec<usize> {
         let Some(indices) = projection_map.as_columns() else {
             return visible_columns.to_vec();
@@ -609,9 +640,9 @@ impl DependentJoinFlattener {
     /// join above it.
     fn carry_correlation_keys(
         &self,
-        child: &LogicalPlan,
+        child: &OwnedLogicalPlan,
         base_binding: ColumnBinding,
-        projection_map: &mut crate::operator::ProjectionMap,
+        projection_map: &mut crate::logical::operator::ProjectionMap,
     ) -> Result<()> {
         for index in self.correlation_key_positions(child, base_binding)? {
             projection_map.include(index);
@@ -627,7 +658,7 @@ impl DependentJoinFlattener {
 
     fn correlation_key_positions(
         &self,
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         base_binding: ColumnBinding,
     ) -> Result<Vec<usize>> {
         let bindings = plan.get_column_bindings();
@@ -651,10 +682,10 @@ impl DependentJoinFlattener {
         &self,
         binder: &mut Binder,
         table_index: usize,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
         indices: &[usize],
         output_names: Vec<String>,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<OwnedLogicalPlan> {
         let child_bindings = child.get_column_bindings();
         let child_types = child.types();
 
@@ -675,10 +706,9 @@ impl DependentJoinFlattener {
                         child_types.len()
                     ))
                 })?;
-                Ok(Expression::ColumnRef(ColumnRefExpression::new(
-                    binding,
-                    logical_type,
-                )))
+                Ok(Expression::ColumnRef(
+                    ColumnRefExpression::new(binding, logical_type).into(),
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -728,8 +758,8 @@ impl DependentJoinFlattener {
     fn leaf_pushdown_result(
         &mut self,
         binder: &mut Binder,
-        id: crate::plan::PlanNodeId,
-        stats: crate::plan::NodeStats,
+        id: crate::logical::plan::PlanNodeId,
+        stats: crate::logical::plan::NodeStats,
         operator: LogicalOperator,
         lateral_depth: usize,
     ) -> Result<PushDownResult> {
@@ -746,7 +776,7 @@ impl DependentJoinFlattener {
 
         Ok(self.attach_delim_cross_product(
             binder,
-            LogicalPlan {
+            OwnedLogicalPlan {
                 id,
                 stats,
                 operator,
@@ -785,7 +815,7 @@ impl DependentJoinFlattener {
     fn build_partitioned_limit(
         &mut self,
         binder: &mut Binder,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
         base_binding: ColumnBinding,
         visible_columns: Vec<usize>,
         orders: Vec<OrderByNode>,
@@ -816,39 +846,52 @@ impl DependentJoinFlattener {
         let window_plan = binder.wrap_plan(window);
         let row_number_binding = ColumnBinding::new(window_index, 0);
         let row_number_ref = || {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                row_number_binding,
-                LogicalType::BigInt,
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(row_number_binding, LogicalType::BigInt).into(),
+            )
         };
 
         let mut filters = Vec::new();
         if let Some(limit) = limit {
             let upper_bound = offset.saturating_add(limit);
-            filters.push(Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::LessThanOrEqual,
-                row_number_ref(),
-                Expression::Constant(ConstantExpression {
-                    value: Value::BigInt(upper_bound as i64),
-                    return_type: LogicalType::BigInt,
-                }),
-            )));
+            filters.push(Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::LessThanOrEqual,
+                    row_number_ref(),
+                    Expression::Constant(
+                        ConstantExpression {
+                            value: Value::BigInt(upper_bound as i64),
+                            return_type: LogicalType::BigInt,
+                        }
+                        .into(),
+                    ),
+                )
+                .into(),
+            ));
         }
         if offset > 0 {
-            filters.push(Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::GreaterThan,
-                row_number_ref(),
-                Expression::Constant(ConstantExpression {
-                    value: Value::BigInt(offset as i64),
-                    return_type: LogicalType::BigInt,
-                }),
-            )));
+            filters.push(Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::GreaterThan,
+                    row_number_ref(),
+                    Expression::Constant(
+                        ConstantExpression {
+                            value: Value::BigInt(offset as i64),
+                            return_type: LogicalType::BigInt,
+                        }
+                        .into(),
+                    ),
+                )
+                .into(),
+            ));
         }
 
         let predicate = if filters.len() == 1 {
             filters.pop().expect("single filter")
         } else {
-            Expression::Conjunction(ConjunctionExpression::new(ConjunctionType::And, filters))
+            Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::And, filters).into(),
+            )
         };
         let mut filter = Filter::new(window_plan, vec![predicate]);
         filter.projection_map = Self::all_columns_visible(child_column_count).into();
@@ -863,7 +906,7 @@ impl DependentJoinFlattener {
     fn push_down_dependent_join(
         &mut self,
         binder: &mut Binder,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         lateral_depth: usize,
     ) -> Result<PushDownResult> {
         self.push_down_dependent_join_internal(binder, plan, lateral_depth)
@@ -871,14 +914,10 @@ impl DependentJoinFlattener {
     fn push_down_dependent_join_internal(
         &mut self,
         binder: &mut Binder,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         lateral_depth: usize,
     ) -> Result<PushDownResult> {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         let correlated_map = build_correlated_column_map(&self.correlated_columns);
 
         match operator {
@@ -906,7 +945,7 @@ impl DependentJoinFlattener {
                 self.carry_correlation_keys(&child, base_binding, &mut filter.projection_map)?;
                 filter.child = Box::new(child);
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::Filter(filter),
@@ -926,7 +965,7 @@ impl DependentJoinFlattener {
                     correlated_map.clone(),
                     lateral_depth,
                 );
-                let original_projection_count = proj.expressions.len();
+                let original_visible_count = proj.visible_count;
                 proj.expressions = proj
                     .expressions
                     .into_iter()
@@ -944,13 +983,13 @@ impl DependentJoinFlattener {
                 proj.visible_names.extend(self.internal_output_names());
                 proj.child = Box::new(child);
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::Projection(proj),
                     },
                     base_binding: ColumnBinding::new(projection_index, delim_offset),
-                    visible_columns: Self::all_columns_visible(original_projection_count),
+                    visible_columns: Self::all_columns_visible(original_visible_count),
                 })
             }
             LogicalOperator::RowFetch(mut fetch) => {
@@ -969,7 +1008,7 @@ impl DependentJoinFlattener {
                 }
                 fetch.child = Box::new(child);
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::RowFetch(fetch),
@@ -1000,7 +1039,7 @@ impl DependentJoinFlattener {
                     .collect();
                 project.child = Box::new(child);
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::ExternalProject(project),
@@ -1034,7 +1073,7 @@ impl DependentJoinFlattener {
                         table.returned_types.push(return_type);
                     }
                     Ok(PushDownResult {
-                        plan: LogicalPlan {
+                        plan: OwnedLogicalPlan {
                             id,
                             stats,
                             operator: LogicalOperator::ExternalTable(table),
@@ -1044,7 +1083,7 @@ impl DependentJoinFlattener {
                     })
                 } else {
                     Ok(PushDownResult {
-                        plan: LogicalPlan {
+                        plan: OwnedLogicalPlan {
                             id,
                             stats,
                             operator: LogicalOperator::ExternalTable(table),
@@ -1099,7 +1138,7 @@ impl DependentJoinFlattener {
                             + original_grouping_function_count,
                 );
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::Aggregate(agg),
@@ -1127,7 +1166,7 @@ impl DependentJoinFlattener {
                 self.carry_correlation_keys(&child, base_binding, &mut order.projection_map)?;
                 order.child = Box::new(child);
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::Order(order),
@@ -1169,7 +1208,8 @@ impl DependentJoinFlattener {
                         .unwrap_or(0);
 
                 let lim_child = *limit.child;
-                let (child, base_binding, visible_columns, orders) = match lim_child.operator {
+                let (lim_child_id, lim_child_stats, lim_child_operator) = lim_child.into_parts();
+                let (child, base_binding, visible_columns, orders) = match lim_child_operator {
                     LogicalOperator::Order(order) => {
                         let PushDownResult {
                             plan: child,
@@ -1188,14 +1228,18 @@ impl DependentJoinFlattener {
                         );
                         (child, base_binding, visible_columns, orders)
                     }
-                    _ => {
+                    operator => {
                         let PushDownResult {
                             plan: child,
                             base_binding,
                             visible_columns,
                         } = self.push_down_dependent_join_internal(
                             binder,
-                            lim_child,
+                            OwnedLogicalPlan {
+                                id: lim_child_id,
+                                stats: lim_child_stats,
+                                operator,
+                            },
                             lateral_depth,
                         )?;
                         (child, base_binding, visible_columns, vec![])
@@ -1247,7 +1291,7 @@ impl DependentJoinFlattener {
                 }
                 distinct.child = Box::new(child);
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::Distinct(distinct),
@@ -1279,7 +1323,7 @@ impl DependentJoinFlattener {
                     .extend(child_output_len..child_output_len + window.expressions.len());
                 window.child = Box::new(child);
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::Window(window),
@@ -1313,7 +1357,7 @@ impl DependentJoinFlattener {
                 setop.column_count = output_types.len();
                 setop.types = output_types;
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::SetOperation(setop),
@@ -1349,7 +1393,7 @@ impl DependentJoinFlattener {
                         cross.left.types().len(),
                     ));
                     return Ok(PushDownResult {
-                        plan: LogicalPlan {
+                        plan: OwnedLogicalPlan {
                             id,
                             stats,
                             operator: LogicalOperator::Join(Join::Cross(cross)),
@@ -1377,7 +1421,7 @@ impl DependentJoinFlattener {
                         left_output_len,
                     ));
                     return Ok(PushDownResult {
-                        plan: LogicalPlan {
+                        plan: OwnedLogicalPlan {
                             id,
                             stats,
                             operator: LogicalOperator::Join(Join::Cross(cross)),
@@ -1406,7 +1450,7 @@ impl DependentJoinFlattener {
                     left_output_len,
                 ));
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::Join(Join::Cross(cross)),
@@ -1458,7 +1502,7 @@ impl DependentJoinFlattener {
                         join.left.types().len(),
                     ));
                     return Ok(PushDownResult {
-                        plan: LogicalPlan {
+                        plan: OwnedLogicalPlan {
                             id,
                             stats,
                             operator: LogicalOperator::Join(Join::Comparison(join)),
@@ -1483,7 +1527,7 @@ impl DependentJoinFlattener {
                         left_output_len,
                     ));
                     return Ok(PushDownResult {
-                        plan: LogicalPlan {
+                        plan: OwnedLogicalPlan {
                             id,
                             stats,
                             operator: LogicalOperator::Join(Join::Comparison(join)),
@@ -1512,7 +1556,7 @@ impl DependentJoinFlattener {
                     left_output_len,
                 ));
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::Join(Join::Comparison(join)),
@@ -1557,7 +1601,7 @@ impl DependentJoinFlattener {
                         join.left.types().len(),
                     ));
                     return Ok(PushDownResult {
-                        plan: LogicalPlan {
+                        plan: OwnedLogicalPlan {
                             id,
                             stats,
                             operator: LogicalOperator::Join(Join::Any(join)),
@@ -1582,7 +1626,7 @@ impl DependentJoinFlattener {
                         left_output_len,
                     ));
                     return Ok(PushDownResult {
-                        plan: LogicalPlan {
+                        plan: OwnedLogicalPlan {
                             id,
                             stats,
                             operator: LogicalOperator::Join(Join::Any(join)),
@@ -1611,7 +1655,7 @@ impl DependentJoinFlattener {
                     left_output_len,
                 ));
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::Join(Join::Any(join)),
@@ -1640,7 +1684,7 @@ impl DependentJoinFlattener {
                 } = self.push_down_dependent_join_internal(binder, *empty.child, lateral_depth)?;
                 empty.child = Box::new(child);
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::EmptyResult(empty),
@@ -1657,7 +1701,7 @@ impl DependentJoinFlattener {
                 } = self.push_down_dependent_join_internal(binder, *expand.child, lateral_depth)?;
                 expand.child = Box::new(child);
                 Ok(PushDownResult {
-                    plan: LogicalPlan {
+                    plan: OwnedLogicalPlan {
                         id,
                         stats,
                         operator: LogicalOperator::GraphExpand(expand),
@@ -1667,6 +1711,7 @@ impl DependentJoinFlattener {
                 })
             }
             other @ (LogicalOperator::Alter(_)
+            | LogicalOperator::SubplanRef(_)
             | LogicalOperator::CreateTable(_)
             | LogicalOperator::CreateRoutine(_)
             | LogicalOperator::CreateSequence(_)
@@ -1693,7 +1738,7 @@ impl DependentJoinFlattener {
 
     fn create_any_join_conditions(
         &self,
-        right: &LogicalPlan,
+        right: &OwnedLogicalPlan,
         comparison_type: ComparisonType,
         expression_children: &[Expression],
         child_types: &[LogicalType],
@@ -1721,10 +1766,10 @@ impl DependentJoinFlattener {
 
         let mut conditions = Vec::with_capacity(expression_children.len());
         for child_idx in 0..expression_children.len() {
-            let right_expr = Expression::ColumnRef(ColumnRefExpression::new(
-                right_bindings[child_idx],
-                child_types[child_idx].clone(),
-            ));
+            let right_expr = Expression::ColumnRef(
+                ColumnRefExpression::new(right_bindings[child_idx], child_types[child_idx].clone())
+                    .into(),
+            );
             let right_expr = CastExpression::add_cast_if_needed(
                 right_expr,
                 child_targets[child_idx].clone(),

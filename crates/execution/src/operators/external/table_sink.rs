@@ -7,7 +7,9 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 
 use crate::operators::external::batching::SubmissionBatchPolicy;
-use crate::operators::external::runtime_bridge::{RuntimeBridgeOutcome, TableSubmission};
+use crate::operators::external::runtime_bridge::{
+    ExternalRuntimeBridge, RuntimeBridgeOutcome, TableSubmission,
+};
 use crate::operators::external::table_state::TableOutputBatch;
 use crate::physical::specs::ExternalTableSpec;
 use crate::runtime::breaker::{ExternalTableHandle, HandleRef};
@@ -24,6 +26,7 @@ use crate::runtime::state::{
 pub struct ExternalTableSinkExec {
     pub handle: HandleRef<ExternalTableHandle>,
     pub spec: ExternalTableSpec,
+    pub bridge: Arc<ExternalRuntimeBridge>,
 }
 
 impl ExternalTableSinkExec {
@@ -69,7 +72,6 @@ impl ExternalTableSinkExec {
         };
         local.next_batch_id = local.next_batch_id.saturating_add(1);
         let outcome = self
-            .spec
             .bridge
             .execute_table(ctx.query, &submission, &ctx.memory)?;
         let (response, blocked) = match outcome {

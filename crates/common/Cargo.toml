@@ -9,11 +9,17 @@ ignored = ["humantime-serde"]
 [features]
 default = []
 debug-allocation = []
+## Install-time allocation accounting is intentionally opt-in.  The planner
+## can still use the scoped API in every build; without this feature the API is
+## a zero-cost no-op and production binaries remain free to select jemalloc or
+## another allocator.
+alloc-metrics = []
 test-support = []
 
 [dependencies]
 thiserror = { workspace = true }
 bytes = { workspace = true }
+libc = "0.2"
 
 # Configuration system
 serde = { workspace = true }

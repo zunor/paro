@@ -34,6 +34,17 @@ ORDER BY ts_rank(
 ) DESC
 LIMIT 2;
 
+-- Execute the ranked provider as well as inspecting its plan. The unique
+-- highest rank avoids relying on an unspecified choice within a peer group.
+SELECT id
+FROM ft_exec_mode_split
+WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')
+ORDER BY ts_rank(
+    to_tsvector('simple', content),
+    plainto_tsquery('simple', 'vector database')
+) DESC
+LIMIT 1;
+
 SELECT id
 FROM ft_exec_mode_split
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database')

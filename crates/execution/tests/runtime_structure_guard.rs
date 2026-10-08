@@ -14,7 +14,6 @@ fn hot_path_files_stay_split_and_role_files_stay_thin() {
         "src/runtime/state.rs",
         "src/runtime/task_executor",
         "src/pipeline/lowerer",
-        "src/physical/generator",
     ];
 
     for root in checked_roots {
@@ -42,9 +41,10 @@ fn hot_path_files_stay_split_and_role_files_stay_thin() {
         !manifest.join("src/pipeline/lowerer.rs").exists(),
         "pipeline lowerer must remain split under pipeline/lowerer/"
     );
+    let physical = read(&manifest, "src/physical/mod.rs");
     assert!(
-        !manifest.join("src/physical/generator.rs").exists(),
-        "physical generator must remain split under physical/generator/"
+        physical.contains("pub use paro_planner::physical::*") && physical.lines().count() <= 12,
+        "execution must keep physical-plan ownership in the optimizer facade"
     );
 }
 

@@ -12,6 +12,7 @@ pub mod external_table;
 pub mod join;
 pub mod materialized;
 pub mod partition_aggregate_window;
+pub(crate) mod radix;
 pub mod recursive;
 pub mod registry;
 pub mod set_operation;

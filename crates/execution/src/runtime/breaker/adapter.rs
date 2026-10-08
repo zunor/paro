@@ -8,8 +8,16 @@ use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
+use paro_common::types::LogicalType;
+use paro_storage::buffer::{MemoryTag, DEFAULT_BLOCK_SIZE};
+use paro_storage::row::{RowFormat, RowSpillWriter, RowStoreSpillWriter};
 
 use super::{FoundBits, HandleRef, MaterializedHandle, MaterializedReader};
+use crate::operators::sort::build::query_has_temporary_directory;
+use crate::physical::specs::SpillExecutionPolicy;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
 use crate::runtime::source::SourcePoll;
@@ -41,6 +49,18 @@ impl MaterializedSourceGlobal {
     /// producer handle and remains valid for this execution attempt.
     pub(crate) fn sealed_chunks(&self) -> Result<&Arc<[Chunk]>> {
         self.reader.sealed_chunks()
+    }
+
+    /// Bound useful workers by output vectors while retaining every immutable
+    /// chunk as independently claimable work.
+    pub(crate) fn parallel_work_count(&self) -> Result<usize> {
+        let chunks = self.sealed_chunks()?;
+        let rows = chunks
+            .iter()
+            .fold(0usize, |rows, chunk| rows.saturating_add(chunk.size()));
+        Ok(chunks
+            .len()
+            .min(rows.div_ceil(paro_common::vector::VECTOR_SIZE).max(1)))
     }
 
     #[inline]
@@ -117,6 +137,7 @@ impl MaterializedSourceExec {
 #[derive(Debug, Clone)]
 pub struct MaterializeSinkExec {
     pub handle: HandleRef<MaterializedHandle>,
+    pub spill_policy: SpillExecutionPolicy,
 }
 
 #[derive(Debug)]
@@ -124,13 +145,56 @@ pub struct MaterializeSinkGlobal {
     pub handle: Arc<MaterializedHandle>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MaterializeSinkLocal {
     pub chunks: Vec<Chunk>,
+    external: Option<RowStoreSpillWriter<MaterializedRowFormat>>,
+}
+
+#[derive(Debug, Clone)]
+struct MaterializedRowFormat {
+    logical_types: Box<[LogicalType]>,
+}
+
+impl RowFormat for MaterializedRowFormat {
+    fn name(&self) -> &'static str {
+        "materialized_rows"
+    }
+
+    fn logical_types(&self) -> &[LogicalType] {
+        &self.logical_types
+    }
 }
 
 impl MaterializeSinkExec {
+    fn spill_writer(
+        ctx: &crate::runtime::context::QueryRuntimeContext,
+        global: &MaterializeSinkGlobal,
+    ) -> RowStoreSpillWriter<MaterializedRowFormat> {
+        let owner: Arc<dyn MemoryOwner> = ctx.memory.clone();
+        RowStoreSpillWriter::new(
+            ctx.session.buffer_pool().clone(),
+            MaterializedRowFormat {
+                logical_types: global.handle.metadata().row_type.types.clone(),
+            },
+            MemoryTag::HashTable,
+            MemoryAccountingContext::from_owner(
+                owner,
+                MemoryDomain::Host,
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Spill,
+            ),
+        )
+    }
+
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
+        if self.spill_policy == SpillExecutionPolicy::ForcedExternal
+            && !query_has_temporary_directory(ctx.query)
+        {
+            return Err(paro_error::out_of_memory(
+                "forced external materialization requires a temporary directory",
+            ));
+        }
         Ok(SinkGlobal::Materialize(Arc::new(MaterializeSinkGlobal {
             handle: ctx.handles.get(self.handle)?,
         })))
@@ -138,16 +202,27 @@ impl MaterializeSinkExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
-        _global: &SinkGlobal,
+        ctx: &mut PipelineInitContext,
+        global: &SinkGlobal,
     ) -> Result<SinkLocal> {
-        Ok(SinkLocal::Materialize(MaterializeSinkLocal::default()))
+        let SinkGlobal::Materialize(global) = global else {
+            return Err(paro_error::internal(
+                "materialize sink global state mismatch",
+            ));
+        };
+        let external = (self.spill_policy == SpillExecutionPolicy::ForcedExternal
+            && query_has_temporary_directory(ctx.query))
+        .then(|| Self::spill_writer(ctx.query, global));
+        Ok(SinkLocal::Materialize(MaterializeSinkLocal {
+            chunks: Vec::new(),
+            external,
+        }))
     }
 
     pub(crate) fn consume(
         &self,
         ctx: &mut OperatorCallContext,
-        _global: &SinkGlobal,
+        global: &SinkGlobal,
         local: &mut SinkLocal,
         input: &mut Chunk,
     ) -> Result<SinkPoll> {
@@ -160,7 +235,27 @@ impl MaterializeSinkExec {
                 "materialize sink local state mismatch",
             ));
         };
-        local.chunks.push(input.handoff_referencing_vectors());
+        let SinkGlobal::Materialize(global) = global else {
+            return Err(paro_error::internal(
+                "materialize sink global state mismatch",
+            ));
+        };
+        if local.external.is_none()
+            && self.spill_policy == SpillExecutionPolicy::Adaptive
+            && query_has_temporary_directory(ctx.query)
+            && ctx.query.memory.available_bytes() <= DEFAULT_BLOCK_SIZE.saturating_mul(2)
+        {
+            let mut external = Self::spill_writer(ctx.query, global);
+            for chunk in local.chunks.drain(..) {
+                external.append_chunk(&chunk)?;
+            }
+            local.external = Some(external);
+        }
+        if let Some(external) = &mut local.external {
+            external.append_chunk(input)?;
+        } else {
+            local.chunks.push(input.handoff_referencing_vectors());
+        }
         Ok(SinkPoll::NeedMoreInput)
     }
 
@@ -180,7 +275,11 @@ impl MaterializeSinkExec {
                 "materialize sink local state mismatch",
             ));
         };
-        global.handle.append_chunks(&mut local.chunks)?;
+        if let Some(external) = local.external.take() {
+            global.handle.append_row_store(external.finish()?)?;
+        } else {
+            global.handle.append_chunks(&mut local.chunks)?;
+        }
         Ok(MergePoll::Done)
     }
 
@@ -264,6 +363,8 @@ mod tests {
         assert_eq!(second.next_chunk_index(), 0);
         assert_eq!(first.sealed_chunks().unwrap().len(), 2);
         assert_eq!(second.sealed_chunks().unwrap().len(), 2);
+        assert_eq!(first.parallel_work_count().unwrap(), 1);
+        assert_eq!(second.parallel_work_count().unwrap(), 1);
     }
 
     #[test]

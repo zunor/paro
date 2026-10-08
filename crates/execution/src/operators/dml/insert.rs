@@ -8,7 +8,7 @@ use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_function::scalar::FunctionExecContext;
-use paro_planner::operator::InsertOnConflictAction;
+use paro_planner::logical::operator::InsertOnConflictAction;
 use paro_storage::table::table_handle::InsertOnConflictAction as StorageInsertOnConflictAction;
 
 use crate::physical::specs::InsertSpec;

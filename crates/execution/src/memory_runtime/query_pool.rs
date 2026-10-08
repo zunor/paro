@@ -16,8 +16,8 @@ use paro_common::memory::{
 use paro_context::{QueryMemoryRegistration, QueryMemoryTarget};
 
 use super::{
-    GrowOutcome, MemoryDomainTagBytes, MemoryRuntimeStats, MemoryTagBytes,
-    PipelineAdmissionController, ReclaimHandle, ReclaimStats, Reclaimer, SpillCost,
+    ExecutionLease, GrowOutcome, MemoryDomainTagBytes, MemoryRuntimeStats, MemoryTagBytes,
+    QueryTaskPermitPool, ReclaimHandle, ReclaimStats, Reclaimer, SpillCost,
 };
 
 const DEFAULT_UNBOUNDED_QUERY_CAPACITY: usize = usize::MAX / 4;
@@ -44,6 +44,7 @@ impl Drop for CapacityWriteGuard<'_> {
 /// Per-query memory pool. Capacity checks use issued bytes, not observed usage.
 pub struct QueryMemoryPool {
     capacity_bytes: AtomicUsize,
+    execution_ceiling_bytes: AtomicUsize,
     capacity_gate: AtomicUsize,
     issued_bytes: AtomicUsize,
     non_revocable_bytes: AtomicUsize,
@@ -63,14 +64,16 @@ pub struct QueryMemoryPool {
     output_buffer_bytes: AtomicUsize,
     peer_reclaim_in_progress: AtomicBool,
     reclaimers: Mutex<Vec<Arc<dyn Reclaimer>>>,
-    admission: Arc<PipelineAdmissionController>,
+    task_permits: Arc<QueryTaskPermitPool>,
     registration: Mutex<Option<QueryMemoryRegistration>>,
+    execution_lease: Mutex<Option<ExecutionLease>>,
 }
 
 impl QueryMemoryPool {
     pub fn new(capacity_bytes: usize) -> Self {
         Self {
             capacity_bytes: AtomicUsize::new(capacity_bytes),
+            execution_ceiling_bytes: AtomicUsize::new(capacity_bytes),
             capacity_gate: AtomicUsize::new(0),
             issued_bytes: AtomicUsize::new(0),
             non_revocable_bytes: AtomicUsize::new(0),
@@ -90,8 +93,9 @@ impl QueryMemoryPool {
             output_buffer_bytes: AtomicUsize::new(0),
             peer_reclaim_in_progress: AtomicBool::new(false),
             reclaimers: Mutex::new(Vec::new()),
-            admission: Arc::new(PipelineAdmissionController::for_current_parallelism()),
+            task_permits: Arc::new(QueryTaskPermitPool::for_current_parallelism()),
             registration: Mutex::new(None),
+            execution_lease: Mutex::new(None),
         }
     }
 
@@ -103,9 +107,19 @@ impl QueryMemoryPool {
         self.capacity_bytes.load(Ordering::Relaxed)
     }
 
+    pub fn execution_ceiling_bytes(&self) -> usize {
+        self.execution_ceiling_bytes.load(Ordering::Acquire)
+    }
+
     pub fn set_capacity_bytes(&self, capacity_bytes: usize) {
         let _guard = self.capacity_write_guard();
-        self.capacity_bytes.store(capacity_bytes, Ordering::Release);
+        // Capacity is an admission ceiling, not a revocation mechanism.
+        // Published grants remain owned until a reclaimer releases them, so a
+        // coordinator must never manufacture headroom by assigning a ceiling
+        // below the bytes already issued by this pool.
+        let issued = self.issued_bytes.load(Ordering::Acquire);
+        self.capacity_bytes
+            .store(capacity_bytes.max(issued), Ordering::Release);
     }
 
     fn relinquish_unused_capacity(&self, target_bytes: usize) -> usize {
@@ -198,7 +212,62 @@ impl QueryMemoryPool {
             .map(QueryMemoryRegistration::query_id)
     }
 
+    /// Reserve the execution contract's non-negotiable capacity floor for
+    /// this pool's registration lifetime.
+    pub fn try_reserve_minimum_capacity(&self, minimum_bytes: usize) -> MemoryResult<bool> {
+        let Some(registration) = self.registration() else {
+            return Ok(minimum_bytes <= self.capacity_bytes());
+        };
+        registration.try_reserve_minimum_capacity(minimum_bytes)
+    }
+
+    /// Publish the already-acquired multi-resource execution lease before any
+    /// runtime state can allocate or schedule work.
+    pub fn install_execution_lease(&self, lease: ExecutionLease) -> paro_common::error::Result<()> {
+        let resources = lease.resources();
+        let working_set = usize::try_from(resources.working_set_memory_bytes)
+            .map_err(|_| paro_common::error::internal("execution working set exceeds usize"))?;
+        let ceiling = usize::try_from(resources.memory_ceiling_bytes)
+            .map_err(|_| paro_common::error::internal("execution memory ceiling exceeds usize"))?;
+        if self.capacity_bytes() < working_set || self.issued_bytes() > ceiling {
+            return Err(paro_common::error::internal(
+                "execution lease memory was not reserved before publication",
+            ));
+        }
+        let mut slot = self
+            .execution_lease
+            .lock()
+            .expect("execution lease lock poisoned");
+        if slot.is_some() {
+            return Err(paro_common::error::internal(
+                "query memory pool already owns an execution lease",
+            ));
+        }
+        self.execution_ceiling_bytes
+            .store(ceiling, Ordering::Release);
+        self.task_permits
+            .set_max_permits(usize::from(resources.max_parallel_tasks));
+        *slot = Some(lease);
+        Ok(())
+    }
+
+    pub fn external_dispatch_gate(
+        &self,
+    ) -> Option<paro_external::runtime::host::ExternalDispatchGate> {
+        self.execution_lease
+            .lock()
+            .expect("execution lease lock poisoned")
+            .as_ref()
+            .and_then(ExecutionLease::external_dispatch_gate)
+    }
+
     pub fn detach_registration(&self) {
+        // Admission leases have the same lifetime as the query registration,
+        // not the lifetime of incidental Arc holders retained by operators.
+        self.execution_lease
+            .lock()
+            .expect("execution lease lock poisoned")
+            .take();
         if let Some(registration) = self
             .registration
             .lock()
@@ -343,11 +412,12 @@ impl QueryMemoryPool {
 
     pub fn available_bytes(&self) -> usize {
         self.capacity_bytes()
+            .min(self.execution_ceiling_bytes())
             .saturating_sub(self.issued_bytes.load(Ordering::Relaxed))
     }
 
-    pub fn admission_controller(&self) -> Arc<PipelineAdmissionController> {
-        self.admission.clone()
+    pub fn task_permits(&self) -> Arc<QueryTaskPermitPool> {
+        self.task_permits.clone()
     }
 
     pub fn register_reclaimer(&self, reclaimer: Arc<dyn Reclaimer>) {
@@ -413,9 +483,9 @@ impl QueryMemoryPool {
                     if self.request_peer_capacity(target)? > 0 {
                         continue;
                     }
-                    return Err(err);
+                    return Err(self.annotate_runtime_cap_exhaustion(err));
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(self.annotate_runtime_cap_exhaustion(err)),
             }
         }
     }
@@ -438,7 +508,7 @@ impl QueryMemoryPool {
                         self.try_grow(bytes)?;
                         return Ok(GrowOutcome::Granted);
                     }
-                    return Err(err);
+                    return Err(self.annotate_runtime_cap_exhaustion(err));
                 };
                 match handle.result() {
                     Some(Ok(stats)) if stats.reclaimed_bytes > 0 => {
@@ -450,7 +520,7 @@ impl QueryMemoryPool {
                             self.try_grow(bytes)?;
                             Ok(GrowOutcome::Granted)
                         } else {
-                            Err(err)
+                            Err(self.annotate_runtime_cap_exhaustion(err))
                         }
                     }
                     Some(Err(reclaim_err)) => Err(reclaim_err),
@@ -458,6 +528,31 @@ impl QueryMemoryPool {
                 }
             }
             Err(err) => Err(err),
+        }
+    }
+
+    fn annotate_runtime_cap_exhaustion(&self, error: MemoryError) -> MemoryError {
+        let uncapped_memory_demand = self
+            .execution_lease
+            .lock()
+            .expect("execution lease lock poisoned")
+            .as_ref()
+            .and_then(|lease| lease.resources().memory_completion.uncapped_memory_demand());
+        match (error, uncapped_memory_demand) {
+            (
+                MemoryError::QuotaExhausted {
+                    domain,
+                    requested,
+                    available,
+                },
+                Some(uncapped_memory_demand),
+            ) => MemoryError::RuntimeCapExhausted {
+                domain,
+                requested,
+                available,
+                uncapped_memory_demand,
+            },
+            (error, _) => error,
         }
     }
 
@@ -553,7 +648,10 @@ impl QueryMemoryPool {
         let _guard = self.capacity_read_guard();
         let mut current = self.issued_bytes.load(Ordering::Relaxed);
         loop {
-            let capacity = self.capacity_bytes();
+            // The coordinator share and the physical operating-point ceiling
+            // are intentionally distinct. The former remains redistributable
+            // process capacity; the latter is the plan's executable bound.
+            let capacity = self.capacity_bytes().min(self.execution_ceiling_bytes());
             let Some(next) = current.checked_add(bytes) else {
                 return Err(MemoryError::quota_exhausted(
                     MemoryDomain::Host,
@@ -817,14 +915,20 @@ impl fmt::Debug for QueryMemoryPool {
             .field("reclaim_attempt_count", &self.reclaim_attempt_count())
             .field("reclaimed_bytes", &self.reclaimed_bytes())
             .field("reclaim_spilled_bytes", &self.reclaim_spilled_bytes())
-            .field("admission_used_slots", &self.admission.used_slots())
-            .field("admission_max_slots", &self.admission.max_slots())
+            .field("task_permits_used", &self.task_permits.used_permits())
+            .field("task_permits_max", &self.task_permits.max_permits())
             .finish()
     }
 }
 
 impl Drop for QueryMemoryPool {
     fn drop(&mut self) {
+        // Release the composite capability before unregistering the memory
+        // floor it describes. This preserves one lifetime boundary even on
+        // error paths where the stream did not call `detach_registration`.
+        if let Ok(mut lease) = self.execution_lease.lock() {
+            lease.take();
+        }
         if let Ok(mut registration) = self.registration.lock() {
             if let Some(registration) = registration.take() {
                 registration

@@ -22,41 +22,40 @@ FROM peers AS p
 JOIN agg AS a ON a.grp = p.grp
 ORDER BY p.id, p.peer_id;
 QUERY PLAN
-MATERIALIZED_CTE
+MATERIALIZED_CTE  (rows=0)
   CTE Name: base
   Materialization: MATERIALIZED
   Reference Count: 3
   ->  VALUES  (rows=5)
-  ->  ORDER_BY
-    Sort Key: p.id ASC NULLS LAST, p.peer_id ASC NULLS LAST
-    ->  PROJECTION
-      Output: p.id, p.peer_id, a.total
-      ->  HASH_JOIN
-        Join Type: INNER
-        Join Condition: p.grp = a.grp
-        ->  PROJECTION
-          Output: id, peer_id, grp
-          ->  FILTER
-            Filter: l.id < r.id
-            ->  HASH_JOIN
-              Join Type: INNER
-              Join Condition: l.grp = r.grp
-              ->  CTE_SCAN
-                CTE Index: 0
-                Table Index: 16
-              ->  CTE_SCAN
-                CTE Index: 0
-                Table Index: 17
-        ->  PROJECTION
-          Output: grp, total
-          ->  AGGREGATE
-            Group Key: base.grp
-            Aggregates: sum(base.amount)
-            ->  CTE_SCAN
-              CTE Index: 0
-              Table Index: 25
+  ->  ORDER_BY  (rows=0)
+        Sort Key: p.id ASC NULLS LAST, p.peer_id ASC NULLS LAST
+        ->  PROJECTION  (rows=0)
+              Output: p.id, p.peer_id, a.total
+              ->  HASH_JOIN  (rows=0)
+                    Join Type: INNER
+                    Join Condition: a.grp = p.grp
+                    ->  PROJECTION  (rows=3)
+                          Output: grp, total
+                          ->  AGGREGATE  (rows=3)
+                                Group Key: base.grp
+                                Aggregates: sum(base.amount)
+                                ->  CTE_SCAN  (rows=5)
+                                      CTE Index: 0
+                                      Table Index: 25
+                    ->  PROJECTION  (rows=1)
+                          Output: id, peer_id, grp
+                          ->  HASH_JOIN  (rows=1)
+                                Join Type: INNER
+                                Join Condition: l.grp = r.grp
+                                Join Condition: l.id < r.id
+                                ->  CTE_SCAN  (rows=5)
+                                      CTE Index: 0
+                                      Table Index: 16
+                                ->  CTE_SCAN  (rows=5)
+                                      CTE Index: 0
+                                      Table Index: 17
 
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE
 WITH base(id, grp, amount) AS MATERIALIZED (
     VALUES
@@ -82,34 +81,37 @@ JOIN agg AS a ON a.grp = p.grp
 ORDER BY p.id, p.peer_id;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 VALUES (actual time=<time-range> rows=5 loops=<loops>)
+  SOURCE #0 VALUES (actual time=<time-range> rows=5 loops=<loops>) logical_node_id=1
   SINK #1 CTE_MATERIALIZE (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 1
-  SOURCE #2 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
-  SINK #3 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=5 loops=<loops>)
+  SOURCE #2 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>) logical_node_id=2
+  SINK #3 HASH_JOIN_BUILD (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 2
-  SOURCE #4 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=3 loops=<loops>)
-  TRANSFORM #5 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
-  SINK #6 HASH_JOIN_BUILD (actual time=<time-range> rows=3 loops=<loops> runtime_filter_installed_count=1)
+  SOURCE #4 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  TRANSFORM #5 HASH_JOIN_PROBE (actual time=<time-range> rows=2 loops=<loops>)
+  TRANSFORM #6 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #7 HASH_JOIN_BUILD (actual time=<time-range> rows=2 loops=<loops>)
 PIPELINE 3
-  SOURCE #7 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
-  SINK #8 HASH_JOIN_BUILD (actual time=<time-range> rows=5 loops=<loops> runtime_filter_installed_count=1)
+  SOURCE #8 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
+  TRANSFORM #9 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
+  SINK #10 HASH_JOIN_BUILD (actual time=<time-range> rows=0 loops=<loops>)
 PIPELINE 4
-  SOURCE #9 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
-  TRANSFORM #10 HASH_JOIN_PROBE (actual time=<time-range> rows=9 loops=<loops>)
-  TRANSFORM #11 FILTER (actual time=<time-range> rows=2 loops=<loops>)
-  TRANSFORM #12 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
-  TRANSFORM #13 HASH_JOIN_PROBE (actual time=<time-range> rows=2 loops=<loops>)
-  TRANSFORM #14 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
-  SINK #15 SORT_BUILD (actual time=<time-range> rows=2 loops=<loops> peak_memory_bytes=262148)
+  SOURCE #11 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>) logical_node_id=3
+  SINK #12 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 5
-  SOURCE #16 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
-  TRANSFORM #17 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
-  SINK #18 SORT_BUILD (actual time=<time-range> rows=0 loops=<loops>)
+  SOURCE #13 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #14 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #15 HASH_JOIN_PROBE (actual time=<time-range> rows=2 loops=<loops>)
+  TRANSFORM #16 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #17 SORT_BUILD (actual time=<time-range> rows=2 loops=<loops> peak_memory_bytes=262148)
 PIPELINE 6
-  SOURCE #19 SORT_EMIT (actual time=<time-range> rows=2 loops=<loops>)
-  SINK #20 CLIENT_RESULT (actual time=<time-range> rows=2 loops=<loops>)
-PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=2 runtime_filter_no_wait=0
+  SOURCE #18 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
+  TRANSFORM #19 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
+  SINK #20 SORT_BUILD (actual time=<time-range> rows=0 loops=<loops>)
+PIPELINE 7
+  SOURCE #21 SORT_EMIT (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #22 CLIENT_RESULT (actual time=<time-range> rows=2 loops=<loops>)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 2
@@ -140,7 +142,7 @@ p.id	p.peer_id	a.total
 1	2	30
 3	4	45
 
--- @normalize explain_operator_timing,explain_summary_timing
+-- @normalize explain_operator_timing,explain_summary_timing,explain_logical_ids
 EXPLAIN ANALYZE
 WITH RECURSIVE
 edges(src, dst) AS (
@@ -157,12 +159,12 @@ walk(node, depth) AS (
 SELECT node, depth FROM walk ORDER BY depth, node;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 VALUES (actual time=<time-range> rows=1 loops=<loops>)
+  SOURCE #0 VALUES (actual time=<time-range> rows=1 loops=<loops>) logical_node_id=1
   SINK #1 RECURSIVE_TABLE_APPEND (actual time=<time-range> rows=1 loops=<loops>)
 PIPELINE 1
-  SOURCE #2 VALUES (actual time=<time-range> rows=5 loops=<loops>)
-  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=5 loops=<loops>)
-  SINK #4 HASH_JOIN_BUILD (actual time=<time-range> rows=5 loops=<loops> runtime_filter_installed_count=1)
+  SOURCE #2 VALUES (actual time=<time-range> rows=5 loops=<loops>) logical_node_id=2
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=5 loops=<loops>) logical_node_id=3
+  SINK #4 HASH_JOIN_BUILD (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 2
   SOURCE #5 RECURSIVE_TABLE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
   TRANSFORM #6 FILTER (actual time=<time-range> rows=3 loops=<loops>)
@@ -184,7 +186,7 @@ CONTROL_REGION 0 RECURSIVE_CTE (iterations=3 termination=empty_delta)
   ITERATION 1 (delta_rows=1 working_rows=1)
   ITERATION 2 (delta_rows=2 working_rows=2)
   ITERATION 3 (delta_rows=2 working_rows=2)
-PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=1 runtime_filter_no_wait=0
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 5

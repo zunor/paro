@@ -303,7 +303,9 @@ impl FullTextIndex {
                 &local_stats
             }
         };
-        if stats.global.total_docs == 0 || stats.global.avg_doc_length == 0.0 {
+        if score_mode == FullTextScoreMode::CorpusBm25V1
+            && (stats.global.total_docs == 0 || stats.global.avg_doc_length == 0.0)
+        {
             let elapsed_us = start.elapsed().as_micros() as u64;
             self.telemetry.lock().unwrap().record_search(
                 elapsed_us,
@@ -549,6 +551,72 @@ mod tests {
     use roaring::RoaringBitmap;
 
     #[test]
+    fn document_rank_is_identical_before_index_truncation_and_without_corpus_stats() {
+        use super::super::scoring::{score_document_from_tokens, DocumentScoreMode};
+        use super::super::tokenizer::Tokenizer;
+
+        let documents = [
+            "vector database vector",
+            "vector database",
+            "database vector",
+            "vector",
+            "noise",
+        ];
+        let mut index = FullTextIndex::new_default();
+        let tokenizer = DefaultTokenizer::new();
+        for (id, document) in documents.iter().enumerate() {
+            index.add_document(id as u32 + 1, document).unwrap();
+        }
+        // Exercise terms, prefix, conjunction, disjunction, phrase and negative
+        // subexpressions; score equality is bit-exact, not an epsilon oracle.
+        for text in [
+            "vector",
+            "vect*",
+            "vector AND database",
+            "vector OR noise",
+            "\"vector database\"",
+            "vector AND NOT noise",
+        ] {
+            let query = index.parse_query(text).unwrap();
+            let empty_stats =
+                FullTextScoringStats::from_global_stats(GlobalFullTextStats::from_totals(0, 0));
+            let rows = index.search(
+                &query,
+                10,
+                None,
+                Some(&empty_stats),
+                FullTextScoreMode::DocumentRankV1,
+            );
+            for row in rows {
+                let tokens = tokenizer.tokenize_to_vec(documents[row.idx as usize - 1]);
+                let scalar = score_document_from_tokens(DocumentScoreMode::RankV1, &tokens, &query);
+                assert_eq!(
+                    row.score.to_bits(),
+                    scalar.to_bits(),
+                    "{text}, document {}",
+                    row.idx
+                );
+            }
+        }
+        let query = index.parse_query("vector AND database").unwrap();
+        let first = index.search(&query, 1, None, None, FullTextScoreMode::DocumentRankV1);
+        assert_eq!((first[0].idx, first[0].score), (1, 2.375));
+        index.add_document(6, "unrelated document").unwrap();
+        let after = index.search(&query, 1, None, None, FullTextScoreMode::DocumentRankV1);
+        assert_eq!((after[0].idx, after[0].score), (1, 2.375));
+        let filter = RoaringBitmap::from_iter([2, 3]);
+        let filtered = index.search(
+            &query,
+            1,
+            Some(&filter),
+            None,
+            FullTextScoreMode::DocumentRankV1,
+        );
+        assert!(matches!(filtered[0].idx, 2 | 3));
+        assert_eq!(filtered[0].score, 2.0);
+    }
+
+    #[test]
     fn fulltext_index_add_and_parse() {
         let mut index = FullTextIndex::new_default();
         index.add_document(1, "Hello world").unwrap();
@@ -583,7 +651,7 @@ mod tests {
         index.add_document(2, "hello hello world").unwrap();
 
         let query = index.parse_query("hello").unwrap();
-        let results = index.search(&query, 2, None, None, FullTextScoreMode::Bm25);
+        let results = index.search(&query, 2, None, None, FullTextScoreMode::CorpusBm25V1);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].idx, 2);
     }
@@ -626,7 +694,7 @@ mod tests {
         index.add_document(2, "hello hello world").unwrap();
 
         let query = index.parse_query("hello").unwrap();
-        let results = index.search(&query, 2, None, None, FullTextScoreMode::Bm25);
+        let results = index.search(&query, 2, None, None, FullTextScoreMode::CorpusBm25V1);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].idx, 2);
         assert!(results[0].score > results[1].score);
@@ -639,7 +707,7 @@ mod tests {
         index.add_document(2, "alpha x beta x").unwrap();
 
         let query = index.parse_query("alpha beta").unwrap();
-        let results = index.search(&query, 2, None, None, FullTextScoreMode::CoverDensity);
+        let results = index.search(&query, 2, None, None, FullTextScoreMode::CoverDensityV1);
         assert_eq!(results.len(), 2);
 
         let mut scores = std::collections::HashMap::new();
@@ -678,8 +746,10 @@ mod tests {
         let query_small = seg_small.parse_query("vector").unwrap();
         let query_large = seg_large.parse_query("vector").unwrap();
 
-        let local_small = seg_small.search(&query_small, 1, None, None, FullTextScoreMode::Bm25);
-        let local_large = seg_large.search(&query_large, 1, None, None, FullTextScoreMode::Bm25);
+        let local_small =
+            seg_small.search(&query_small, 1, None, None, FullTextScoreMode::CorpusBm25V1);
+        let local_large =
+            seg_large.search(&query_large, 1, None, None, FullTextScoreMode::CorpusBm25V1);
         assert_eq!(local_small.len(), 1);
         assert_eq!(local_large.len(), 1);
         assert_ne!(
@@ -698,14 +768,14 @@ mod tests {
             1,
             None,
             Some(&global),
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
         );
         let global_large = seg_large.search(
             &query_large,
             1,
             None,
             Some(&global),
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
         );
         assert_eq!(global_small.len(), 1);
         assert_eq!(global_large.len(), 1);
@@ -736,14 +806,14 @@ mod tests {
             1,
             None,
             Some(&global_without_df),
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
         );
         let common_local_df = common_segment.search(
             &query,
             1,
             None,
             Some(&global_without_df),
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
         );
         assert!(
             (rare_local_df[0].score - common_local_df[0].score).abs() > 1e-3,
@@ -761,14 +831,14 @@ mod tests {
             1,
             None,
             Some(&generation_stats),
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
         );
         let common_global_df = common_segment.search(
             &query,
             1,
             None,
             Some(&generation_stats),
-            FullTextScoreMode::Bm25,
+            FullTextScoreMode::CorpusBm25V1,
         );
 
         let delta = (rare_global_df[0].score - common_global_df[0].score).abs();

@@ -157,6 +157,11 @@ impl RawRowAllocator {
         self.memory.accounting_class()
     }
 
+    #[inline]
+    pub fn memory_tag(&self) -> MemoryTag {
+        self.tag
+    }
+
     /// Get the number of row blocks.
     #[inline]
     pub fn row_block_count(&self) -> usize {
