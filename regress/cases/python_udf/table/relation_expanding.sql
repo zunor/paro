@@ -8,10 +8,11 @@ DROP FUNCTION IF EXISTS py_expand(INTEGER);
 CREATE FUNCTION py_expand(a INTEGER) RETURNS TABLE (value INTEGER)
 LANGUAGE python
 AS $$
+import pyarrow as pa
 output = []
-for value in a.materialize_py():
+for value in a.to_pylist():
     output.extend((value, value + 100))
-return output
+return pa.RecordBatch.from_arrays([pa.array(output, type=pa.int32())], names=["value"])
 $$;
 
 SELECT *

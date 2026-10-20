@@ -366,6 +366,10 @@ pub(crate) fn external_operator_cost(
         critical_path: range,
         external_workers: paro_planner::physical::ExternalWorkerRequirementSetId(1),
         external_worker_slots_upper: 1,
+        non_revocable_memory_upper: paro_external::python::TRANSPORT_WORKING_SET_BYTES as u64,
+        minimum_memory_bytes: paro_external::python::TRANSPORT_WORKING_SET_BYTES as u64,
+        peak_memory_upper: paro_external::python::TRANSPORT_WORKING_SET_BYTES as u64,
+        memory_completion: paro_planner::physical::MemoryCompletion::runtime_capped_unbounded(),
         ..PhysicalCost::ZERO
     };
     cost.resources_expected[ResourceDimension::Cpu as usize] =

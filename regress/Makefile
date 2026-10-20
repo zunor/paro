@@ -31,6 +31,9 @@ RUNNER := $(PYTHON) runner.py
 REQUIREMENTS := requirements.txt
 
 # ── User-tunable knobs ───────────────────────────────────────
+EXCLUDE ?=
+RUNNER += $(if $(EXCLUDE),--exclude "$(EXCLUDE)")
+
 FILE  ?=
 JOBS  ?= 4
 
@@ -126,6 +129,7 @@ help: ## Show this help
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  $(_C)%-18s$(_E) %s\n", $$1, $$2}'
 	@printf "\n  $(_Y)Variables:$(_E)\n"
 	@printf "  $(_C)%-18s$(_E) %s\n" "FILE=<pattern>"  "Filter cases by substring"
+	@printf "  $(_C)%-18s$(_E) %s\n" "EXCLUDE=<pattern>" "Exclude cases by substring"
 	@printf "  $(_C)%-18s$(_E) %s\n" "JOBS=N"          "Worker count for check-parallel (default: 4)"
 	@printf "  $(_C)%-18s$(_E) %s\n" "PYTHON_SYS=…"   "Override system Python binary"
 	@printf "\n"

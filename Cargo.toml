@@ -11,6 +11,13 @@ edition = "2021"
 pgwire = "0.37"
 
 arrow = "53.3"
+arrow-array = "53.3"
+arrow-buffer = "53.3"
+arrow-schema = "53.3"
+arrow-ipc = "53.3"
+arrow-flight = "53.3"
+flatbuffers = "24.12"
+tonic = "0.12"
 parquet = "53.3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }

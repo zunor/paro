@@ -8173,6 +8173,7 @@ CreateFunction(
         strict: false,
         security: Invoker,
         handler: None,
+        vectorized: false,
         packages: [],
         imports: [],
         rows: None,
@@ -8236,6 +8237,7 @@ CreateFunction(
         strict: false,
         security: Invoker,
         handler: None,
+        vectorized: false,
         packages: [],
         imports: [],
         rows: None,
@@ -8297,6 +8299,7 @@ CreateFunction(
         strict: true,
         security: Invoker,
         handler: None,
+        vectorized: false,
         packages: [],
         imports: [],
         rows: None,
@@ -8360,6 +8363,7 @@ CreateFunction(
         handler: Some(
             "binary_reverse",
         ),
+        vectorized: false,
         packages: [],
         imports: [],
         rows: None,
@@ -8423,6 +8427,7 @@ CreateFunction(
         handler: Some(
             "binary_reverse",
         ),
+        vectorized: false,
         packages: [
             "numpy",
         ],
@@ -8486,6 +8491,7 @@ CreateFunction(
         strict: false,
         security: Invoker,
         handler: None,
+        vectorized: false,
         packages: [],
         imports: [],
         rows: Some(
@@ -8551,6 +8557,7 @@ CreateFunction(
         handler: Some(
             "addone_py",
         ),
+        vectorized: false,
         packages: [],
         imports: [],
         rows: None,
@@ -8614,6 +8621,7 @@ CreateFunction(
         handler: Some(
             "addone_py",
         ),
+        vectorized: false,
         packages: [
             "numpy",
             "pandas",
@@ -8691,6 +8699,7 @@ CreateFunction(
         strict: false,
         security: Definer,
         handler: None,
+        vectorized: false,
         packages: [],
         imports: [],
         rows: None,
@@ -8763,6 +8772,7 @@ CreateFunction(
         handler: Some(
             "addone_py",
         ),
+        vectorized: false,
         packages: [],
         imports: [],
         rows: None,
@@ -8837,6 +8847,7 @@ CreateFunction(
         handler: Some(
             "addone_py",
         ),
+        vectorized: false,
         packages: [
             "numpy",
             "pandas",
@@ -8973,6 +8984,7 @@ CreateFunction(
         strict: false,
         security: Invoker,
         handler: None,
+        vectorized: false,
         packages: [],
         imports: [],
         rows: Some(

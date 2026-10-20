@@ -1,0 +1,36 @@
+CREATE FUNCTION py_batch(a INTEGER, b INTEGER) RETURNS INTEGER LANGUAGE python STRICT MODE VECTOR
+AS $$
+import pyarrow.compute as pc
+assert len(a) == len(b) == ctx.num_rows
+assert a.null_count == b.null_count == 0
+return pc.add(a, b)
+$$;
+CREATE FUNCTION
+
+SELECT count(*) AS rows, count(value) AS nonnull, sum(value) AS total
+FROM (SELECT py_batch(CASE WHEN i % 7 = 0 THEN NULL ELSE i::INTEGER END, 3) AS value FROM generate_series(1, 1) t(i)) q;
+rows	nonnull	total
+1	1	4
+
+SELECT count(*) AS rows, count(value) AS nonnull, sum(value) AS total
+FROM (SELECT py_batch(CASE WHEN i % 7 = 0 THEN NULL ELSE i::INTEGER END, 3) AS value FROM generate_series(1, 1023) t(i)) q;
+rows	nonnull	total
+1023	877	451290
+
+SELECT count(*) AS rows, count(value) AS nonnull, sum(value) AS total
+FROM (SELECT py_batch(CASE WHEN i % 7 = 0 THEN NULL ELSE i::INTEGER END, 3) AS value FROM generate_series(1, 1024) t(i)) q;
+rows	nonnull	total
+1024	878	452317
+
+SELECT count(*) AS rows, count(value) AS nonnull, sum(value) AS total
+FROM (SELECT py_batch(CASE WHEN i % 7 = 0 THEN NULL ELSE i::INTEGER END, 3) AS value FROM generate_series(1, 1025) t(i)) q;
+rows	nonnull	total
+1025	879	453345
+
+SELECT count(*) AS rows, count(value) AS nonnull, sum(value) AS total
+FROM (SELECT py_batch(CASE WHEN i % 7 = 0 THEN NULL ELSE i::INTEGER END, 3) AS value FROM generate_series(1, 4097) t(i)) q;
+rows	nonnull	total
+4097	3512	7205454
+
+DROP FUNCTION py_batch(INTEGER, INTEGER);
+DROP FUNCTION

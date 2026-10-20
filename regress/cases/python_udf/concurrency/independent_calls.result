@@ -1,0 +1,33 @@
+CREATE FUNCTION py_concurrent(a INTEGER) RETURNS INTEGER LANGUAGE python
+AS $$
+import time
+time.sleep(0.2)
+return a * 10
+$$;
+CREATE FUNCTION
+
+SELECT 42 AS ordinary_sql;
+ordinary_sql
+42
+
+-- session: worker2
+SELECT py_concurrent(2) AS value;
+value
+20
+
+-- session: worker1
+SELECT py_concurrent(1) AS value;
+value
+10
+
+-- session: worker0
+SELECT py_concurrent(0) AS value;
+value
+0
+
+SELECT py_concurrent(7) AS recovered;
+recovered
+70
+
+DROP FUNCTION py_concurrent(INTEGER);
+DROP FUNCTION

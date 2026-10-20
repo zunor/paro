@@ -1910,6 +1910,96 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn python_udf_cancel_reaps_handler_and_preserves_transaction_recovery() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let directory = tempdir().unwrap();
+        let marker = directory.path().join("handler.pid");
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&encode_startup_packet("paro", "postgres"))
+            .await
+            .unwrap();
+        let startup = read_messages_until_ready(&mut client).await;
+        let (pid, secret) = startup
+            .iter()
+            .find(|(tag, _)| *tag == b'K')
+            .and_then(|(_, payload)| backend_key_data(payload))
+            .unwrap();
+        let sql = format!(
+            "CREATE FUNCTION py_cancel(a INTEGER) RETURNS INTEGER LANGUAGE python AS $$\nimport os, time\nfrom pathlib import Path\nPath({:?}).write_text(str(os.getpid()))\ntime.sleep(30)\nreturn a\n$$",
+            marker.to_str().unwrap(),
+        );
+        let created = run_simple_query_roundtrip(&mut client, &sql).await;
+        assert!(!created.iter().any(|(tag, _)| *tag == b'E'), "{created:?}");
+        run_simple_query_roundtrip(&mut client, "BEGIN").await;
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new("SELECT py_cancel(1)".to_string()),
+            )))
+            .await
+            .unwrap();
+        let handler: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // File creation precedes write_text's payload publication.
+                if let Some(pid) = std::fs::read_to_string(&marker)
+                    .ok()
+                    .and_then(|value| value.parse::<i32>().ok())
+                {
+                    break pid;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("handler should start");
+        let mut cancel = TcpStream::connect(addr).await.unwrap();
+        cancel
+            .write_all(&encode_cancel_request(pid, secret))
+            .await
+            .unwrap();
+        let mut eof = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), cancel.read(&mut eof))
+                .await
+                .expect("CancelRequest must not wait behind Python")
+                .unwrap(),
+            0
+        );
+        let cancelled = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_messages_until_ready(&mut client),
+        )
+        .await
+        .expect("query should cancel promptly");
+        assert!(cancelled
+            .iter()
+            .any(|(tag, payload)| *tag == b'E'
+                && error_field(payload, b'C').as_deref() == Some("57014")));
+        assert_eq!(
+            cancelled
+                .last()
+                .and_then(|(_, p)| ready_for_query_status(p)),
+            Some('E')
+        );
+        // SAFETY: signal zero only checks whether the owned test handler exists.
+        assert_eq!(
+            unsafe { libc::kill(handler, 0) },
+            -1,
+            "handler must be reaped before SQL error"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        run_simple_query_roundtrip(&mut client, "ROLLBACK").await;
+        let probe = run_simple_query_roundtrip(&mut client, "SELECT 42").await;
+        assert!(!probe.iter().any(|(tag, _)| *tag == b'E'));
+        run_simple_query_roundtrip(&mut client, "DROP FUNCTION py_cancel(INTEGER)").await;
+        server.shutdown(Duration::from_secs(5)).await.unwrap();
+        run_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_to_stdout_cancel_returns_query_canceled_and_recovers_connection() {
         let (server, run_task, addr) = spawn_test_server(4).await;
         let mut client = TcpStream::connect(addr).await.expect("client connection");

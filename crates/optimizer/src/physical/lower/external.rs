@@ -15,24 +15,45 @@ impl PhysicalPlanBuilder {
             project.child.types().len(),
             "external project input",
         )?;
-        let routines = project
-            .expressions
-            .iter()
-            .map(|expr| external_routine_descriptor(&expr.routine_meta))
-            .collect::<Vec<_>>();
+        let mut routines = Vec::new();
+        for expression in &project.expressions {
+            paro_planner::expression::ExpressionIterator::visit(
+                &expression.expression,
+                &mut |node| {
+                    if let Expression::Function(function) = node {
+                        if let Some(meta) = function
+                            .routine_meta()
+                            .filter(|_| function.crosses_execution_boundary())
+                        {
+                            routines.push(external_routine_descriptor(meta));
+                        }
+                    }
+                    paro_planner::expression::ExpressionVisitDecision::Descend
+                },
+            );
+        }
+        let mut output_names = input_names.clone();
+        output_names.extend(
+            project
+                .expressions
+                .iter()
+                .map(|expression| expression.output_name.clone()),
+        );
+        let mut output_types = project.child.types();
+        output_types.extend(
+            project
+                .expressions
+                .iter()
+                .map(|expression| expression.expression.return_type()),
+        );
         let spec = ExternalProjectSpec {
             routines: routines.into_boxed_slice(),
             expressions: project.expressions.clone().into_boxed_slice(),
             cost: project.cost,
             input_names: input_names.into_boxed_slice(),
             input_types: project.child.types().into_boxed_slice(),
-            output_names: align_output_names(
-                project.output_names.clone(),
-                project.returned_types.len(),
-                "external project output",
-            )?
-            .into_boxed_slice(),
-            output_types: project.returned_types.clone().into_boxed_slice(),
+            output_names: output_names.into_boxed_slice(),
+            output_types: output_types.into_boxed_slice(),
         };
         Ok((PhysicalNodeKind::ExternalProject(spec), vec![child]))
     }

@@ -475,7 +475,7 @@ impl PartitionAggregateWindowBuildSinkExec {
         } else {
             None
         };
-        Ok(SinkGlobal::Dyn(Box::new(PartitionAggregateBuildGlobal {
+        Ok(SinkGlobal::Dyn(Arc::new(PartitionAggregateBuildGlobal {
             handle,
             global,
         })))

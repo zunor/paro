@@ -362,8 +362,6 @@ impl LogicalPlanDeepCopy {
                 LogicalOperator::ExternalProject(crate::logical::operator::LogicalExternalProject {
                     project_index,
                     expressions: p.expressions.clone(),
-                    output_names: p.output_names.clone(),
-                    returned_types: p.returned_types.clone(),
                     child: Box::new(child),
                     cost: p.cost,
                 })

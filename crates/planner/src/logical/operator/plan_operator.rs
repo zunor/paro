@@ -461,6 +461,7 @@ enum OutputNamesTask<'a> {
     FinishJoin(&'a Join),
     FinishDependentJoin(&'a DependentJoin),
     ExtendWindow(&'a Window),
+    ExtendExternal(&'a LogicalExternalProject),
     FinishGraphExpand(&'a GraphExpand),
 }
 
@@ -491,10 +492,9 @@ fn derive_output_names(root: &LogicalOperator) -> Vec<String> {
                     tasks.push(ExtendRowFetch(fetch));
                     tasks.push(Derive(&fetch.child.operator));
                 }
-                // ExternalProject owns an eagerly aligned presentation
-                // contract, so deriving its child again would be redundant.
                 LogicalOperator::ExternalProject(project) => {
-                    outputs.push(project.output_names.clone());
+                    tasks.push(ExtendExternal(project));
+                    tasks.push(Derive(&project.child.operator));
                 }
                 LogicalOperator::ExternalTable(table) => {
                     outputs.push(table.output_columns.clone());
@@ -620,6 +620,14 @@ fn derive_output_names(root: &LogicalOperator) -> Vec<String> {
             FinishDependentJoin(join) => {
                 let names = finish_dependent_join_names(join, &mut outputs);
                 outputs.push(names);
+            }
+            ExtendExternal(project) => {
+                outputs.last_mut().expect("external child names").extend(
+                    project
+                        .expressions
+                        .iter()
+                        .map(|expression| expression.output_name.clone()),
+                );
             }
             ExtendWindow(window) => {
                 let mut names = pop_output_names(&mut outputs);
@@ -882,7 +890,16 @@ impl<Child> LogicalOperator<Child> {
                 }
                 names
             }
-            LogicalOperator::ExternalProject(project) => project.output_names.clone(),
+            LogicalOperator::ExternalProject(project) => {
+                let mut names = child(0).to_vec();
+                names.extend(
+                    project
+                        .expressions
+                        .iter()
+                        .map(|expression| expression.output_name.clone()),
+                );
+                names
+            }
             LogicalOperator::ExternalTable(table) => table.output_columns.clone(),
             LogicalOperator::Limit(_) | LogicalOperator::Distinct(_) => child(0).to_vec(),
             LogicalOperator::Order(order) => {
@@ -1239,11 +1256,10 @@ fn derive_local_output_layout<Child>(
         }
         LogicalOperator::ExternalProject(project) => {
             let mut layout = required_output_layout(first, "external project child");
-            let child_width = layout.len();
             for (index, expression) in project.expressions.iter().enumerate() {
                 layout.push(
                     expression.expression.return_type(),
-                    ColumnBinding::new(project.project_index, child_width + index),
+                    ColumnBinding::new(project.project_index, index),
                 );
             }
             layout

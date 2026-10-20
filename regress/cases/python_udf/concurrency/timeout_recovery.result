@@ -1,0 +1,40 @@
+CREATE FUNCTION py_timeout(a INTEGER) RETURNS INTEGER LANGUAGE python
+AS $$
+import time
+if a < 0:
+    time.sleep(10)
+return a + 1
+$$;
+CREATE FUNCTION
+
+SELECT py_timeout(0) AS warm;
+warm
+1
+
+SET statement_timeout = 500;
+SET
+
+SELECT py_timeout(-1);
+ERROR: canceling statement due to statement timeout (SQLSTATE=57P06)
+
+SELECT py_timeout(-1);
+ERROR: canceling statement due to statement timeout (SQLSTATE=57P06)
+
+SELECT py_timeout(-1);
+ERROR: canceling statement due to statement timeout (SQLSTATE=57P06)
+
+SELECT py_timeout(-1);
+ERROR: canceling statement due to statement timeout (SQLSTATE=57P06)
+
+SELECT py_timeout(-1);
+ERROR: canceling statement due to statement timeout (SQLSTATE=57P06)
+
+SET statement_timeout = 0;
+SET
+
+SELECT py_timeout(41) AS recovered, 6 * 7 AS native_value;
+recovered	native_value
+42	42
+
+DROP FUNCTION py_timeout(INTEGER);
+DROP FUNCTION

@@ -409,7 +409,7 @@ mod tests {
                     id: "blob:1".to_string(),
                     inline_source: "def batch(ctx, a, b):\n    return a + b".to_string(),
                 },
-                entrypoint: PythonEntrypointRef::Batch {
+                entrypoint: PythonEntrypointRef::Vector {
                     handler: "batch".to_string(),
                 },
                 runtime: PythonRuntimeSelector::SystemDefault,

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod batching;
+mod expression;
 pub(crate) mod project;
 pub mod runtime_bridge;
 pub mod state;

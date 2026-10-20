@@ -664,6 +664,9 @@ impl PipelineTaskExecutor {
     ) -> Result<TaskStepResult> {
         match ctx.query.output.try_push(chunk) {
             QueryOutputWrite::Written => {
+                if let Some(shared) = &self.runtime.shared_sink {
+                    shared.mark_finished()?;
+                }
                 self.phase = PipelineTaskPhase::Done;
                 Ok(TaskStepResult::Done)
             }
@@ -695,6 +698,9 @@ impl PipelineTaskExecutor {
         let retained = chunk.memory;
         match ctx.query.output.try_push(chunk.chunk) {
             QueryOutputWrite::Written => {
+                if let Some(shared) = &self.runtime.shared_sink {
+                    shared.mark_finished()?;
+                }
                 self.phase = PipelineTaskPhase::Done;
                 Ok(TaskStepResult::Done)
             }

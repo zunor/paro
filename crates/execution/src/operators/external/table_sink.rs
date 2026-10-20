@@ -5,18 +5,14 @@ use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::vector::{Vector, VectorSelection};
 
 use crate::operators::external::batching::SubmissionBatchPolicy;
-use crate::operators::external::runtime_bridge::{
-    ExternalRuntimeBridge, RuntimeBridgeOutcome, TableSubmission,
-};
+use crate::operators::external::runtime_bridge::{ExternalRuntimeBridge, TableSubmission};
 use crate::operators::external::table_state::TableOutputBatch;
 use crate::physical::specs::ExternalTableSpec;
 use crate::runtime::breaker::{ExternalTableHandle, HandleRef};
-use crate::runtime::context::{
-    BlockReason, Blocker, OperatorCallContext, OperatorFinishContext, PipelineInitContext,
-    WakeSource, WakeToken,
-};
+use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
 use crate::runtime::state::{
     ExternalTableSinkGlobal, ExternalTableSinkLocal, SinkGlobal, SinkLocal,
@@ -61,6 +57,28 @@ impl ExternalTableSinkExec {
         }
         let global = external_table_global(global)?;
         let local = external_table_local(local)?;
+        // A correlated table call owns one outer row. Its result may contain
+        // zero or many rows, so each call retains that row's provenance.
+        if self.spec.emitted_output_types.len() > self.spec.worker_output_types.len() {
+            for row in 0..input.size() {
+                ctx.query.cancellation.check()?;
+                let mut single = input.clone_referencing_vectors();
+                single.try_slice_range(row, 1)?;
+                self.execute_batch(ctx, global, local, &single)?;
+            }
+        } else {
+            self.execute_batch(ctx, global, local, input)?;
+        }
+        Ok(SinkPoll::NeedMoreInput)
+    }
+
+    fn execute_batch(
+        &self,
+        ctx: &mut OperatorCallContext,
+        global: &ExternalTableSinkGlobal,
+        local: &mut ExternalTableSinkLocal,
+        input: &Chunk,
+    ) -> Result<()> {
         let batch_id = local.next_batch_id;
         let submission = TableSubmission {
             batch_id,
@@ -71,13 +89,9 @@ impl ExternalTableSinkExec {
             parameterized: self.spec.parameterized,
         };
         local.next_batch_id = local.next_batch_id.saturating_add(1);
-        let outcome = self
+        let response = self
             .bridge
             .execute_table(ctx.query, &submission, &ctx.memory)?;
-        let (response, blocked) = match outcome {
-            RuntimeBridgeOutcome::Ready(response) => (response, false),
-            RuntimeBridgeOutcome::Blocked(response) => (response, true),
-        };
         let mut batches = Vec::with_capacity(response.output_batches.len());
         for mut chunk in response.output_batches {
             append_passthrough_columns(&self.spec, input, &mut chunk)?;
@@ -91,15 +105,7 @@ impl ExternalTableSinkExec {
             local.next_partition_id = local.next_partition_id.saturating_add(1);
         }
         global.handle.shared().enqueue_output_batches(batches);
-        if blocked {
-            return Ok(SinkPoll::Pending(
-                Blocker::new(BlockReason::ExternalRuntime).with_wake(ctx.wake.register(
-                    WakeSource::ExternalRuntime,
-                    WakeToken::external_operator_batch(ctx.operator, batch_id),
-                )),
-            ));
-        }
-        Ok(SinkPoll::NeedMoreInput)
+        Ok(())
     }
 
     pub(crate) fn merge_local(
@@ -156,10 +162,9 @@ fn append_passthrough_columns(
     if passthrough_count == 0 {
         return Ok(());
     }
-    if output.size() != input.size() {
+    if input.size() != 1 {
         return Err(paro_error::contract_violation(format!(
-            "parameterized external table returned {} rows for {} input rows; pass-through correlation columns require one output row per input row",
-            output.size(),
+            "correlated table invocation requires one parameter row, got {}",
             input.size()
         )));
     }
@@ -188,7 +193,14 @@ fn append_passthrough_columns(
                 expected_type
             )));
         }
-        output.try_push_column(column.clone(), output.size())?;
+        let repeated = Vector::try_gather_ref(
+            Arc::clone(column),
+            VectorSelection::Repeated {
+                index: 0,
+                count: output.size(),
+            },
+        )?;
+        output.try_push_column(Arc::new(repeated), output.size())?;
     }
     Ok(())
 }

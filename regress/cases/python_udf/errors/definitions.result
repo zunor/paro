@@ -1,0 +1,21 @@
+CREATE FUNCTION py_bad_signature(a INTEGER) RETURNS INTEGER LANGUAGE python HANDLER 'main'
+AS $$
+def main(a):
+    return a
+$$;
+ERROR: handler signature must be (ctx, arg...) (SQLSTATE=39001)
+
+CREATE FUNCTION py_async(a INTEGER) RETURNS INTEGER LANGUAGE python HANDLER 'main'
+AS $$
+async def main(ctx, a):
+    return a
+$$;
+ERROR: expected one synchronous module-level handler (SQLSTATE=39001)
+
+CREATE FUNCTION py_dynamic_import(a INTEGER) RETURNS INTEGER LANGUAGE python
+IMPORTS ('/tmp/should-not-be-loaded.py') AS $$return a$$;
+ERROR: query-time Python PACKAGES/IMPORTS is not supported (SQLSTATE=0A000; HINT=Install dependencies in the worker interpreter environment.)
+
+CREATE FUNCTION py_unsupported_profile(a INTEGER) RETURNS INTEGER LANGUAGE python
+CAPABILITY PROFILE sandbox_wasm AS $$return a$$;
+ERROR: Python CAPABILITY PROFILE overrides is not supported (SQLSTATE=0A000)

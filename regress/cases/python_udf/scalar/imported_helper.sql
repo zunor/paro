@@ -1,19 +1,20 @@
 -- Copyright 2024-2026 Zunor
 -- SPDX-License-Identifier: Apache-2.0
 
--- @fixture python_udf/modules/basic_math
 -- @control connect user=paro
 
 DROP FUNCTION IF EXISTS py_imported(INTEGER);
 
--- @normalize regress_paths
 CREATE FUNCTION py_imported(a INTEGER) RETURNS INTEGER
 LANGUAGE python
 IMMUTABLE
-IMPORTS ('{{fixture:python_udf/modules/basic_math}}/basic_math.py')
+HANDLER 'main'
 AS $$
-from basic_math import shift_all
-return shift_all(a.materialize_py())
+def shift(value):
+    return value + 10
+
+def main(ctx, a):
+    return shift(a)
 $$;
 
 SELECT py_imported(v)

@@ -9,6 +9,7 @@ use paro_context::StatementCancelReason;
 
 use crate::pipeline::graph::SharedSinkId;
 use crate::runtime::context::QueryErrorId;
+use crate::runtime::state::SinkGlobal;
 
 const PRODUCER_COUNT_NOT_FROZEN: usize = usize::MAX;
 
@@ -20,6 +21,9 @@ pub struct SharedSinkCoordinator {
     merged_count: AtomicUsize,
     state: AtomicU8,
     finish_claimed: AtomicBool,
+    // One sink owns all branch writes and the completion fence. Initialization
+    // is serialized here; operator calls use their cloned state without this lock.
+    global: Mutex<Option<SinkGlobal>>,
     registration: Mutex<ProducerRegistration>,
     terminal: Mutex<Option<SharedSinkTerminalReason>>,
 }
@@ -33,9 +37,24 @@ impl SharedSinkCoordinator {
             merged_count: AtomicUsize::new(0),
             state: AtomicU8::new(SharedSinkStateCode::Open as u8),
             finish_claimed: AtomicBool::new(false),
+            global: Mutex::new(None),
             registration: Mutex::new(ProducerRegistration::default()),
             terminal: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn get_or_init_global(
+        &self,
+        create: impl FnOnce() -> Result<SinkGlobal>,
+    ) -> Result<SinkGlobal> {
+        let mut global = self.global.lock().expect("shared sink global poisoned");
+        if global.is_none() {
+            *global = Some(create()?);
+        }
+        Ok(global
+            .as_ref()
+            .expect("initialized shared sink global")
+            .clone())
     }
 
     #[inline]

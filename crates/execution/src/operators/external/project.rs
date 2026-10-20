@@ -6,13 +6,10 @@ use std::sync::Arc;
 
 use crate::operators::external::batching::SubmissionBatchPolicy;
 use crate::operators::external::runtime_bridge::{
-    ExternalRuntimeBridge, ProjectSubmission, RuntimeBridgeOutcome, RuntimeBridgeResponse,
+    ExternalRuntimeBridge, ProjectSubmission, RuntimeBridgeResponse,
 };
 use crate::physical::specs::ExternalProjectSpec;
-use crate::runtime::context::{
-    BlockReason, Blocker, OperatorCallContext, OperatorFinishContext, PipelineInitContext,
-    WakeSource, WakeToken,
-};
+use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::state::{
     ExternalProjectTransformGlobal, ExternalProjectTransformLocal, TransformGlobal, TransformLocal,
 };
@@ -83,22 +80,10 @@ impl ExternalProjectTransformExec {
             batch_policy: &global.batch_policy,
         };
         local.next_batch_id = local.next_batch_id.saturating_add(1);
-        let outcome = self
+        let response = self
             .bridge
             .execute_project(ctx.query, &submission, &ctx.memory)?;
-        let (response, blocked) = match outcome {
-            RuntimeBridgeOutcome::Ready(response) => (response, false),
-            RuntimeBridgeOutcome::Blocked(response) => (response, true),
-        };
         enqueue_external_project_output(self, input, response, output, &mut local.ready, ctx)?;
-        if blocked {
-            return Ok(TransformPoll::Pending(
-                Blocker::new(BlockReason::ExternalRuntime).with_wake(ctx.wake.register(
-                    WakeSource::ExternalRuntime,
-                    WakeToken::external_operator_batch(ctx.operator, batch_id),
-                )),
-            ));
-        }
         Ok(if local.ready.is_empty() {
             TransformPoll::Output
         } else {

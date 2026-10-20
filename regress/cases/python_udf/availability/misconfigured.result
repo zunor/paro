@@ -3,7 +3,7 @@ DROP FUNCTION
 
 CREATE FUNCTION py_misconfigured_probe(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return [value + 3 for value in a.materialize_py()]$$;
+AS $$return a + 3$$;
 CREATE FUNCTION
 
 SELECT py_misconfigured_probe(1);
@@ -17,7 +17,7 @@ SELECT 20 + 22;
 -- @normalize regress_paths
 CREATE FUNCTION py_misconfigured_new(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return [value for value in a.materialize_py()]$$;
+AS $$return a$$;
 ERROR: Python runtime is misconfigured for CREATE FUNCTION (SQLSTATE=39P04; DETAIL=failed to bootstrap Python interpreter '<repo>/regress/fixtures/python_udf/bin/python_misconfigured.py': simulated misconfigured python runtime)
 
 -- @normalize regress_paths

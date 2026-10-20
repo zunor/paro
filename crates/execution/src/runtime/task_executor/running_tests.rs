@@ -77,8 +77,20 @@ fn shared_sink_finish_runs_once_after_all_producers_merge() {
     };
     let mut profiler = OperatorProfiler::disabled();
 
+    let mut previous_global = None;
     for id in [PipelineId::new(0), PipelineId::new(1)] {
         let runtime = shared_empty_result_runtime(&query, shared, coordinator.clone(), id);
+        let global = runtime
+            .sink_global
+            .client_result()
+            .expect("client result global");
+        if let Some(previous) = &previous_global {
+            assert!(
+                Arc::ptr_eq(previous, global),
+                "branches must share sink state"
+            );
+        }
+        previous_global = Some(global.clone());
         let task = runtime
             .create_task_state(&query, paro_common::test_utils::test_allocator())
             .expect("task");
@@ -195,6 +207,66 @@ fn completion_result_uses_pending_chunk_when_root_output_is_blocked() {
         .expect("resume completion");
     assert!(matches!(result, TaskStepResult::Done));
     assert_eq!(output.len(), 1);
+}
+
+#[test]
+fn shared_completion_is_finished_only_after_output_accepts_result() {
+    let output = QueryOutputPort::bounded(1);
+    output
+        .try_push(Chunk::try_new(paro_common::test_utils::test_allocator()).unwrap())
+        .assert_written();
+    let query = query_context(output.clone());
+    let shared = crate::pipeline::graph::SharedSinkId::new(0);
+    let coordinator = Arc::new(SharedSinkCoordinator::new(shared));
+    coordinator.register_producer().unwrap();
+    coordinator.freeze_producer_count().unwrap();
+    coordinator.mark_producer_merged().unwrap();
+    assert!(coordinator.try_begin_finish().unwrap());
+    let runtime =
+        shared_empty_result_runtime(&query, shared, coordinator.clone(), PipelineId::new(0));
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    executor.phase = PipelineTaskPhase::Merging;
+    executor.completion_stage = PipelineCompletionStage::Finish;
+
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(7),
+        generation: WakeGeneration(3),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+    let chunk = Chunk::try_new(paro_common::test_utils::test_allocator()).unwrap();
+
+    let result = executor
+        .write_completion_result(
+            &mut step_context(&query, &thread, &wake, &mut profiler),
+            chunk,
+        )
+        .expect("write completion result");
+    let TaskStepResult::Blocked(blocker) = result else {
+        panic!("completion output should block");
+    };
+    assert_eq!(executor.phase, PipelineTaskPhase::Blocked);
+    assert!(matches!(
+        executor.task.pending,
+        PendingChunkState::CompletionResult { .. }
+    ));
+    assert_eq!(
+        blocker.wake.expect("output wake").task_id,
+        PipelineTaskId(7)
+    );
+
+    assert_eq!(coordinator.state(), SharedSinkState::Sealing);
+    output.pop_front();
+    executor.resume_after_wake().expect("resume");
+    let result = executor
+        .step(&mut step_context(&query, &thread, &wake, &mut profiler))
+        .expect("resume completion");
+    assert!(matches!(result, TaskStepResult::Done));
+    assert_eq!(output.len(), 1);
+    assert_eq!(coordinator.state(), SharedSinkState::Finished);
 }
 
 #[test]

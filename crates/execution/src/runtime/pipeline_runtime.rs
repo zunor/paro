@@ -116,7 +116,7 @@ impl PipelineRuntime {
             transform_globals.push(transform.exec.create_global(&mut ctx)?);
         }
 
-        let sink_global = {
+        let create_sink_global = || {
             let mut ctx = init_context(
                 query,
                 &program,
@@ -128,7 +128,11 @@ impl PipelineRuntime {
                 paro_common::cold_work::Kind::GlobalInit,
                 program.sink.operator_id.index(),
             );
-            program.sink.exec.create_global(&mut ctx)?
+            program.sink.exec.create_global(&mut ctx)
+        };
+        let sink_global = match &shared_sink {
+            Some(shared) => shared.get_or_init_global(create_sink_global)?,
+            None => create_sink_global()?,
         };
 
         Ok(Self {

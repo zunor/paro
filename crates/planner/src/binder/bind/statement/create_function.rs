@@ -1,16 +1,13 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use crate::binder::bind::type_name::bind_logical_type;
 use crate::binder::ir::BoundStatementKind;
 use crate::binder::Binder;
 use paro_catalog::entry::{CreateRoutineInfo, OnCreateConflict};
 use paro_common::error::{self as paro_error, Result};
 use paro_external::routine::capability::{CapabilityProfile, CapabilityProfilePreset};
-use paro_external::routine::env::{DeclaredEnvSpec, PackageRequirement, PythonRuntimeSelector};
+use paro_external::routine::env::{DeclaredEnvSpec, PythonRuntimeSelector};
 use paro_external::routine::permission::{PermissionSpec, RoutineSecurityMode};
 use paro_external::routine::spec::{
     PythonEntrypointRef, PythonImplementationRef, RoutineArgument, RoutineExecutionContract,
@@ -34,24 +31,6 @@ impl BoundCreateRoutineInfo {
     pub fn to_create_routine_info(&self) -> CreateRoutineInfo {
         self.create_info.clone()
     }
-}
-
-fn inline_source_blob_id(
-    schema_name: &str,
-    routine_name: &str,
-    definition: &str,
-    handler: &str,
-    packages: &[String],
-    imports: &[String],
-) -> String {
-    let mut hasher = DefaultHasher::new();
-    schema_name.hash(&mut hasher);
-    routine_name.hash(&mut hasher);
-    definition.hash(&mut hasher);
-    handler.hash(&mut hasher);
-    packages.hash(&mut hasher);
-    imports.hash(&mut hasher);
-    format!("inline:sip64:{:016x}", hasher.finish())
 }
 
 fn is_python_language(language: &str) -> bool {
@@ -143,6 +122,11 @@ pub fn bind_create_function(
 
     let capability_profile = resolve_capability_profile(&stmt)?;
     require_routine_privilege(binder, &stmt, &capability_profile)?;
+    if stmt.capability_profile.is_some() {
+        return Err(paro_error::not_supported(
+            "Python CAPABILITY PROFILE overrides",
+        ));
+    }
     binder
         .session_context()
         .ensure_python_runtime_ready_for_ddl()?;
@@ -202,42 +186,62 @@ pub fn bind_create_function(
         may_block: false,
     };
 
-    let handler = stmt.handler.clone().unwrap_or_else(|| "batch".to_string());
+    if !stmt.packages.is_empty() || !stmt.imports.is_empty() {
+        return Err(
+            paro_error::not_supported("query-time Python PACKAGES/IMPORTS")
+                .hint("Install dependencies in the worker interpreter environment."),
+        );
+    }
+    let (source, handler) = if let Some(handler) = &stmt.handler {
+        (stmt.definition.clone(), handler.clone())
+    } else {
+        let mut source = String::from("def main(ctx");
+        for (index, argument) in arguments.iter().enumerate() {
+            let name = argument
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("arg{index}"));
+            if name == "ctx"
+                || !name.chars().enumerate().all(|(i, c)| {
+                    c == '_'
+                        || if i == 0 {
+                            c.is_alphabetic()
+                        } else {
+                            c.is_alphanumeric()
+                        }
+                })
+            {
+                return Err(paro_error::invalid_input(
+                    "invalid Python argument identifier",
+                ));
+            }
+            source.push_str(&format!(", {name}"));
+        }
+        source.push_str("):\n");
+        for line in stmt.definition.lines() {
+            source.push_str("    ");
+            source.push_str(line);
+            source.push('\n');
+        }
+        (source, "main".to_string())
+    };
     let implementation = RoutineImplementationRef::Python(PythonImplementationRef {
         source_blob: SourceBlobRef {
-            id: inline_source_blob_id(
-                &schema_name,
-                &routine_name,
-                &stmt.definition,
-                &handler,
-                &stmt.packages,
-                &stmt.imports,
-            ),
-            inline_source: stmt.definition.clone(),
+            id: paro_external::python::definition::source_digest(&source),
+            inline_source: source,
         },
-        entrypoint: PythonEntrypointRef::Batch { handler },
+        entrypoint: if stmt.vectorized || matches!(return_type, RoutineReturn::Table(_)) {
+            PythonEntrypointRef::Vector { handler }
+        } else {
+            PythonEntrypointRef::Scalar { handler }
+        },
         runtime: PythonRuntimeSelector::SystemDefault,
     });
 
     let environment = DeclaredEnvSpec {
         runtime: PythonRuntimeSelector::SystemDefault,
-        packages: stmt
-            .packages
-            .iter()
-            .map(|spec| PackageRequirement {
-                spec: spec.clone(),
-                source: None,
-            })
-            .collect(),
-        imports: stmt
-            .imports
-            .iter()
-            .map(|path| paro_external::routine::env::ImportRef {
-                uri: path.clone(),
-                expected_digest: None,
-                expected_size: None,
-            })
-            .collect(),
+        packages: Vec::new(),
+        imports: Vec::new(),
     };
 
     let permissions = PermissionSpec {
@@ -254,7 +258,7 @@ pub fn bind_create_function(
         CreateOption::CreateOrReplace => OnCreateConflict::ReplaceOnConflict,
     };
 
-    Ok(BoundStatementKind::CreateRoutine(BoundCreateRoutineInfo {
+    let bound = BoundCreateRoutineInfo {
         database_name,
         schema_name: schema_name.clone(),
         routine_name: routine_name.clone(),
@@ -276,7 +280,17 @@ pub fn bind_create_function(
             on_conflict,
             sql,
         },
-    }))
+    };
+    let spec = bound.create_info.materialize_spec(
+        paro_external::routine::spec::RoutineIdentity {
+            id: paro_external::routine::spec::RoutineId::from_raw(0),
+            generation: 0,
+        },
+        &bound.schema_name,
+        &bound.routine_name,
+    );
+    binder.session_context().validate_python_routine(&spec)?;
+    Ok(BoundStatementKind::CreateRoutine(bound))
 }
 
 #[cfg(test)]
@@ -311,8 +325,7 @@ mod tests {
         let mut binder = test_binder();
         let stmt = parse_create_function(
             "CREATE FUNCTION public.py_add(a INTEGER, b INTEGER) RETURNS INTEGER \
-             LANGUAGE python IMMUTABLE STRICT HANDLER 'vectorized' \
-             PACKAGES ('numpy==2.1.1') IMPORTS ('stage://bucket/mod.py') \
+             LANGUAGE python IMMUTABLE STRICT \
              AS $$return a + b$$",
         );
 
@@ -339,8 +352,8 @@ mod tests {
             bound.create_info.execution_contract,
             RoutineExecutionContract::Scalar(_)
         ));
-        assert_eq!(bound.create_info.environment.packages.len(), 1);
-        assert_eq!(bound.create_info.environment.imports.len(), 1);
+        assert_eq!(bound.create_info.environment.packages.len(), 0);
+        assert_eq!(bound.create_info.environment.imports.len(), 0);
         assert!(matches!(
             bound.create_info.permissions.security_mode,
             RoutineSecurityMode::Invoker

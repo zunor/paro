@@ -413,6 +413,16 @@ impl Optimizer {
             crate::diagnostics::work::enter(crate::diagnostics::work::Bucket::Normalization);
         self.ctx.session.cancellation.check()?;
         let mut grant = self.resource_grant()?;
+        let mut layer = layer;
+        let query = if let QueryStatementLayer::Update { expressions, .. } = &mut layer {
+            crate::rewrite::external::lowering::ExternalRoutineLoweringPass::lower_assignments(
+                query,
+                expressions,
+                &self.ctx.bind_context,
+            )?
+        } else {
+            query
+        };
         let query = self.normalization().normalize(query)?;
         let (query, _) = distinct_decomposition::optimize_plan(query, &self.ctx.bind_context)?;
         let candidate = self.normalization().settle_relational_baseline(query)?;

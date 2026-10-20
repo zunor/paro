@@ -4,7 +4,8 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::process::Command;
+use std::io::{Read, Seek, SeekFrom};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -23,14 +24,7 @@ const DEFAULT_REPROBE_MAX: Duration = Duration::from_secs(30);
 const DISABLE_ENV: &str = "PARO_PYTHON_RUNTIME_DISABLED";
 const PYTHON_BIN_ENV: &str = "PARO_PYTHON_BIN";
 const DEFAULT_PYTHON_BIN: &str = "python3";
-const PYTHON_SLOTS_PROBE: &str = "import dataclasses\n@dataclasses.dataclass(slots=True)\nclass _ParoSlotsProbe:\n    value: int\n";
-const PYTHON_AUTO_CANDIDATES: &[&str] = &[
-    "python3.12",
-    "python3.11",
-    "python3.13",
-    "python3.14",
-    DEFAULT_PYTHON_BIN,
-];
+const PYTHON_RUNTIME_PROBE: &str = "import sys\nassert sys.version_info >= (3, 11), 'Paro requires Python >=3.11'\nimport pyarrow.flight\nassert int(pyarrow.__version__.split('.')[0]) >= 18, 'Paro requires PyArrow >=18'\n";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PythonRuntimeStartupPolicy {
@@ -130,6 +124,11 @@ pub trait PythonRuntimeProbe: Send + Sync {
 }
 
 pub trait PythonRuntimeProvider: Send + Sync {
+    fn python_client(&self) -> Result<Arc<crate::python::client::PythonClient>> {
+        Err(paro_error::python_runtime_unavailable(
+            "Python Flight service is not configured",
+        ))
+    }
     fn startup_policy(&self) -> PythonRuntimeStartupPolicy;
     fn status(&self) -> PythonRuntimeStatus;
     fn ensure_ready_for_ddl(&self) -> Result<()>;
@@ -300,11 +299,7 @@ impl PythonRuntimeProbe for CommandPythonRuntimeProbe {
             );
         }
 
-        match Command::new(&self.python_binary)
-            .arg("-c")
-            .arg(PYTHON_SLOTS_PROBE)
-            .output()
-        {
+        match probe_interpreter(&self.python_binary) {
             Ok(output) if output.status.success() => PythonRuntimeProbeResult::ready(),
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -332,24 +327,49 @@ impl PythonRuntimeProbe for CommandPythonRuntimeProbe {
     }
 }
 
+fn probe_interpreter(binary: &OsStr) -> std::io::Result<Output> {
+    // A temporary file prevents an interpreter's diagnostics from filling a
+    // pipe and deadlocking the probe. Read only a bounded diagnostic prefix.
+    let mut diagnostics = tempfile::tempfile()?;
+    let mut child = Command::new(binary)
+        .arg("-c")
+        .arg(PYTHON_RUNTIME_PROBE)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(diagnostics.try_clone()?))
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(result.err().unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Python interpreter probe exceeded 10 seconds",
+                    )
+                }));
+            }
+        }
+    };
+    diagnostics.seek(SeekFrom::Start(0))?;
+    let mut stderr = Vec::new();
+    diagnostics.take(8192).read_to_end(&mut stderr)?;
+    Ok(Output {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    })
+}
+
 pub fn default_python_binary() -> OsString {
     if let Some(value) = env::var_os(PYTHON_BIN_ENV).filter(|value| !value.is_empty()) {
         return value;
     }
-    PYTHON_AUTO_CANDIDATES
-        .iter()
-        .copied()
-        .find(|candidate| python_supports_required_dataclass_slots(candidate))
-        .map(OsString::from)
-        .unwrap_or_else(|| OsString::from(DEFAULT_PYTHON_BIN))
-}
-
-fn python_supports_required_dataclass_slots(candidate: &str) -> bool {
-    Command::new(candidate)
-        .arg("-c")
-        .arg(PYTHON_SLOTS_PROBE)
-        .output()
-        .is_ok_and(|output| output.status.success())
+    OsString::from(DEFAULT_PYTHON_BIN)
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +392,7 @@ impl Default for PythonRuntimeState {
 }
 
 pub struct ExternalRuntimeHost {
+    python_client: Mutex<Option<Arc<crate::python::client::PythonClient>>>,
     protocol: RuntimeProtocolVersion,
     startup_policy: PythonRuntimeStartupPolicy,
     dispatch_policy: ExternalDispatchPolicy,
@@ -383,6 +404,7 @@ pub struct ExternalRuntimeHost {
     degraded_retry_base: Duration,
     degraded_retry_max: Duration,
     probe: Arc<dyn PythonRuntimeProbe>,
+    probe_lock: Mutex<()>,
     state: RwLock<PythonRuntimeState>,
 }
 
@@ -411,6 +433,7 @@ impl ExternalRuntimeHost {
     pub fn new() -> Self {
         let permit_budget = PermitBudget::default();
         Self {
+            python_client: Mutex::new(None),
             protocol: RuntimeProtocolVersion::current(),
             startup_policy: PythonRuntimeStartupPolicy::LazyBestEffort,
             dispatch_policy: ExternalDispatchPolicy::default(),
@@ -422,6 +445,7 @@ impl ExternalRuntimeHost {
             degraded_retry_base: DEFAULT_REPROBE_BASE,
             degraded_retry_max: DEFAULT_REPROBE_MAX,
             probe: Arc::new(CommandPythonRuntimeProbe::default()),
+            probe_lock: Mutex::new(()),
             state: RwLock::new(PythonRuntimeState::default()),
         }
     }
@@ -555,7 +579,7 @@ impl ExternalRuntimeHost {
         };
 
         if should_probe {
-            self.run_probe();
+            self.run_probe(false);
         }
 
         let status = self.status();
@@ -566,7 +590,23 @@ impl ExternalRuntimeHost {
         Err(runtime_unavailable_error(&status, operation))
     }
 
-    fn run_probe(&self) -> PythonRuntimeStatus {
+    fn run_probe(&self, force: bool) -> PythonRuntimeStatus {
+        let _probe = self.probe_lock.lock().expect("Python probe lock poisoned");
+        // Concurrent first-use requests share one interpreter probe. Recheck
+        // eligibility after waiting, including a failed probe's cached state.
+        if !force {
+            let eligible = {
+                let state = self.state.read().expect("python runtime state");
+                matches!(state.availability, PythonRuntimeAvailability::NotProbed)
+                    || (matches!(
+                        state.availability,
+                        PythonRuntimeAvailability::Degraded { .. }
+                    ) && state.next_probe_at.is_some_and(|at| Instant::now() >= at))
+            };
+            if !eligible {
+                return self.status();
+            }
+        }
         let result = self.probe.probe();
         let availability = result.availability.clone();
         let detail = result.detail.clone();
@@ -619,6 +659,20 @@ impl ExternalRuntimeHost {
 }
 
 impl PythonRuntimeProvider for ExternalRuntimeHost {
+    fn python_client(&self) -> Result<Arc<crate::python::client::PythonClient>> {
+        self.ensure_ready("Python Flight service")?;
+        let mut service = self
+            .python_client
+            .lock()
+            .map_err(|_| paro_error::internal("Python service lock poisoned"))?;
+        if service.as_ref().is_some_and(|client| !client.is_running()) {
+            service.take();
+        }
+        if service.is_none() {
+            *service = Some(Arc::new(crate::python::client::PythonClient::start()?));
+        }
+        Ok(service.as_ref().unwrap().clone())
+    }
     fn startup_policy(&self) -> PythonRuntimeStartupPolicy {
         self.startup_policy
     }
@@ -677,7 +731,7 @@ impl PythonRuntimeProvider for ExternalRuntimeHost {
     }
 
     fn force_reprobe(&self) -> PythonRuntimeStatus {
-        self.run_probe()
+        self.run_probe(true)
     }
 
     fn observe_worker_failure(&self, message: &str) -> PythonRuntimeStatus {
@@ -749,6 +803,51 @@ fn display_os(value: &OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ExternalRuntimeHost, PythonRuntimeProvider};
+
+    #[test]
+    fn concurrent_first_use_shares_successful_and_failed_probes() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier,
+        };
+        struct Probe {
+            calls: AtomicUsize,
+            ready: bool,
+        }
+        impl super::PythonRuntimeProbe for Probe {
+            fn probe(&self) -> super::PythonRuntimeProbeResult {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                if self.ready {
+                    super::PythonRuntimeProbeResult::ready()
+                } else {
+                    super::PythonRuntimeProbeResult::binary_missing("test missing interpreter")
+                }
+            }
+        }
+        for ready in [true, false] {
+            let probe = Arc::new(Probe {
+                calls: AtomicUsize::new(0),
+                ready,
+            });
+            let host = Arc::new(ExternalRuntimeHost::new().with_probe(probe.clone()));
+            let barrier = Arc::new(Barrier::new(8));
+            let threads = (0..8)
+                .map(|_| {
+                    let host = host.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        assert_eq!(host.ensure_ready_for_execution().is_ok(), ready);
+                    })
+                })
+                .collect::<Vec<_>>();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert_eq!(probe.calls.load(Ordering::Relaxed), 1);
+        }
+    }
 
     #[test]
     fn execution_slot_lease_is_held_until_drop() {

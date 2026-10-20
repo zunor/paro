@@ -267,12 +267,18 @@ impl SelectionVector {
 
     /// Get raw slice of indices.
     pub fn as_slice(&self) -> &[u32] {
+        if self.is_empty() {
+            return &[];
+        }
         // SAFETY: buffer contains valid u32 data up to self.count
         unsafe { std::slice::from_raw_parts(self.buffer.data() as *const u32, self.count) }
     }
 
     /// Get mutable raw slice of indices.
     pub fn as_mut_slice(&mut self) -> &mut [u32] {
+        if self.is_empty() {
+            return &mut [];
+        }
         self.try_make_exclusive()
             .expect("selection vector copy-on-write allocation failed");
         // SAFETY: buffer contains valid u32 data up to self.count
@@ -589,6 +595,16 @@ impl From<&SelectionVector> for VectorSelection {
 mod tests {
     use super::*;
     use crate::allocator::default_allocator;
+
+    #[test]
+    fn empty_selection_has_valid_empty_slices() {
+        let mut selection =
+            SelectionVector::try_from_owned_indices(Vec::new(), Arc::new(default_allocator()))
+                .unwrap();
+        assert!(selection.as_slice().is_empty());
+        assert!(selection.as_mut_slice().is_empty());
+        assert!(ValidatedVectorSelection::try_new(selection, 0).is_ok());
+    }
 
     #[test]
     fn owned_indices_are_adopted_and_mutate_with_copy_on_write() {

@@ -3,13 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "paro-runtime-worker"
+name = "paro-worker"
 version = "0.1.0"
 description = "Paro internal Python runtime worker"
 requires-python = ">=3.11"
+dependencies = ["pyarrow>=18", "paro-udf"]
 
 [project.scripts]
-paro-runtime-worker = "paro_runtime_worker.main:main"
+paro-worker = "paro_worker.__main__:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

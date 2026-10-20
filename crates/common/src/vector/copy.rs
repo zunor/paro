@@ -419,7 +419,9 @@ impl Vector {
         }
 
         let (source, src_rows) = Self::normalize_source_rows(source, src_rows)?;
-        if source.logical_type == LogicalType::Null {
+        if source.logical_type == LogicalType::Null
+            || (source.vector_type == VectorType::Constant && source.is_null(0))
+        {
             return self.try_copy_null_rows(source, src_rows, dst_rows, count);
         }
 
@@ -1171,6 +1173,10 @@ impl Vector {
         array_size: usize,
     ) -> Result<()> {
         let (source, src_rows) = Self::normalize_source_rows(source, src_rows)?;
+        // Typed NULL constants have no child buffers, including through dictionaries.
+        if source.vector_type == VectorType::Constant && source.is_null(0) {
+            return self.try_copy_null_rows(source, src_rows, dst_rows, count);
+        }
         let required_count = self.destination_required_count(dst_rows, count)?;
         self.validate_source_rows(source, &src_rows, count)?;
 
@@ -1376,6 +1382,10 @@ impl Vector {
         count: usize,
     ) -> Result<()> {
         let (source, src_rows) = Self::normalize_source_rows(source, src_rows)?;
+        // Typed NULL constants have no child buffers, including through dictionaries.
+        if source.vector_type == VectorType::Constant && source.is_null(0) {
+            return self.try_copy_null_rows(source, src_rows, dst_rows, count);
+        }
         let required_count = self.destination_required_count(dst_rows, count)?;
         self.check_list_scatter_overwrite(dst_rows, count)?;
 
@@ -1430,6 +1440,10 @@ impl Vector {
         count: usize,
     ) -> Result<()> {
         let (source, src_rows) = Self::normalize_source_rows(source, src_rows)?;
+        // Typed NULL constants have no child buffers, including through dictionaries.
+        if source.vector_type == VectorType::Constant && source.is_null(0) {
+            return self.try_copy_null_rows(source, src_rows, dst_rows, count);
+        }
         let required_count = self.destination_required_count(dst_rows, count)?;
         self.validate_source_rows(source, &src_rows, count)?;
 

@@ -74,7 +74,7 @@ mod tests {
                         id: "inline:test".to_string(),
                         inline_source: "return a".to_string(),
                     },
-                    entrypoint: PythonEntrypointRef::Batch {
+                    entrypoint: PythonEntrypointRef::Vector {
                         handler: "batch".to_string(),
                     },
                     runtime: PythonRuntimeSelector::SystemDefault,

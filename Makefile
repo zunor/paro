@@ -171,12 +171,14 @@ regress-unit: ## Run harness unit tests
 	@$(MAKE) -C regress unit
 
 # ── Python UDF (project-level proxy + smoke) ─────────────────
-python-udf-setup: ## Install regress dependencies used by Python UDF regress and smoke flows
+python-udf-setup: ## Install regression and Arrow/NumPy test dependencies in regress/.venv
 	@$(MAKE) -C regress setup
+	regress/.venv/bin/python3 -m pip install -r runtimes/python-worker/requirements.txt 'numpy>=2'
 
 python-udf-unit: ## Run ABI/runtime Rust tests plus Python worker and SDK unit tests
 	cargo test -p paro-external --test abi_conformance --locked
 	cargo test -p paro-external --test runtime --locked
+	PARO_PYTHON_BIN=$(PYTHON3) cargo test -p paro-external --test python_flight --locked
 	PYTHONPATH=python/paro_udf/src:runtimes/python-worker/src $(PYTHON3) -m unittest discover -s runtimes/python-worker/tests -p 'test_*.py' -v
 	PYTHONPATH=python/paro_udf/src:runtimes/python-worker/src $(PYTHON3) -m unittest discover -s python/paro_udf/tests -p 'test_*.py' -v
 
@@ -216,9 +218,11 @@ python-udf-startup-smoke: ## Verify parod starts and serves ordinary SQL when Py
 	cleanup
 
 python-udf-ci: ## Run Python UDF unit tests, startup smoke, and dedicated SQL regress
-	@$(MAKE) python-udf-unit
+	@$(MAKE) python-udf-setup
+	@$(MAKE) python-udf-unit PYTHON3="$(abspath regress/.venv/bin/python3)"
 	@$(MAKE) python-udf-startup-smoke
 	@set -e; \
+	export PATH="$(abspath regress/.venv/bin):$$PATH"; \
 	cleanup() { \
 		if [ -f "$(CI_PID)" ]; then \
 			kill "$$(cat "$(CI_PID)")" 2>/dev/null || true; \

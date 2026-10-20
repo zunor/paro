@@ -102,6 +102,12 @@ def execute_blocks(
     setup_failed = False
     main_error: Exception | None = None
 
+    def track_control_connection(current: Any, block: Block) -> Any:
+        nonlocal conn
+        assert control_handler is not None
+        conn = control_handler(current, block)
+        return conn
+
     try:
         for block in setup_blocks:
             try:
@@ -121,7 +127,7 @@ def execute_blocks(
                 result,
                 engine=engine,
                 float_precision=float_precision,
-                control_handler=control_handler,
+                control_handler=track_control_connection if control_handler is not None else None,
                 session_manager=session_manager,
                 async_manager=async_manager,
                 wait_expect_matcher=wait_expect_matcher,

@@ -120,7 +120,7 @@ mod tests {
                             inline_source: "return [value for value in a.materialize_py()]"
                                 .to_string(),
                         },
-                        entrypoint: PythonEntrypointRef::Batch {
+                        entrypoint: PythonEntrypointRef::Vector {
                             handler: "batch".to_string(),
                         },
                         runtime: PythonRuntimeSelector::SystemDefault,

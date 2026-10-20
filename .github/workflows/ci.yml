@@ -19,6 +19,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUST_TOOLCHAIN: 1.92.0
+  PYTHON_VERSION: ">=3.11"
 
 jobs:
   changes:
@@ -41,6 +42,8 @@ jobs:
           filters: |
             header:
               - 'crates/**'
+              - 'runtimes/**'
+              - 'python/**'
               - 'benchmark/**'
               - 'regress/**'
               - '.github/**'
@@ -52,20 +55,23 @@ jobs:
               - 'Cargo.lock'
               - 'build.rs'
               - '**/build.rs'
+              - 'runtimes/python-worker/**'
+              - 'python/paro_udf/**'
             regress:
               - 'regress/**'
             benchmark:
               - 'benchmark/**'
             python_udf:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - 'crates/common/**'
               - 'crates/context/**'
               - 'crates/execution/**'
-              - 'crates/external_abi/**'
-              - 'crates/external_runtime/**'
+              - 'crates/external/**'
               - 'crates/instance/**'
               - 'crates/parser/**'
               - 'crates/planner/**'
-              - 'crates/routine/**'
               - 'crates/session/**'
               - 'python/paro_udf/**'
               - 'runtimes/**'
@@ -103,7 +109,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
       - run: python3 tools/ci/check_headers.py
 
   actionlint:
@@ -165,7 +171,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
       - run: python3 tools/ci/generate_optimizer_calibration.py --check
 
   clippy:
@@ -199,6 +205,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: python -m pip install -r runtimes/python-worker/requirements.txt
       - run: RUST_MIN_STACK=33554432 cargo test --workspace --locked
 
   regress_unit:
@@ -211,7 +221,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Install regress dependencies
         run: |
           python -m pip install --upgrade pip
@@ -244,29 +254,6 @@ jobs:
           path: target/release/parod
           retention-days: 1
 
-  python_udf_unit:
-    name: python udf unit (py${{ matrix.python-version }})
-    needs: changes
-    if: needs.changes.outputs.python_udf == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.14"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: python-udf-unit-${{ matrix.python-version }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - run: make python-udf-unit
-
   regress:
     name: regression
     needs: [changes, build]
@@ -280,11 +267,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Install regress dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r regress/requirements.txt
+          python -m pip install -r regress/requirements.txt -r runtimes/python-worker/requirements.txt 'numpy>=2'
       - id: start_parod
         uses: ./.github/actions/start-parod
         with:
@@ -312,25 +299,30 @@ jobs:
         if: always()
         uses: ./.github/actions/cleanup-parod
 
-  python_udf_regress:
-    name: python udf regress (py${{ matrix.python-version }})
+  python_udf:
+    name: python udf
     needs: [changes, build]
-    if: needs.changes.outputs.python_udf == 'true' || needs.changes.outputs.ci == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python_udf == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Install regress dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r regress/requirements.txt
+          python -m pip install -r regress/requirements.txt -r runtimes/python-worker/requirements.txt 'numpy>=2'
+      # Rust ABI/runtime tests are already covered by the workspace test job.
+      - name: Run Python worker unit tests
+        env:
+          PYTHONPATH: python/paro_udf/src:runtimes/python-worker/src
+        run: python -m unittest discover -s runtimes/python-worker/tests -p 'test_*.py' -v
+      - name: Run Python SDK unit tests
+        env:
+          PYTHONPATH: python/paro_udf/src:runtimes/python-worker/src
+        run: python -m unittest discover -s python/paro_udf/tests -p 'test_*.py' -v
       - id: start_parod
         uses: ./.github/actions/start-parod
         with:
@@ -343,11 +335,27 @@ jobs:
           PARO_PORT: ${{ steps.start_parod.outputs.port }}
           PARO_USER: paro
         run: make -C regress ci FILE=python_udf
-      - name: Upload Python UDF regression report
+      - name: Verify startup without Python runtime
+        run: |
+          mkdir -p .ci/python-udf-startup-data
+          PARO_PYTHON_RUNTIME_DISABLED=1 .ci/bin/parod \
+            --listen 127.0.0.1:6544 \
+            --data-dir .ci/python-udf-startup-data \
+            > .ci/python-udf-startup.log 2>&1 &
+          smoke_pid=$!
+          trap 'kill "$smoke_pid" 2>/dev/null || true; wait "$smoke_pid" 2>/dev/null || true' EXIT
+          echo "$smoke_pid" > .ci/python-udf-startup.pid
+          python tools/ci/wait_for_parod.py \
+            --host 127.0.0.1 --port 6544 \
+            --pid-file .ci/python-udf-startup.pid \
+            --timeout 60 --log .ci/python-udf-startup.log
+          python tools/ci/python_runtime_startup_smoke.py \
+            --host 127.0.0.1 --port 6544
+      - name: Upload Python UDF report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: python-udf-regress-report-py${{ matrix.python-version }}
+          name: python-udf-report
           if-no-files-found: warn
           path: |
             regress/report/report.txt
@@ -355,48 +363,7 @@ jobs:
             regress/report/regress.log
             regress/report/actuals/**
             .ci/parod.log
-      - name: Stop parod
-        if: always()
-        uses: ./.github/actions/cleanup-parod
-
-  startup_without_python:
-    name: startup without python runtime
-    needs: [changes, build]
-    if: needs.changes.outputs.python_udf == 'true' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install regress dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r regress/requirements.txt
-      - id: start_parod
-        env:
-          PARO_PYTHON_RUNTIME_DISABLED: "1"
-        uses: ./.github/actions/start-parod
-        with:
-          artifact-name: parod-release
-          port: "6432"
-          health-timeout: "60"
-      - name: Run startup smoke
-        env:
-          PARO_HOST: ${{ steps.start_parod.outputs.host }}
-          PARO_PORT: ${{ steps.start_parod.outputs.port }}
-        run: |
-          python tools/ci/python_runtime_startup_smoke.py \
-            --host "$PARO_HOST" \
-            --port "$PARO_PORT"
-      - name: Upload startup smoke logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: startup-without-python-report
-          if-no-files-found: warn
-          path: .ci/parod.log
+            .ci/python-udf-startup.log
       - name: Stop parod
         if: always()
         uses: ./.github/actions/cleanup-parod
@@ -436,7 +403,7 @@ jobs:
           shared-key: benchmark
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Install benchmark dependencies
         run: |
           python -m pip install --upgrade pip
@@ -518,7 +485,7 @@ jobs:
   ci_gate:
     name: ci-gate
     if: always()
-    needs: [changes, header, actionlint, fmt, clippy, test, regress_unit, build, python_udf_unit, regress, python_udf_regress, startup_without_python, benchmark]
+    needs: [changes, header, actionlint, fmt, clippy, test, regress_unit, build, regress, python_udf, benchmark]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -543,8 +510,6 @@ jobs:
           check test "${{ needs.test.result }}"
           check regress_unit "${{ needs.regress_unit.result }}"
           check build "${{ needs.build.result }}"
-          check python_udf_unit "${{ needs.python_udf_unit.result }}"
           check regress "${{ needs.regress.result }}"
-          check python_udf_regress "${{ needs.python_udf_regress.result }}"
-          check startup_without_python "${{ needs.startup_without_python.result }}"
+          check python_udf "${{ needs.python_udf.result }}"
           check benchmark "${{ needs.benchmark.result }}"

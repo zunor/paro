@@ -7,7 +7,11 @@ DROP FUNCTION IF EXISTS py_scale(INTEGER);
 
 CREATE FUNCTION py_scale(a INTEGER) RETURNS TABLE (value INTEGER)
 LANGUAGE python
-AS $$return [value * 10 for value in a.materialize_py()]$$;
+AS $$
+import pyarrow as pa
+import pyarrow.compute as pc
+return pa.RecordBatch.from_arrays([pc.multiply(a, 10).cast(pa.int32())], names=["value"])
+$$;
 
 -- @normalize explain_routine_ids
 EXPLAIN

@@ -7,7 +7,7 @@ DROP FUNCTION IF EXISTS py_misconfigured_probe(INTEGER);
 
 CREATE FUNCTION py_misconfigured_probe(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return [value + 3 for value in a.materialize_py()]$$;
+AS $$return a + 3$$;
 
 SELECT py_misconfigured_probe(1);
 
@@ -17,7 +17,7 @@ SELECT 20 + 22;
 -- @normalize regress_paths
 CREATE FUNCTION py_misconfigured_new(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return [value for value in a.materialize_py()]$$;
+AS $$return a$$;
 
 -- @normalize regress_paths
 SELECT py_misconfigured_probe(1);

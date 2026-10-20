@@ -1,0 +1,40 @@
+CREATE SCHEMA py_space_a;
+CREATE SCHEMA
+
+CREATE SCHEMA py_space_b;
+CREATE SCHEMA
+
+CREATE FUNCTION py_space_a.score(a INTEGER) RETURNS INTEGER LANGUAGE python
+AS $$
+return a + 10
+$$;
+CREATE FUNCTION
+
+CREATE FUNCTION py_space_b.score(a INTEGER) RETURNS INTEGER LANGUAGE python
+AS $$
+return a + 100
+$$;
+CREATE FUNCTION
+
+CREATE FUNCTION py_space_a.score(a VARCHAR) RETURNS VARCHAR LANGUAGE python
+AS $$
+return a + "!"
+$$;
+CREATE FUNCTION
+
+SELECT py_space_a.score(2) AS first, py_space_b.score(2) AS second, py_space_a.score('雪'::VARCHAR) AS text_value;
+first	second	text_value
+12	102	雪!
+
+DROP FUNCTION py_space_a.score(INTEGER);
+DROP FUNCTION
+
+SELECT py_space_b.score(2) AS retained, py_space_a.score(''::VARCHAR) AS overload;
+retained	overload
+102	!
+
+DROP FUNCTION py_space_b.score(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION py_space_a.score(VARCHAR);
+DROP FUNCTION

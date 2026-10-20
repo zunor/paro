@@ -2,18 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use paro_common::error::{self as paro_error, Result};
+use paro_common::runtime_value::Value;
+use paro_common::types::LogicalType;
 use paro_external::routine::bound::BoundRoutineCallMeta;
 use paro_external::routine::spec::RowSemantics;
 use paro_planner::binder::bind::from::join_utils::{collect_table_bindings, get_expression_side};
 use paro_planner::binder::context::BindContext;
 use paro_planner::binder::ir::OrderByNode;
-use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
+use paro_planner::expression::{
+    CaseExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression,
+    Expression, ExpressionIterator,
+};
 use paro_planner::logical::operator::external_project::{
     ExternalCostEstimate, ExternalProjectExpression,
 };
 use paro_planner::logical::operator::{
-    Aggregate, AnyJoin, ComparisonJoin, Distinct, Filter, Join, JoinSide, LogicalExternalProject,
-    LogicalOperator, Order, Projection, TopN, Update, Window,
+    Aggregate, AnyJoin, ColumnBinding, ComparisonJoin, Distinct, ExpressionGet, Filter, Join,
+    JoinSide, LogicalExternalProject, LogicalOperator, Order, Projection, TopN, Update, Window,
 };
 use paro_planner::logical::plan::OwnedLogicalPlan;
 
@@ -28,6 +33,17 @@ pub struct ExternalRoutineLoweringResult {
 pub struct ExternalRoutineLoweringPass;
 
 impl ExternalRoutineLoweringPass {
+    /// UPDATE assignments belong to the statement envelope, but their external
+    /// work must enter the query before resource planning and column pruning.
+    pub(crate) fn lower_assignments(
+        plan: OwnedLogicalPlan,
+        expressions: &mut Vec<Expression>,
+        bind_context: &BindContext,
+    ) -> Result<OwnedLogicalPlan> {
+        ExternalRoutineLowerer::new(bind_context)
+            .lower_external_in_expression_vec(plan, expressions)
+    }
+
     pub fn lower(
         plan: OwnedLogicalPlan,
         bind_context: &BindContext,
@@ -41,6 +57,45 @@ impl ExternalRoutineLoweringPass {
             changed: lowerer.changed,
         })
     }
+}
+
+fn ordinal_constant(row: usize) -> Expression {
+    Expression::Constant(
+        ConstantExpression::new(Value::BigInt(row as i64), LogicalType::BigInt).into(),
+    )
+}
+
+fn values_column(
+    mut cells: Vec<Expression>,
+    start: usize,
+    ordinal: &Expression,
+) -> Result<Expression> {
+    if cells.len() == 1 {
+        return Ok(cells.pop().expect("one VALUES cell"));
+    }
+    if cells.is_empty() {
+        return Err(paro_error::internal("external VALUES has no rows"));
+    }
+    let midpoint = cells.len() / 2;
+    let right = cells.split_off(midpoint);
+    let left = values_column(cells, start, ordinal)?;
+    let return_type = left.return_type();
+    Ok(Expression::Case(
+        CaseExpression::new(
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::LessThan,
+                    ordinal.clone(),
+                    ordinal_constant(start + midpoint),
+                )
+                .into(),
+            ),
+            left,
+            values_column(right, start + midpoint, ordinal)?,
+            return_type,
+        )
+        .into(),
+    ))
 }
 
 #[derive(Debug)]
@@ -127,6 +182,15 @@ impl<'a> ExternalRoutineLowerer<'a> {
         let (id, stats, operator) = plan.into_parts();
 
         let operator = match operator {
+            LogicalOperator::ExpressionGet(values)
+                if values
+                    .expressions
+                    .iter()
+                    .flatten()
+                    .any(Expression::contains_external_routine) =>
+            {
+                return self.lower_values(values);
+            }
             LogicalOperator::Projection(projection) => {
                 LogicalOperator::Projection(self.lower_projection(projection)?)
             }
@@ -156,6 +220,69 @@ impl<'a> ExternalRoutineLowerer<'a> {
             stats,
             operator,
         })
+    }
+
+    fn lower_values(&mut self, values: ExpressionGet) -> Result<OwnedLogicalPlan> {
+        // Keep a single bounded execution boundary regardless of VALUES length.
+        // The native source supplies row ordinals; balanced conditional trees
+        // evaluate each cell only for its own row, preserving volatile calls and
+        // heterogeneous expressions without one pipeline/reservation per row.
+        let ordinal_index = self.bind_context.generate_table_index();
+        let ordinal = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(ordinal_index, 0), LogicalType::BigInt)
+                .into(),
+        );
+        let row_count = values.expressions.len();
+        let mut columns = vec![Vec::with_capacity(row_count); values.types.len()];
+        for row in values.expressions {
+            for (column, cell) in columns.iter_mut().zip(row) {
+                column.push(cell);
+            }
+        }
+        let mut input_rows = (0..row_count)
+            .map(|row| vec![ordinal_constant(row)])
+            .collect::<Vec<_>>();
+        let mut input_types = vec![LogicalType::BigInt];
+        let mut input_names = vec!["ordinal".into()];
+        let mut expressions = Vec::with_capacity(columns.len());
+        for (column_index, cells) in columns.into_iter().enumerate() {
+            if cells.iter().any(Expression::contains_external_routine) {
+                expressions.push(values_column(cells, 0, &ordinal)?);
+            } else {
+                // Native columns keep the existing VALUES evaluator, including
+                // nested types, instead of acquiring conditional-expression costs.
+                expressions.push(Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(ordinal_index, input_types.len()),
+                        values.types[column_index].clone(),
+                    )
+                    .into(),
+                ));
+                input_types.push(values.types[column_index].clone());
+                input_names.push(values.names[column_index].clone());
+                for (row, cell) in input_rows.iter_mut().zip(cells) {
+                    row.push(cell);
+                }
+            }
+        }
+        let child = OwnedLogicalPlan::new(
+            self.bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                ordinal_index,
+                input_rows,
+                input_names,
+                input_types,
+            )),
+        );
+        let mut projection = Projection::new(values.table_index, child, expressions)
+            .with_visible_names(values.names);
+        projection.visible_qualifier = values.relation_alias;
+        let projection = self.lower_projection(projection)?;
+        self.changed = true;
+        Ok(OwnedLogicalPlan::new(
+            self.bind_context,
+            LogicalOperator::Projection(projection),
+        ))
     }
 
     fn lower_projection(&mut self, mut projection: Projection) -> Result<Projection> {
@@ -451,6 +578,12 @@ impl<'a> ExternalRoutineLowerer<'a> {
         expression: &Expression,
         layer: &mut ReadyExternalLayer,
     ) -> Result<()> {
+        // A conditional is one evaluation boundary: lifting its branch calls
+        // out would execute Python on rows for which SQL never selects them.
+        if matches!(expression, Expression::Case(_)) && expression.contains_external_routine() {
+            push_unique_expression(&mut layer.calls, expression, &mut layer.reused_calls);
+            return Ok(());
+        }
         match expression {
             Expression::Function(function) if function.crosses_execution_boundary() => {
                 let Some(meta) = function.routine_meta() else {
@@ -518,6 +651,19 @@ impl<'a> ExternalRoutineLowerer<'a> {
         left_layer: &mut ReadyExternalLayer,
         right_layer: &mut ReadyExternalLayer,
     ) -> Result<()> {
+        if matches!(expression, Expression::Case(_)) && expression.contains_external_routine() {
+            let layer = match get_expression_side(expression, left_bindings, right_bindings) {
+                JoinSide::Left | JoinSide::None => left_layer,
+                JoinSide::Right => right_layer,
+                JoinSide::Both => {
+                    return Err(paro_error::not_implemented(
+                        "External conditional JOIN expressions cannot depend on both sides",
+                    ))
+                }
+            };
+            push_unique_expression(&mut layer.calls, expression, &mut layer.reused_calls);
+            return Ok(());
+        }
         match expression {
             Expression::Function(function) if function.crosses_execution_boundary() => {
                 let Some(meta) = function.routine_meta() else {
@@ -614,7 +760,6 @@ impl<'a> ExternalRoutineLowerer<'a> {
         reused_calls: usize,
     ) -> Result<(OwnedLogicalPlan, Vec<LayerMapping>)> {
         let project_index = self.bind_context.generate_table_index();
-        let child_column_count = child.get_column_bindings().len();
         let expressions = calls
             .iter()
             .enumerate()
@@ -633,10 +778,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
             .enumerate()
             .map(|(idx, expression)| LayerMapping {
                 binding: ColumnRefExpression::new(
-                    paro_planner::logical::operator::ColumnBinding::new(
-                        project_index,
-                        child_column_count + idx,
-                    ),
+                    paro_planner::logical::operator::ColumnBinding::new(project_index, idx),
                     expression.return_type(),
                 ),
                 expression,
@@ -700,6 +842,9 @@ impl<'a> ExternalRoutineLowerer<'a> {
             LogicalOperator::Update(update) => {
                 self.ensure_expressions_are_native("UPDATE", update.expressions.iter())
             }
+            LogicalOperator::ExpressionGet(values) => {
+                self.ensure_expressions_are_native("VALUES", values.expressions.iter().flatten())
+            }
             LogicalOperator::Join(join) => match join {
                 Join::Comparison(comparison) => self.ensure_expressions_are_native(
                     "JOIN",
@@ -736,14 +881,17 @@ impl<'a> ExternalRoutineLowerer<'a> {
 }
 
 fn external_routine_meta(expression: &Expression) -> Result<&BoundRoutineCallMeta> {
-    match expression {
-        Expression::Function(function) if function.crosses_execution_boundary() => function
-            .routine_meta()
-            .ok_or_else(|| paro_error::internal("external routine is missing bound metadata")),
-        _ => Err(paro_error::internal(
-            "expected external function expression while building LogicalExternalProject",
-        )),
-    }
+    use paro_planner::expression::ExpressionVisitDecision;
+    let mut first = None;
+    ExpressionIterator::visit(expression, &mut |node| {
+        if let Expression::Function(function) = node {
+            if function.crosses_execution_boundary() && first.is_none() {
+                first = function.routine_meta();
+            }
+        }
+        ExpressionVisitDecision::Descend
+    });
+    first.ok_or_else(|| paro_error::internal("external expression has no bound routine metadata"))
 }
 
 fn push_unique_expression(
@@ -970,6 +1118,52 @@ mod tests {
         semantics.stability = RoutineStability::Volatile;
         semantics.side_effects = RoutineSideEffects::HasSideEffects;
         expression
+    }
+
+    #[test]
+    fn external_values_share_one_boundary_with_balanced_row_selection() {
+        let ctx = BindContext::default();
+        let rows = (0..1025)
+            .map(|row| {
+                vec![external_call(
+                    "py_value",
+                    vec![Expression::Constant(
+                        ConstantExpression::new(Value::Integer(row), LogicalType::Integer).into(),
+                    )],
+                    LogicalType::Integer,
+                )]
+            })
+            .collect();
+        let plan = OwnedLogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                50,
+                rows,
+                vec!["value".into()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let lowered = ExternalRoutineLoweringPass::lower(plan, &ctx).unwrap();
+        let LogicalOperator::Projection(projection) = &lowered.plan.operator else {
+            panic!("projection")
+        };
+        assert_eq!(projection.table_index, 50);
+        let LogicalOperator::ExternalProject(project) = &projection.child.operator else {
+            panic!("external boundary")
+        };
+        assert_eq!(project.expressions.len(), 1);
+        let LogicalOperator::ExpressionGet(values) = &project.child.operator else {
+            panic!("ordinal source")
+        };
+        assert_eq!(values.expressions.len(), 1025);
+        fn depth(expression: &Expression) -> usize {
+            if let Expression::Case(case) = expression {
+                1 + depth(&case.result_if_true).max(depth(&case.result_if_false))
+            } else {
+                0
+            }
+        }
+        assert_eq!(depth(&project.expressions[0].expression), 11);
     }
 
     fn expression_get(bind_context: &BindContext, table_index: usize) -> OwnedLogicalPlan {

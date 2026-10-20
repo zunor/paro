@@ -1,0 +1,139 @@
+CREATE FUNCTION py_healthy(a INTEGER) RETURNS INTEGER LANGUAGE python
+AS $$
+return a + 1
+$$;
+CREATE FUNCTION
+
+CREATE FUNCTION py_bad_short(a INTEGER) RETURNS INTEGER LANGUAGE python MODE VECTOR
+AS $$
+return a.slice(0, 0)
+$$;
+CREATE FUNCTION
+
+SELECT py_bad_short(1);
+ERROR: output row count mismatch (SQLSTATE=39001)
+
+SELECT py_healthy(41) AS recovered;
+recovered
+42
+
+DROP FUNCTION py_bad_short(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_bad_wide(a INTEGER) RETURNS INTEGER LANGUAGE python MODE VECTOR
+AS $$
+import pyarrow as pa
+return a.cast(pa.int64())
+$$;
+CREATE FUNCTION
+
+SELECT py_bad_wide(1);
+ERROR: vector result must be an Arrow array of the declared type (SQLSTATE=39001)
+
+SELECT py_healthy(41) AS recovered;
+recovered
+42
+
+DROP FUNCTION py_bad_wide(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_bad_list(a INTEGER) RETURNS INTEGER LANGUAGE python MODE VECTOR
+AS $$
+return a.to_pylist()
+$$;
+CREATE FUNCTION
+
+SELECT py_bad_list(1);
+ERROR: vector result must be an Arrow array of the declared type (SQLSTATE=39001)
+
+SELECT py_healthy(41) AS recovered;
+recovered
+42
+
+DROP FUNCTION py_bad_list(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_bad_overflow(a INTEGER) RETURNS TINYINT LANGUAGE python
+AS $$
+return 128
+$$;
+CREATE FUNCTION
+
+SELECT py_bad_overflow(1);
+ERROR: scalar result cannot be converted to int8 (SQLSTATE=39001)
+
+SELECT py_healthy(41) AS recovered;
+recovered
+42
+
+DROP FUNCTION py_bad_overflow(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_bad_columns(a INTEGER) RETURNS TABLE (value INTEGER) LANGUAGE python
+AS $$
+import pyarrow as pa
+return pa.RecordBatch.from_arrays([a], names=["wrong"])
+$$;
+CREATE FUNCTION
+
+SELECT * FROM py_bad_columns(1);
+ERROR: table result schema mismatch (SQLSTATE=39001)
+
+SELECT py_healthy(41) AS recovered;
+recovered
+42
+
+DROP FUNCTION py_bad_columns(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_bad_table(a INTEGER) RETURNS TABLE (value INTEGER) LANGUAGE python
+AS $$
+return a
+$$;
+CREATE FUNCTION
+
+SELECT * FROM py_bad_table(1);
+ERROR: table handler must return RecordBatch or Table (SQLSTATE=39001)
+
+SELECT py_healthy(41) AS recovered;
+recovered
+42
+
+DROP FUNCTION py_bad_table(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_bad_bytes(a INTEGER) RETURNS VARCHAR LANGUAGE python
+AS $$
+return "x" * (16 * 1024 * 1024 + 1)
+$$;
+CREATE FUNCTION
+
+SELECT py_bad_bytes(1);
+ERROR: handler result too large (SQLSTATE=39001)
+
+SELECT py_healthy(41) AS recovered;
+recovered
+42
+
+DROP FUNCTION py_bad_bytes(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_bad_rows(a INTEGER) RETURNS TABLE (value INTEGER) LANGUAGE python
+AS $$
+import pyarrow as pa
+return pa.RecordBatch.from_arrays([pa.array([1] * 65537, type=pa.int32())], names=["value"])
+$$;
+CREATE FUNCTION
+
+SELECT * FROM py_bad_rows(1);
+ERROR: handler result too large (SQLSTATE=39001)
+
+SELECT py_healthy(41) AS recovered;
+recovered
+42
+
+DROP FUNCTION py_bad_rows(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION py_healthy(INTEGER);
+DROP FUNCTION
