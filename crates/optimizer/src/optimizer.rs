@@ -451,8 +451,10 @@ impl Optimizer {
             1,
             WorkKind::RegionPlanning,
             regions_us,
-            region_work.transitions + join_work.transitions,
-            region_work.budget_fallbacks + join_work.budget_fallbacks,
+            region_work.transitions + join_work.transitions + regions.graphs.transitions,
+            region_work.budget_fallbacks
+                + join_work.budget_fallbacks
+                + regions.graphs.budget_fallbacks,
         );
 
         let physical_started = Instant::now();

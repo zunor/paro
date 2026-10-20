@@ -379,9 +379,7 @@ mod tests {
     };
     use paro_common::types::LogicalType;
     use paro_parser::ast::EdgeDirection;
-    use paro_planner::binder::bind::graph::{
-        BoundEdgeVariable, BoundPatternElement, BoundVertexVariable,
-    };
+    use paro_planner::binder::bind::graph::{BoundEdgeVariable, BoundVertexVariable};
     use paro_planner::binder::ir::{BoundGraphColumn, BoundGraphPattern};
     use paro_planner::expression::{
         ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
@@ -459,7 +457,8 @@ mod tests {
     }
 
     fn make_graph_match(
-        elements: Vec<BoundPatternElement>,
+        vertices: Vec<BoundVertexVariable>,
+        edges: Vec<BoundEdgeVariable>,
         columns: Vec<BoundGraphColumn>,
         table_index: usize,
     ) -> LogicalOperator {
@@ -475,7 +474,11 @@ mod tests {
                 "test".to_string(),
                 paro_catalog::entry::CatalogObjectId::from_raw(10_001),
             )),
-            BoundGraphPattern { elements },
+            BoundGraphPattern {
+                vertices,
+                edges,
+                filter: None,
+            },
             columns,
             table_index,
             "graph_table".to_string(),
@@ -491,11 +494,8 @@ mod tests {
         let e_k = make_edge("k", "Knows", 11, EdgeDirection::Right, "a", "b");
         let v_b = make_vertex("b", "Person", 12);
 
-        let elements = vec![
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k),
-            BoundPatternElement::Vertex(v_b),
-        ];
+        let vertices = vec![v_a, v_b];
+        let edges = vec![e_k];
         // COLUMNS: a.name (col 1), a.age (col 2), b.name (col 1), k.weight (col 0)
         let columns = vec![
             make_column(10, 1, LogicalType::Varchar), // a.name → output col 0
@@ -503,7 +503,7 @@ mod tests {
             make_column(12, 1, LogicalType::Varchar), // b.name → output col 2
             make_column(11, 0, LogicalType::Float),   // k.weight → output col 3
         ];
-        let plan = make_graph_match(elements, columns, 100);
+        let plan = make_graph_match(vertices, edges, columns, 100);
 
         // Decompose
         let mut decompose = GraphMatchDecompose::new();
@@ -757,18 +757,15 @@ mod tests {
         let e_k = make_edge("k", "Knows", 11, EdgeDirection::Right, "a", "b");
         let v_b = make_vertex("b", "Person", 12);
 
-        let elements = vec![
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k),
-            BoundPatternElement::Vertex(v_b),
-        ];
+        let vertices = vec![v_a, v_b];
+        let edges = vec![e_k];
         let columns = vec![
             make_column(10, 1, LogicalType::Varchar),
             make_column(10, 2, LogicalType::Integer),
             make_column(12, 1, LogicalType::Varchar),
             make_column(11, 0, LogicalType::Float),
         ];
-        let plan = make_graph_match(elements, columns, 100);
+        let plan = make_graph_match(vertices, edges, columns, 100);
         let mut decompose = GraphMatchDecompose::new();
         let decomposed = decompose.optimize(plan);
 
@@ -814,13 +811,10 @@ mod tests {
         let e_k = make_edge("k", "Knows", 11, EdgeDirection::Right, "a", "b");
         let v_b = make_vertex("b", "Person", 12);
 
-        let elements = vec![
-            BoundPatternElement::Vertex(v_a),
-            BoundPatternElement::Edge(e_k),
-            BoundPatternElement::Vertex(v_b),
-        ];
+        let vertices = vec![v_a, v_b];
+        let edges = vec![e_k];
         let columns = vec![make_column(10, 1, LogicalType::Varchar)];
-        let plan = make_graph_match(elements, columns, 100);
+        let plan = make_graph_match(vertices, edges, columns, 100);
         let mut decompose = GraphMatchDecompose::new();
         let decomposed = decompose.optimize(plan);
 

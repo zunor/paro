@@ -95,10 +95,9 @@ fn graph_match_clause(i: Input) -> IResult<GraphMatchClause> {
     .parse(i)
 }
 
-// MVP: single path only; AST supports Vec<PathPattern> for future multi-path extension.
 fn graph_pattern(i: Input) -> IResult<GraphPattern> {
-    map(rule! { #path_pattern }, |path| GraphPattern {
-        paths: vec![path],
+    map(rule! { #comma_separated_list1(path_pattern) }, |paths| {
+        GraphPattern { paths }
     })
     .parse(i)
 }

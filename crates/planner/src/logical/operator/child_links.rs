@@ -113,7 +113,7 @@ child_links!(Filter {
 child_links!(GraphExpand {
     required [child]
     optional []
-    payload [edge_info, direction, source_label, edge_filter, target_filter, quantifier, path_mode, source_table_index, edge_table_index, target_table_index, output_table_index, target_label, source_table_oid, target_table_oid, target_table_name, has_path_functions]
+    payload [edge_info, direction, source_label, edge_filter, target_filter, quantifier, path_mode, source_table_index, edge_table_index, target_table_index, target_is_bound, output_table_index, target_label, source_table_oid, target_table_oid, target_table_name, has_path_functions]
 });
 
 child_links!(Insert {

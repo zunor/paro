@@ -4,6 +4,7 @@
 //! Bounded relational regions and joint join/aggregate decisions.
 
 pub(crate) mod aggregate;
+mod graph;
 pub mod join;
 pub(crate) mod limits;
 

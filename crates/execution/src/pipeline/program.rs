@@ -1241,6 +1241,7 @@ mod tests {
             target_label: "Person".to_string(),
             source_local_col_idx: 0,
             source_rowid_col_idx: 1,
+            target_local_col_idx: None,
             min_hops: 1,
             max_hops: 1,
             source_table_oid: 1,

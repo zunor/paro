@@ -7,7 +7,9 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::identity::GraphId;
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, VectorSelection, VECTOR_SIZE};
+use paro_common::vector::{
+    SelectionVector, ValidatedVectorSelection, Vector, VectorSelection, VECTOR_SIZE,
+};
 use paro_planner::logical::operator::graph_expand::ExpandDirection;
 use paro_storage::index::graph::NeighborView;
 
@@ -198,6 +200,7 @@ fn build_graph_expand_output(
         let source_rowid = source_rowid_col
             .map(|column| read_u64_from_vector(column, row_idx, "GraphExpand source rowid"))
             .transpose()?;
+        let first_row = local.rows.len();
         collect_graph_expand_rows_for_source(
             spec,
             global,
@@ -208,6 +211,20 @@ fn build_graph_expand_output(
             visited_len,
             effective_max_hops,
         )?;
+        if let Some(target_col) = spec.target_local_col_idx {
+            let target = input
+                .column(target_col)
+                .ok_or_else(|| paro_error::internal("GraphExpand bound target column missing"))?;
+            let target = read_u32_from_vector(target, row_idx, "GraphExpand bound target")?;
+            let mut write = first_row;
+            for read in first_row..local.rows.len() {
+                if local.rows[read].dst_local == target {
+                    local.rows.swap(write, read);
+                    write += 1;
+                }
+            }
+            local.rows.truncate(write);
+        }
     }
     let row_count = local.rows.len();
     emit_graph_expand_chunks(spec, input, output, local)?;
@@ -475,7 +492,7 @@ fn write_graph_expand_chunk(
 ) -> Result<()> {
     let row_count = rows.len();
     prepare_graph_expand_output(output, output_types, row_count)?;
-    copy_selected_input_columns(
+    gather_selected_input_columns(
         input,
         output,
         rows.iter().map(|row| row.input_row),
@@ -536,7 +553,7 @@ fn prepare_graph_expand_output(
     Ok(())
 }
 
-fn copy_selected_input_columns<I>(
+fn gather_selected_input_columns<I>(
     input: &Chunk,
     output: &mut Chunk,
     input_rows: I,
@@ -565,15 +582,19 @@ where
     for (out_idx, input_row) in input_rows.into_iter().enumerate() {
         selection.try_set(out_idx, input_row)?;
     }
-    let selection = VectorSelection::materialized(selection.clone());
+    let selection = ValidatedVectorSelection::try_new(
+        VectorSelection::materialized(selection.clone()),
+        input.size(),
+    )?;
     for col_idx in 0..input.column_count() {
         let source = input
             .column(col_idx)
             .ok_or_else(|| paro_error::internal("graph input column missing"))?;
-        output
+        let gathered =
+            Vector::try_dictionary_from_validated(Arc::new(source.reference()), selection.clone())?;
+        *output
             .column_mut(col_idx)
-            .ok_or_else(|| paro_error::internal("graph output column missing"))?
-            .try_copy_selection(0, source, &selection, row_count)?;
+            .ok_or_else(|| paro_error::internal("graph output column missing"))? = gathered;
     }
     Ok(())
 }
@@ -653,6 +674,39 @@ mod tests {
         assert_eq!(next_frontier, vec![1]);
     }
 
+    #[test]
+    fn gathered_carriers_survive_input_and_selection_reuse() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let types = [LogicalType::UBigInt];
+        let mut input = Chunk::try_initialize(&types, 3, allocator.clone()).unwrap();
+        for (row, value) in [10, 20, 30].into_iter().enumerate() {
+            input.column_mut(0).unwrap().set_u64(row, value);
+        }
+        input.try_set_cardinality(3).unwrap();
+        let mut output = Chunk::try_initialize(&types, 3, allocator.clone()).unwrap();
+        let mut selection = None;
+        gather_selected_input_columns(&input, &mut output, [2, 0, 2], 3, &mut selection).unwrap();
+        output.try_set_cardinality(3).unwrap();
+        let retained = output.clone();
+        input.try_reset(allocator.clone()).unwrap();
+        input.column_mut(0).unwrap().set_u64(0, 99);
+        input.try_set_cardinality(1).unwrap();
+        gather_selected_input_columns(&input, &mut output, [0, 0, 0], 3, &mut selection).unwrap();
+        for (row, expected) in [30, 10, 30].into_iter().enumerate() {
+            assert_eq!(
+                read_u64_from_vector(retained.column(0).unwrap(), row, "retained").unwrap(),
+                expected
+            );
+            assert_eq!(
+                read_u64_from_vector(output.column(0).unwrap(), row, "new").unwrap(),
+                99
+            );
+        }
+        assert!(
+            gather_selected_input_columns(&input, &mut output, [1], 1, &mut selection).is_err()
+        );
+    }
+
     fn test_expand_spec(min_hops: u64, max_hops: u64) -> GraphExpandSpec {
         GraphExpandSpec {
             graph_name: "g".to_string(),
@@ -680,6 +734,7 @@ mod tests {
             target_label: "Node".to_string(),
             source_local_col_idx: 0,
             source_rowid_col_idx: 1,
+            target_local_col_idx: None,
             min_hops,
             max_hops,
             source_table_oid: 10,

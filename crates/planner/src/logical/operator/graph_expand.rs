@@ -48,6 +48,8 @@ pub struct GraphExpand<Child = Box<OwnedLogicalPlan>> {
     pub edge_table_index: usize,
     /// Table index of the target vertex variable.
     pub target_table_index: usize,
+    /// True when this expansion constrains an existing vertex binding.
+    pub target_is_bound: bool,
     /// Binding namespace for the graph chain's physical carrier columns.
     pub output_table_index: usize,
     /// Target vertex label.
@@ -90,6 +92,7 @@ impl GraphExpand {
             source_table_index,
             edge_table_index,
             target_table_index,
+            target_is_bound: false,
             output_table_index,
             target_label,
             source_table_oid,

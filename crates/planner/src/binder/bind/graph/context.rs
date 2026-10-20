@@ -18,7 +18,8 @@ pub struct GraphBindContext {
     pub graph_entry: Arc<PropertyGraphCatalogEntry>,
     vertex_bindings: HashMap<String, BoundVertexVariable>,
     edge_bindings: HashMap<String, BoundEdgeVariable>,
-    pattern_chain: Vec<BoundPatternElement>,
+    vertex_order: Vec<String>,
+    edge_order: Vec<String>,
     next_anon_id: usize,
 }
 
@@ -46,19 +47,14 @@ pub struct BoundEdgeVariable {
     pub destination_variable: String,
 }
 
-#[derive(Debug, Clone)]
-pub enum BoundPatternElement {
-    Vertex(BoundVertexVariable),
-    Edge(BoundEdgeVariable),
-}
-
 impl GraphBindContext {
     pub fn new(graph_entry: Arc<PropertyGraphCatalogEntry>) -> Self {
         Self {
             graph_entry,
             vertex_bindings: HashMap::new(),
             edge_bindings: HashMap::new(),
-            pattern_chain: Vec::new(),
+            vertex_order: Vec::new(),
+            edge_order: Vec::new(),
             next_anon_id: 0,
         }
     }
@@ -70,6 +66,34 @@ impl GraphBindContext {
     ) -> Result<BoundVertexVariable> {
         let variable_name =
             self.next_variable_name(vertex.variable.as_ref().map(|v| v.name.as_str()), "v");
+        if let Some(existing) = self.vertex_bindings.get(&variable_name).cloned() {
+            if let Some(label) = &vertex.label {
+                let info = self.resolve_vertex_table(Some(&label.name))?;
+                if info.table_oid != existing.vertex_table_info.table_oid {
+                    return Err(paro_error::catalog(format!(
+                        "Conflicting labels for graph vertex \"{}\"",
+                        variable_name
+                    )));
+                }
+            }
+            let mut bound = existing;
+            if let Some(predicate) = &vertex.where_clause {
+                let predicate =
+                    crate::binder::bind::expr::bind_expression(binder, (**predicate).clone())?;
+                bound.filter = Some(match bound.filter {
+                    Some(previous) => crate::expression::Expression::Conjunction(
+                        crate::expression::ConjunctionExpression::new(
+                            crate::expression::ConjunctionType::And,
+                            vec![previous, predicate],
+                        )
+                        .into(),
+                    ),
+                    None => predicate,
+                });
+            }
+            self.vertex_bindings.insert(variable_name, bound.clone());
+            return Ok(bound);
+        }
         self.ensure_variable_free(&variable_name)?;
 
         let vertex_table_info =
@@ -113,8 +137,7 @@ impl GraphBindContext {
         };
         self.vertex_bindings
             .insert(variable_name.clone(), bound.clone());
-        self.pattern_chain
-            .push(BoundPatternElement::Vertex(bound.clone()));
+        self.vertex_order.push(bound.variable_name.clone());
         Ok(bound)
     }
 
@@ -194,9 +217,35 @@ impl GraphBindContext {
         };
         self.edge_bindings
             .insert(variable_name.clone(), bound.clone());
-        self.pattern_chain
-            .push(BoundPatternElement::Edge(bound.clone()));
+        self.edge_order.push(bound.variable_name.clone());
         Ok(bound)
+    }
+
+    pub fn validate_connected(&self) -> Result<()> {
+        let Some(first) = self.vertex_order.first().cloned() else {
+            return Err(paro_error::catalog("Empty graph pattern"));
+        };
+        let mut reached = std::collections::HashSet::from([first]);
+        loop {
+            let before = reached.len();
+            for edge in self.edge_bindings.values() {
+                if reached.contains(&edge.source_variable)
+                    || reached.contains(&edge.destination_variable)
+                {
+                    reached.insert(edge.source_variable.clone());
+                    reached.insert(edge.destination_variable.clone());
+                }
+            }
+            if reached.len() == before {
+                break;
+            }
+        }
+        if reached.len() != self.vertex_bindings.len() {
+            return Err(paro_error::not_implemented(
+                "Disconnected GRAPH_TABLE patterns",
+            ));
+        }
+        Ok(())
     }
 
     pub fn bind_columns(&self, columns: &[GraphColumnDef]) -> Result<Vec<ColumnBinding>> {
@@ -221,24 +270,55 @@ impl GraphBindContext {
         }
     }
 
-    /// Swap the last two elements in the pattern chain.
-    ///
-    /// Used by `bind_graph_table` to fix ordering: `bind_vertex` must be called
-    /// before `bind_edge` (so the variable is registered), but the chain needs
-    /// `[..., Edge, Vertex]` order for the decomposer.
-    pub fn swap_last_two_elements(&mut self) {
-        let len = self.pattern_chain.len();
-        if len >= 2 {
-            self.pattern_chain.swap(len - 2, len - 1);
+    pub fn edge_count(&self) -> usize {
+        self.edge_order.len()
+    }
+
+    pub fn into_pattern(
+        mut self,
+        filter: Option<Expression>,
+    ) -> crate::binder::ir::BoundGraphPattern {
+        use crate::expression::{
+            ConjunctionExpression, ConjunctionType, ExpressionIterator, ExpressionVisitDecision,
+        };
+        let mut predicates = filter.into_iter().collect::<Vec<_>>();
+        let vertices = self
+            .vertex_order
+            .iter()
+            .map(|name| {
+                let mut vertex = self.vertex_bindings.remove(name).unwrap();
+                if let Some(predicate) = &vertex.filter {
+                    let mut local = true;
+                    ExpressionIterator::visit(predicate, &mut |expression| {
+                        if let Expression::ColumnRef(column) = expression {
+                            local &= column.depth == 0
+                                && column.binding.table_index == vertex.table_index;
+                        }
+                        ExpressionVisitDecision::Descend
+                    });
+                    if !local {
+                        predicates.push(vertex.filter.take().unwrap());
+                    }
+                }
+                vertex
+            })
+            .collect();
+        let filter = match predicates.len() {
+            0 => None,
+            1 => predicates.pop(),
+            _ => Some(Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::And, predicates).into(),
+            )),
+        };
+        crate::binder::ir::BoundGraphPattern {
+            vertices,
+            edges: self
+                .edge_order
+                .iter()
+                .map(|name| self.edge_bindings.remove(name).unwrap())
+                .collect(),
+            filter,
         }
-    }
-
-    pub fn pattern_chain(&self) -> &[BoundPatternElement] {
-        &self.pattern_chain
-    }
-
-    pub fn into_pattern_chain(self) -> Vec<BoundPatternElement> {
-        self.pattern_chain
     }
 
     fn resolve_vertex_table(&self, label: Option<&str>) -> Result<VertexTableInfo> {

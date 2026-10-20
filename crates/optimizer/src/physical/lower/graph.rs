@@ -65,6 +65,11 @@ impl PhysicalPlanBuilder {
             .local_id_cols
             .get(&expand.target_table_index)
             .copied();
+        if expand.target_is_bound != target_local_col_idx.is_some() {
+            return Err(paro_error::internal(
+                "GraphExpand target binding disagrees with child layout",
+            ));
+        }
         let (output_names, output_types) =
             graph_expand_output_row_type(child_output, expand.has_path_functions);
 
@@ -114,6 +119,7 @@ impl PhysicalPlanBuilder {
             target_label: expand.target_label.clone(),
             source_local_col_idx,
             source_rowid_col_idx,
+            target_local_col_idx,
             min_hops,
             max_hops,
             source_table_oid: expand.source_table_oid,

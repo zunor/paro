@@ -72,16 +72,16 @@ PROJECTION  (rows=4)
         Filter: <pushed down>
         ->  GRAPH_EXPAND  (rows=4)
               Graph: start_graph
-              Edge Label: locatedin
-              Direction: forward
-              ->  GRAPH_EXPAND  (rows=4)
+              Edge Label: worksat
+              Direction: backward
+              ->  GRAPH_EXPAND  (rows=2)
                     Graph: start_graph
-                    Edge Label: worksat
+                    Edge Label: locatedin
                     Direction: forward
-                    ->  GRAPH_SCAN  (rows=4)
+                    ->  GRAPH_SCAN  (rows=2)
                           Graph: start_graph
-                          Vertex Label: person
-                          Table: ssp_person
+                          Vertex Label: company
+                          Table: ssp_company
 
 SELECT * FROM GRAPH_TABLE(start_graph
     MATCH (p:Person)-[w:WorksAt]->(c:Company WHERE c.name = 'Acme')-[l:LocatedIn]->(city:City)

@@ -29,3 +29,15 @@ fn test_graph_statements() {
 
     write_statement_cases("graph.txt", cases);
 }
+
+#[test]
+fn graph_table_multiple_paths_round_trip() {
+    let sql = "SELECT count(*) FROM GRAPH_TABLE(g MATCH (a:node), (a)-[e:link]->(b:node), (b)-[f:link]->(a) WHERE a.id <> b.id COLUMNS (a.id AS id))";
+    let statement = paro_parser::parse_one(sql).unwrap();
+    let formatted = statement.to_string();
+    assert!(formatted.contains(", "));
+    assert_eq!(
+        paro_parser::parse_one(&formatted).unwrap().to_string(),
+        formatted
+    );
+}

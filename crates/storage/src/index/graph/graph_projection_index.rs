@@ -9,7 +9,7 @@ use paro_common::error::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -292,7 +292,7 @@ impl GraphProjectionIndex {
         for (idx, (label, map)) in vertex_items.iter().enumerate() {
             let file_name = format!("vertex_{}.vmap", idx);
             let path = dir.join(&file_name);
-            let mut file = File::create(&path)?;
+            let mut file = BufWriter::new(File::create(&path)?);
             map.serialize(&mut file)?;
             file.flush()?;
             vertices_meta.push(VertexFileMeta {
@@ -312,14 +312,14 @@ impl GraphProjectionIndex {
 
             let forward_file = format!("edge_{}.fwd", idx);
             let forward_path = dir.join(&forward_file);
-            let mut forward_writer = File::create(&forward_path)?;
+            let mut forward_writer = BufWriter::new(File::create(&forward_path)?);
             forward.serialize(&mut forward_writer)?;
             forward_writer.flush()?;
 
             let backward_file = if let Some(backward) = self.backward_adjacency.get(*label) {
                 let file_name = format!("edge_{}.bwd", idx);
                 let path = dir.join(&file_name);
-                let mut backward_writer = File::create(&path)?;
+                let mut backward_writer = BufWriter::new(File::create(&path)?);
                 backward.serialize(&mut backward_writer)?;
                 backward_writer.flush()?;
                 Some(file_name)
@@ -381,13 +381,13 @@ impl GraphProjectionIndex {
                 )));
             }
             let path = dir.join(&vertex_meta.file);
-            let mut file = File::open(&path).map_err(|e| {
+            let file = File::open(&path).map_err(|e| {
                 paro_error::io_error(format!(
                     "GraphProjectionIndex: failed to open vertex map {:?}: {}",
                     path, e
                 ))
             })?;
-            let map = VertexIdMap::deserialize(&mut file)?;
+            let map = VertexIdMap::deserialize(&mut BufReader::new(file))?;
             vertex_maps.insert(vertex_meta.label.clone(), map);
         }
 
@@ -517,7 +517,7 @@ impl GraphProjectionIndex {
 
 fn load_csr_with_mmap_fallback(path: &Path) -> Result<AdjacencyCSR> {
     AdjacencyCSR::load_mmap(path).or_else(|_| {
-        let mut reader = File::open(path)?;
+        let mut reader = BufReader::new(File::open(path)?);
         AdjacencyCSR::deserialize(&mut reader)
     })
 }

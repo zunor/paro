@@ -5,6 +5,7 @@
 
 pub mod access;
 pub mod calibration;
+pub(crate) mod graph;
 pub(crate) mod join;
 pub(crate) mod join_layout;
 pub(crate) mod materialization;

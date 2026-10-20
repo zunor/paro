@@ -19,6 +19,7 @@ pub(crate) struct PlannedRegions {
     pub relation: AnnotatedRelation,
     pub aggregates: aggregate_region::Work,
     pub joins: aggregate_region::Work,
+    pub graphs: super::graph::Work,
 }
 
 pub(crate) fn plan(
@@ -29,6 +30,8 @@ pub(crate) fn plan(
     calibration: &MachineCalibrationBundle,
     limits: &RegionLimits,
 ) -> Result<PlannedRegions> {
+    let mut graph_work = super::graph::Work::default();
+    plan = super::graph::optimize(plan, ctx, limits, &mut graph_work)?;
     // Each aggregate region has a bounded grain domain: original SQL
     // grain, or a proven partial-state/merge decomposition. Join DP runs
     // inside each legal state before comparing it; neither state's cost
@@ -101,5 +104,6 @@ pub(crate) fn plan(
         relation: candidate,
         aggregates: region_work,
         joins: join_work,
+        graphs: graph_work,
     })
 }

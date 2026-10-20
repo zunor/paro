@@ -797,6 +797,7 @@ impl LogicalPlanDeepCopy {
                     source_table_index,
                     edge_table_index,
                     target_table_index,
+                    target_is_bound: ge.target_is_bound,
                     output_table_index,
                     target_label: ge.target_label.clone(),
                     source_table_oid: ge.source_table_oid,

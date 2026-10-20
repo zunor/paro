@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::binder::bind::graph::BoundPatternElement;
+use crate::binder::bind::graph::{BoundEdgeVariable, BoundVertexVariable};
 use crate::binder::CorrelatedColumnInfo;
 use crate::expression::Expression;
 use paro_catalog::entry::{PropertyGraphCatalogEntry, TableCatalogEntry};
@@ -59,7 +59,9 @@ pub struct BoundFromGraphTable {
 
 #[derive(Debug, Clone)]
 pub struct BoundGraphPattern {
-    pub elements: Vec<BoundPatternElement>,
+    pub vertices: Vec<BoundVertexVariable>,
+    pub edges: Vec<BoundEdgeVariable>,
+    pub filter: Option<Expression>,
 }
 
 #[derive(Debug, Clone)]

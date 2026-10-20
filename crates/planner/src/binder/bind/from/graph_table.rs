@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::binder::bind::expr::bind_expression;
-use crate::binder::bind::graph::{BoundPatternElement, GraphBindContext};
-use crate::binder::ir::{BoundFromGraphTable, BoundFromItem, BoundGraphColumn, BoundGraphPattern};
+use crate::binder::bind::graph::GraphBindContext;
+use crate::binder::ir::{BoundFromGraphTable, BoundFromItem, BoundGraphColumn};
 use crate::binder::Binder;
 use crate::expression::{ColumnRefExpression, Expression};
 use crate::logical::operator::ColumnBinding;
@@ -78,21 +78,20 @@ pub fn bind_graph_table(
                     };
                     idx += 1;
 
-                    let bound_edge = graph_ctx.bind_edge(
+                    graph_ctx.bind_edge(
                         binder,
                         edge,
                         &current_vertex_var,
                         &next_vertex.variable_name,
                     )?;
-                    let _ = bound_edge;
-                    graph_ctx.swap_last_two_elements();
                     current_vertex_var = next_vertex.variable_name;
                 }
             }
 
-            if let Some(match_where) = &graph_table_ref.match_clause.where_clause {
-                let _ = bind_expression(binder, (**match_where).clone())?;
-            }
+            graph_ctx.validate_connected()?;
+
+            let match_filter = graph_table_ref.match_clause.where_clause.as_ref()
+                .map(|expr| bind_expression(binder, (**expr).clone())).transpose()?;
 
             graph_ctx.bind_columns(&graph_table_ref.columns)?;
 
@@ -106,16 +105,22 @@ pub fn bind_graph_table(
                 .iter()
                 .any(|col| is_path_function_call(&col.expr, &path_variable));
 
-            let num_edges = graph_ctx
-                .pattern_chain()
-                .iter()
-                .filter(|e| {
-                    matches!(
-                        e,
-                        BoundPatternElement::Edge(_)
-                    )
+            let has_quantifier = graph_table_ref.match_clause.pattern.paths.iter().any(|path| {
+                path.elements.iter().any(|element| {
+                    matches!(element, PatternElement::Edge(edge) if edge.quantifier.is_some())
                 })
-                .count();
+            });
+            let requires_path_order = has_path_functions
+                || path_variable.is_some()
+                || graph_table_ref.match_clause.path_mode.is_some()
+                || has_quantifier;
+            if graph_table_ref.match_clause.pattern.paths.len() > 1 && requires_path_order {
+                return Err(paro_error::not_implemented(
+                    "Path bindings, modes and quantifiers require one GRAPH_TABLE path",
+                ));
+            }
+
+            let num_edges = graph_ctx.edge_count();
             let expand_chain_cols = 2 + 3 * num_edges;
             let path_length_col_idx = has_path_functions.then_some(expand_chain_cols);
 
@@ -201,9 +206,7 @@ pub fn bind_graph_table(
             }
 
             Ok((
-                BoundGraphPattern {
-                    elements: graph_ctx.into_pattern_chain(),
-                },
+                graph_ctx.into_pattern(match_filter),
                 bound_columns,
                 output_names,
                 output_types,
