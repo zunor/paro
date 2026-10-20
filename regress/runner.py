@@ -93,6 +93,7 @@ class RunnerConfig:
     report_dir: Path
     runtime_profiles: Mapping[str, RuntimeProfile]
     managed_runtime_env: tuple[str, ...]
+    exclude_pattern: str | None = None
     optimizer_verify: bool | None = None
 
     @property
@@ -242,6 +243,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="filter_pattern",
         help="Substring filter for case path",
     )
+    parser.add_argument("--exclude", dest="exclude_pattern", help="Exclude case paths containing this substring")
     parser.add_argument("--jobs", type=int, help="Worker count (M1 runs serially)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument(
@@ -348,6 +350,7 @@ def resolve_config(
         jobs=jobs,
         verbose=bool(args.verbose),
         filter_pattern=args.filter_pattern,
+        exclude_pattern=getattr(args, "exclude_pattern", None),
         config_path=config_path,
         root_dir=root,
         report_dir=report_dir,
@@ -418,7 +421,9 @@ def _resolve_runtime_profile_value(value: str, *, config_dir: Path) -> str:
     return value
 
 
-def discover_case_files(cases_dir: Path, filter_pattern: str | None = None) -> list[Path]:
+def discover_case_files(
+    cases_dir: Path, filter_pattern: str | None = None, exclude_pattern: str | None = None
+) -> list[Path]:
     if not cases_dir.exists():
         raise RunnerError(f"cases directory does not exist: {cases_dir}")
 
@@ -429,6 +434,9 @@ def discover_case_files(cases_dir: Path, filter_pattern: str | None = None) -> l
 
     if filter_pattern:
         files = [path for path in files if filter_pattern in path.as_posix()]
+
+    if exclude_pattern:
+        files = [path for path in files if exclude_pattern not in path.as_posix()]
 
     return files
 
@@ -699,7 +707,9 @@ def main(argv: list[str] | None = None) -> int:
         if config.jobs != 1:
             _print_warning("--jobs > 1 is reserved for M2; running serially in current implementation")
 
-        case_files = discover_case_files(config.cases_dir, filter_pattern=config.filter_pattern)
+        case_files = discover_case_files(
+            config.cases_dir, filter_pattern=config.filter_pattern, exclude_pattern=config.exclude_pattern
+        )
         print(f"Running {len(case_files)} test cases...")
 
         reporter = Reporter(config)

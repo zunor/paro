@@ -1,0 +1,56 @@
+CREATE FUNCTION py_rel(a INTEGER) RETURNS INTEGER LANGUAGE python STRICT
+AS $$
+return a + 2
+$$;
+CREATE FUNCTION
+
+CREATE TABLE py_rel_data(id INTEGER, value INTEGER);
+CREATE TABLE
+
+INSERT INTO py_rel_data VALUES (1, 4), (2, 9), (3, NULL), (4, 4);
+INSERT 0 4
+
+SELECT id, py_rel(value) AS value FROM py_rel_data WHERE py_rel(value) > 6 ORDER BY py_rel(value), id;
+id	value
+2	11
+
+SELECT l.id AS id, r.tag AS tag FROM py_rel_data l LEFT JOIN (VALUES (6, 'six'), (11, 'eleven')) r(k, tag) ON py_rel(l.value) = r.k ORDER BY l.id;
+id	tag
+1	six
+2	eleven
+3	NULL
+4	six
+
+SELECT py_rel(value) AS bucket, count(*) AS n, sum(py_rel(value)) AS total FROM py_rel_data GROUP BY py_rel(value) HAVING count(*) > 1 ORDER BY bucket;
+bucket	n	total
+6	2	12
+
+SELECT id, row_number() OVER (ORDER BY py_rel(value) NULLS LAST, id) AS rank FROM py_rel_data ORDER BY id;
+id	rank
+1	1
+2	3
+3	4
+4	2
+
+WITH transformed AS (SELECT id, py_rel(value) AS value FROM py_rel_data) SELECT id, py_rel(value) AS value FROM transformed ORDER BY id;
+id	value
+1	8
+2	13
+3	NULL
+4	8
+
+SELECT py_rel((SELECT max(value) FROM py_rel_data)) AS value;
+value
+11
+
+SELECT DISTINCT py_rel(value) AS value FROM py_rel_data ORDER BY value NULLS LAST;
+value
+6
+11
+NULL
+
+DROP TABLE py_rel_data;
+DROP TABLE
+
+DROP FUNCTION py_rel(INTEGER);
+DROP FUNCTION

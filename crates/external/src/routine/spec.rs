@@ -150,7 +150,10 @@ pub struct PythonImplementationRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PythonEntrypointRef {
-    Batch {
+    Scalar {
+        handler: String,
+    },
+    Vector {
         handler: String,
     },
     Aggregate {

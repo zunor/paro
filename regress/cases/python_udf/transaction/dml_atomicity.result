@@ -1,0 +1,99 @@
+CREATE FUNCTION py_write(a INTEGER) RETURNS INTEGER LANGUAGE python STRICT
+AS $$
+if a == 3000:
+    raise ValueError("rejected write")
+return a + 10
+$$;
+CREATE FUNCTION
+
+CREATE TABLE py_write_data(id INTEGER, value INTEGER);
+CREATE TABLE
+
+CREATE TABLE py_write_copy(id INTEGER, value INTEGER);
+CREATE TABLE
+
+INSERT INTO py_write_copy SELECT 1, 2 UNION ALL SELECT 3, 4;
+INSERT 0 2
+
+DELETE FROM py_write_copy;
+DELETE 2
+
+INSERT INTO py_write_data VALUES (1, py_write(2)), (2, py_write(NULL));
+INSERT 0 2
+
+UPDATE py_write_data SET value = py_write(value) WHERE id = 1;
+UPDATE 1
+
+SELECT id AS id, value AS value FROM py_write_data ORDER BY id;
+id	value
+1	22
+2	NULL
+
+DELETE FROM py_write_data WHERE py_write(value) > 30;
+DELETE 1
+
+SELECT id AS id, value AS value FROM py_write_data ORDER BY id;
+id	value
+2	NULL
+
+DELETE FROM py_write_data;
+DELETE 1
+
+INSERT INTO py_write_data SELECT i::INTEGER, i::INTEGER FROM generate_series(1, 4097) t(i);
+INSERT 0 4097
+
+UPDATE py_write_data SET value = py_write(value);
+ERROR: ValueError: rejected write (SQLSTATE=38001)
+
+SELECT count(*) AS rows, sum(value) AS total FROM py_write_data;
+rows	total
+4097	8394753
+
+SELECT count(*) AS rows FROM py_write_copy;
+rows
+0
+
+INSERT INTO py_write_copy SELECT id, py_write(value) FROM py_write_data;
+ERROR: ValueError: rejected write (SQLSTATE=38001)
+
+SELECT count(*) AS rows, sum(value) AS total FROM py_write_data;
+rows	total
+4097	8394753
+
+SELECT count(*) AS rows FROM py_write_copy;
+rows
+0
+
+DELETE FROM py_write_data WHERE py_write(value) > 0;
+ERROR: ValueError: rejected write (SQLSTATE=38001)
+
+SELECT count(*) AS rows, sum(value) AS total FROM py_write_data;
+rows	total
+4097	8394753
+
+SELECT count(*) AS rows FROM py_write_copy;
+rows
+0
+
+BEGIN;
+BEGIN
+
+UPDATE py_write_data SET value = py_write(value) WHERE id < 3;
+UPDATE 2
+
+ROLLBACK;
+ROLLBACK
+
+SELECT id, value FROM py_write_data WHERE id < 3 ORDER BY id;
+id	value
+1	1
+2	2
+
+DROP TABLE py_write_copy;
+DROP TABLE
+
+DROP TABLE py_write_data;
+DROP TABLE
+
+DROP FUNCTION py_write(INTEGER);
+DROP FUNCTION

@@ -8,7 +8,7 @@ DROP FUNCTION IF EXISTS py_explain(INTEGER);
 CREATE FUNCTION py_explain(a INTEGER) RETURNS INTEGER
 LANGUAGE python
 IMMUTABLE
-AS $$return [value + 3 for value in a.materialize_py()]$$;
+AS $$return a + 3$$;
 
 -- @normalize explain_routine_ids
 EXPLAIN

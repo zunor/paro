@@ -15,14 +15,16 @@ SELECT py_fail(1);
 
 CREATE FUNCTION py_bad_contract(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return ["oops" for _ in a.materialize_py()]$$;
+AS $$return "oops"$$;
 
 SELECT py_bad_contract(1);
 
 CREATE FUNCTION py_missing_import(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-IMPORTS ('/tmp/paro/python_udf/does_not_exist.py')
-AS $$return [value for value in a.materialize_py()]$$;
+AS $$
+import paro_nonexistent_test_dependency
+return a
+$$;
 
 SELECT py_missing_import(1);
 

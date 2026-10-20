@@ -143,7 +143,9 @@ performance numbers or mutable experiment status into this guide.
 The current Rust boundary is `paro-external` (`abi`, `routine`, `runtime`,
 `source`), not separate external-ABI/runtime/routine crates. The worker is in
 [runtimes/python-worker](runtimes/python-worker/README.md) and the SDK in
-[python/paro_udf](python/paro_udf/README.md). Ordinary SQL must remain usable
+[python/paro_udf](python/paro_udf/README.md). The local Flight service requires
+Python >=3.11 and PyArrow >=18; SQL values use Arrow IPC rather than JSON.
+Ordinary SQL must remain usable
 without Python; `python-udf-startup-smoke` exercises the disabled-runtime path.
 Use `python-udf-unit`, `python-udf-regress` and `python-udf-ci` only for the
 relevant validation scope and inspect their current Make recipes first.

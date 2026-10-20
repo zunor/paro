@@ -95,7 +95,7 @@ child_links!(Explain {
 child_links!(LogicalExternalProject {
     required [child]
     optional []
-    payload [project_index, expressions, output_names, returned_types, cost]
+    payload [project_index, expressions, cost]
 });
 
 child_links!(LogicalExternalTable {

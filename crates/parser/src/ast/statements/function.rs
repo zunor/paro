@@ -126,6 +126,7 @@ pub struct CreateFunctionStmt {
     pub strict: bool,
     pub security: FunctionSecurity,
     pub handler: Option<String>,
+    pub vectorized: bool,
     pub packages: Vec<String>,
     pub imports: Vec<String>,
     pub rows: Option<u64>,
@@ -147,6 +148,9 @@ impl Display for CreateFunctionStmt {
         write_comma_separated_list(f, &self.arguments)?;
         write!(f, ") RETURNS {}", self.return_type)?;
         write!(f, " LANGUAGE {}", self.language)?;
+        if self.vectorized {
+            write!(f, " MODE VECTOR")?;
+        }
         if let Some(volatility) = &self.volatility {
             write!(f, " {volatility}")?;
         }

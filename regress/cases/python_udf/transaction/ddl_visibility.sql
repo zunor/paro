@@ -9,7 +9,7 @@ BEGIN;
 
 CREATE FUNCTION py_tx(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return [value + 1 for value in a.materialize_py()]$$;
+AS $$return a + 1$$;
 
 SELECT py_tx(1);
 
@@ -21,7 +21,7 @@ BEGIN;
 
 CREATE FUNCTION py_tx(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return [value + 5 for value in a.materialize_py()]$$;
+AS $$return a + 5$$;
 
 COMMIT;
 

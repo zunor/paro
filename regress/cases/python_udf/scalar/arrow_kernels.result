@@ -1,0 +1,65 @@
+CREATE FUNCTION py_kernel(a INTEGER, b INTEGER) RETURNS INTEGER LANGUAGE python MODE VECTOR
+AS $$
+import pyarrow as pa
+import pyarrow.compute as pc
+return pc.add(pc.fill_null(a, 0), pc.fill_null(b, 10)).cast(pa.int32())
+$$;
+CREATE FUNCTION
+
+SELECT id, py_kernel(a, b) AS value FROM (VALUES (1, 2, 4), (2, NULL, 5), (3, 8, NULL), (4, NULL, NULL)) t(id, a, b) WHERE id > 1 ORDER BY id;
+id	value
+2	5
+3	18
+4	10
+
+CREATE FUNCTION py_unicode(a VARCHAR) RETURNS VARCHAR LANGUAGE python MODE VECTOR
+AS $$
+import pyarrow.compute as pc
+return pc.utf8_upper(a)
+$$;
+CREATE FUNCTION
+
+SELECT id, py_unicode(v) AS value FROM (VALUES (1, 'café'), (2, '雪🙂'), (3, ''), (4, NULL)) t(id, v) ORDER BY id;
+id	value
+1	CAFÉ
+2	雪🙂
+3	(empty)
+4	NULL
+
+CREATE FUNCTION py_chunks(a INTEGER) RETURNS INTEGER LANGUAGE python MODE VECTOR
+AS $$
+import pyarrow as pa
+return pa.chunked_array([a.slice(0, 1), a.slice(1)], type=pa.int32())
+$$;
+CREATE FUNCTION
+
+SELECT id, py_chunks(v) AS value FROM (VALUES (1, 8), (2, NULL), (3, -2)) t(id, v) ORDER BY id;
+id	value
+1	8
+2	NULL
+3	-2
+
+CREATE FUNCTION py_slice(a INTEGER) RETURNS INTEGER LANGUAGE python MODE VECTOR
+AS $$
+import pyarrow as pa
+return pa.concat_arrays([pa.array([-999], type=pa.int32()), a]).slice(1)
+$$;
+CREATE FUNCTION
+
+SELECT id, py_slice(v) AS value FROM (VALUES (1, 8), (2, NULL), (3, -2)) t(id, v) ORDER BY id;
+id	value
+1	8
+2	NULL
+3	-2
+
+DROP FUNCTION py_kernel(INTEGER, INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION py_unicode(VARCHAR);
+DROP FUNCTION
+
+DROP FUNCTION py_chunks(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION py_slice(INTEGER);
+DROP FUNCTION

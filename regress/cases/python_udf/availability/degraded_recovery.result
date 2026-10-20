@@ -3,7 +3,7 @@ DROP FUNCTION
 
 CREATE FUNCTION py_degraded_probe(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return [value + 4 for value in a.materialize_py()]$$;
+AS $$return a + 4$$;
 CREATE FUNCTION
 
 SELECT py_degraded_probe(1);
@@ -11,11 +11,11 @@ py_degraded_probe(1)
 5
 
 SELECT py_degraded_probe(1);
-ERROR: python worker closed stdout unexpectedly (SQLSTATE=39002)
+ERROR: Python Flight worker failed readiness (SQLSTATE=39002)
 
 -- @normalize python_runtime_retry_hint
 SELECT py_degraded_probe(1);
-ERROR: Python runtime is degraded and unavailable for external routine execution: python worker closed stdout unexpectedly (SQLSTATE=39P04; DETAIL=python worker closed stdout unexpectedly; HINT=next automatic Python runtime probe in <ms> ms)
+ERROR: Python runtime is degraded and unavailable for external routine execution: Python Flight worker failed readiness (SQLSTATE=39P04; DETAIL=Python Flight worker failed readiness; HINT=next automatic Python runtime probe in <ms> ms)
 
 SELECT 6 * 7;
 6 * 7

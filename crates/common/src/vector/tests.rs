@@ -2004,3 +2004,30 @@ fn shallow_and_dictionary_references_retain_opaque_lifetime_owner() {
     drop(outer);
     assert!(dropped.load(Ordering::SeqCst));
 }
+
+#[test]
+fn copy_typed_null_nested_constants_and_dictionary_views() {
+    for ty in [
+        LogicalType::List(Box::new(LogicalType::Integer)),
+        LogicalType::Array(Box::new(LogicalType::Integer), 2),
+        LogicalType::Struct(vec![("x".into(), LogicalType::Integer)]),
+    ] {
+        let allocator: Arc<dyn Allocator> = Arc::new(DefaultAllocator::new());
+        let constant =
+            Arc::new(Vector::try_constant_null(ty.clone(), 3, allocator.clone()).unwrap());
+        let dictionary = Vector::try_gather_ref(
+            constant.clone(),
+            VectorSelection::Repeated { index: 1, count: 3 },
+        )
+        .unwrap();
+        for source in [constant.as_ref(), &dictionary] {
+            let mut dest = Vector::try_new(ty.clone(), 4, allocator.clone()).unwrap();
+            dest.try_copy_range(1, source, 0, 3).unwrap();
+            assert_eq!(dest.len(), 4);
+            assert!((1..4).all(|row| dest.is_null(row)));
+            let mut scattered = Vector::try_new(ty.clone(), 4, allocator.clone()).unwrap();
+            scattered.try_copy_scatter(source, 0, &[2, 0, 3]).unwrap();
+            assert!([0, 2, 3].into_iter().all(|row| scattered.is_null(row)));
+        }
+    }
+}

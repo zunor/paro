@@ -1,0 +1,67 @@
+-- Copyright 2024-2026 Zunor
+-- SPDX-License-Identifier: Apache-2.0
+
+-- @control connect user=paro
+
+-- STRICT compacts on all arguments and scatters to the original selected row positions.
+
+CREATE FUNCTION py_selected(a INTEGER, b INTEGER) RETURNS INTEGER LANGUAGE python STRICT
+AS $$
+assert a is not None and b is not None
+return a * 10 + b
+$$;
+
+CREATE FUNCTION py_selected_vector(a INTEGER, b INTEGER) RETURNS INTEGER LANGUAGE python STRICT MODE VECTOR
+AS $$
+import pyarrow as pa
+assert a.null_count == b.null_count == 0
+assert len(a) == len(b) == ctx.num_rows
+return pa.array([x.as_py() * 10 + y.as_py() for x, y in zip(a, b)], type=pa.int32())
+$$;
+
+SELECT id, py_selected(a, b) AS value
+FROM (VALUES (1, 2, 3), (2, NULL, 4), (3, 5, NULL), (4, 6, 7), (5, NULL, NULL)) t(id, a, b) ORDER BY id;
+
+SELECT id, CASE WHEN id = 2 THEN py_selected(a, b) ELSE -1 END AS value
+FROM (VALUES (1, 9, 9), (2, 4, 2), (3, 8, 8)) t(id, a, b) ORDER BY id;
+
+SELECT id, py_selected_vector(a, b) AS value
+FROM (VALUES (1, 2, 3), (2, NULL, 4), (3, 5, NULL), (4, 6, 7), (5, NULL, NULL)) t(id, a, b) ORDER BY id;
+
+SELECT id, CASE WHEN id = 2 THEN py_selected_vector(a, b) ELSE -1 END AS value
+FROM (VALUES (1, 9, 9), (2, 4, 2), (3, 8, 8)) t(id, a, b) ORDER BY id;
+
+CREATE FUNCTION py_null_delivery(a INTEGER, b INTEGER) RETURNS INTEGER LANGUAGE python
+AS $$
+return -100 if a is None else (None if b is None else a + b)
+$$;
+
+SELECT id, py_null_delivery(a, b) AS value
+FROM (VALUES (1, NULL, 2), (2, 3, NULL), (3, 4, 5)) t(id, a, b) ORDER BY id;
+
+CREATE FUNCTION py_no_rows(a INTEGER) RETURNS INTEGER LANGUAGE python
+AS $$
+raise RuntimeError("empty input executed")
+$$;
+
+SELECT py_no_rows(v) AS value FROM (VALUES (1)) t(v) WHERE v < 0;
+
+DROP FUNCTION py_selected(INTEGER, INTEGER);
+
+DROP FUNCTION py_selected_vector(INTEGER, INTEGER);
+
+DROP FUNCTION py_null_delivery(INTEGER, INTEGER);
+
+DROP FUNCTION py_no_rows(INTEGER);
+
+-- @teardown
+DROP FUNCTION IF EXISTS py_no_rows(INTEGER);
+
+-- @teardown
+DROP FUNCTION IF EXISTS py_null_delivery(INTEGER, INTEGER);
+
+-- @teardown
+DROP FUNCTION IF EXISTS py_selected_vector(INTEGER, INTEGER);
+
+-- @teardown
+DROP FUNCTION IF EXISTS py_selected(INTEGER, INTEGER);

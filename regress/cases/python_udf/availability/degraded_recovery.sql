@@ -7,7 +7,7 @@ DROP FUNCTION IF EXISTS py_degraded_probe(INTEGER);
 
 CREATE FUNCTION py_degraded_probe(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return [value + 4 for value in a.materialize_py()]$$;
+AS $$return a + 4$$;
 
 SELECT py_degraded_probe(1);
 

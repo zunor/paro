@@ -73,6 +73,17 @@ def test_discover_case_files_and_filter(tmp_path: Path) -> None:
     assert filtered == [sql_c]
 
 
+def test_case_exclusion_combines_with_filter(tmp_path: Path) -> None:
+    cases = tmp_path / "cases"
+    for name in ("native/select.sql", "python_udf/select.sql", "python_udf/errors.sql"):
+        path = cases / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("SELECT 1;")
+    assert runner.discover_case_files(cases, exclude_pattern="python_udf") == [cases / "native/select.sql"]
+    assert runner.discover_case_files(cases, filter_pattern="select", exclude_pattern="native") == [cases / "python_udf/select.sql"]
+    assert runner.discover_case_files(cases, filter_pattern="python_udf", exclude_pattern="python_udf") == []
+
+
 def test_explicit_report_directory_is_owned_and_never_replaces_existing(tmp_path):
     import pytest
     (tmp_path / "config.toml").write_text("[connection]\n[test]\n")

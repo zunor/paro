@@ -4,6 +4,7 @@
 //! Domain models and host runtime for Paro external execution boundaries.
 
 pub mod abi;
+pub mod python;
 pub mod routine;
 pub mod runtime;
 pub mod source;

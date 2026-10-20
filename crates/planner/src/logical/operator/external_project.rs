@@ -3,7 +3,6 @@
 
 use crate::expression::Expression;
 use crate::logical::plan::OwnedLogicalPlan;
-use paro_common::types::LogicalType;
 use paro_external::routine::bound::BoundRoutineCallMeta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -23,11 +22,11 @@ pub struct ExternalProjectExpression {
 
 #[derive(Debug, Clone)]
 pub struct LogicalExternalProject<Child = Box<OwnedLogicalPlan>> {
+    /// Bindings for computed columns use this table index and the expression
+    /// ordinal, independent of the number of pass-through child columns.
     pub project_index: usize,
     pub expressions: Vec<ExternalProjectExpression>,
     pub child: Child,
-    pub output_names: Vec<String>,
-    pub returned_types: Vec<LogicalType>,
     pub cost: ExternalCostEstimate,
 }
 
@@ -37,18 +36,10 @@ impl LogicalExternalProject {
         child: OwnedLogicalPlan,
         expressions: Vec<ExternalProjectExpression>,
     ) -> Self {
-        let mut output_names = child.output_names();
-        output_names.extend(expressions.iter().map(|expr| expr.output_name.clone()));
-
-        let mut returned_types = child.types();
-        returned_types.extend(expressions.iter().map(|expr| expr.expression.return_type()));
-
         Self {
             project_index,
             expressions,
             child: Box::new(child),
-            output_names,
-            returned_types,
             cost: ExternalCostEstimate::default(),
         }
     }

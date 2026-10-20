@@ -225,7 +225,7 @@ mod tests {
                     id: format!("inline:{schema}:{name}"),
                     inline_source: "return 1".to_string(),
                 },
-                entrypoint: PythonEntrypointRef::Batch {
+                entrypoint: PythonEntrypointRef::Vector {
                     handler: "batch".to_string(),
                 },
                 runtime: PythonRuntimeSelector::SystemDefault,

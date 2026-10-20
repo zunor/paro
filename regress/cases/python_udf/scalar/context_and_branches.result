@@ -1,0 +1,47 @@
+CREATE FUNCTION py_context() RETURNS INTEGER LANGUAGE python
+AS $$
+from dataclasses import FrozenInstanceError
+assert ctx.num_rows > 0 and ctx.routine_id > 0 and ctx.generation > 0
+assert ctx.invocation_id
+try:
+    ctx.num_rows = 0
+except FrozenInstanceError:
+    return 17
+raise AssertionError("mutable context")
+$$;
+CREATE FUNCTION
+
+SELECT id, py_context() AS value FROM (VALUES (1), (2), (3)) t(id) ORDER BY id;
+id	value
+1	17
+2	17
+3	17
+
+CREATE FUNCTION py_positive(a INTEGER) RETURNS INTEGER LANGUAGE python STRICT
+AS $$
+assert a > 0, "unselected argument executed"
+return a * 2
+$$;
+CREATE FUNCTION
+
+SELECT id, CASE WHEN v IS NULL THEN 99 WHEN v > 0 THEN py_positive(py_positive(v)) ELSE -1 END AS value FROM (VALUES (1, NULL), (2, -2), (3, 3)) t(id, v) ORDER BY id;
+id	value
+1	99
+2	-1
+3	12
+
+SELECT py_positive(CASE WHEN v > 0 THEN v ELSE 1 END) AS value FROM (VALUES (-5), (2)) t(v) ORDER BY value;
+value
+2
+4
+
+SELECT CASE WHEN v > 0 THEN py_positive(v) ELSE py_positive(0 - v) END AS value FROM (VALUES (-3), (2)) t(v) ORDER BY value;
+value
+4
+6
+
+DROP FUNCTION py_positive(INTEGER);
+DROP FUNCTION
+
+DROP FUNCTION py_context();
+DROP FUNCTION

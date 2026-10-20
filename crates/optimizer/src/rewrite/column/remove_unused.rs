@@ -978,6 +978,13 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                         }
                     }
                     expr_get.types = new_types;
+                    // Names describe the same pruned columns as types and cells.
+                    let mut column = 0;
+                    expr_get.names.retain(|_| {
+                        let keep = referenced_cols.get(column).copied().unwrap_or(false);
+                        column += 1;
+                        keep
+                    });
                 }
             }
             LogicalOperator::DummyScan => {
@@ -1032,6 +1039,54 @@ mod tests {
             panic!("expected column reference");
         };
         column.binding
+    }
+
+    #[test]
+    fn values_pruning_keeps_names_types_cells_and_bindings_aligned() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let values = OwnedLogicalPlan::new(
+            ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                10,
+                vec![(1..=3)
+                    .map(|value| {
+                        Expression::Constant(
+                            paro_planner::expression::ConstantExpression::new(
+                                paro_common::runtime_value::Value::Integer(value),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        )
+                    })
+                    .collect()],
+                vec!["first".into(), "second".into(), "third".into()],
+                vec![LogicalType::Integer; 3],
+            )),
+        );
+        let mut plan = OwnedLogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(20, values, vec![int_column(10, 2)])),
+        );
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+        let LogicalOperator::Projection(projection) = &plan.operator else {
+            panic!("projection")
+        };
+        assert_eq!(
+            binding(&projection.expressions[0]),
+            ColumnBinding::new(10, 0)
+        );
+        let LogicalOperator::ExpressionGet(values) = &projection.child.operator else {
+            panic!("VALUES")
+        };
+        assert_eq!(values.names, ["third"]);
+        assert_eq!(values.types, [LogicalType::Integer]);
+        assert_eq!(values.expressions[0].len(), 1);
+        let Expression::Constant(value) = &values.expressions[0][0] else {
+            panic!("constant")
+        };
+        assert_eq!(value.value, paro_common::runtime_value::Value::Integer(3));
     }
 
     #[test]

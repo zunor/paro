@@ -7,7 +7,7 @@ DROP FUNCTION IF EXISTS py_disabled_probe(INTEGER);
 
 CREATE FUNCTION py_disabled_probe(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return [value + 1 for value in a.materialize_py()]$$;
+AS $$return a + 1$$;
 
 SELECT py_disabled_probe(1);
 
@@ -16,7 +16,7 @@ SELECT 41 + 1;
 
 CREATE FUNCTION py_disabled_new(a INTEGER) RETURNS INTEGER
 LANGUAGE python
-AS $$return [value for value in a.materialize_py()]$$;
+AS $$return a$$;
 
 SELECT py_disabled_probe(1);
 

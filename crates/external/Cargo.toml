@@ -19,6 +19,18 @@ ordered-float = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-flight = { workspace = true }
+flatbuffers = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+base64 = "0.22"
+sha2 = "0.10"
+getrandom = "0.3"
+tempfile = "3.8"

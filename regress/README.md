@@ -68,6 +68,10 @@ Python UDF specific entry points also exist at the project root:
 | `make clean` | Remove `.venv`, `__pycache__`, and reports |
 | `make help` | Print all available targets |
 
+Use `FILE=<substring>` to select cases and `EXCLUDE=<substring>` to omit cases.
+CI runs `make ci EXCLUDE=python_udf` without a Python runtime, and the Python
+job runs `make ci FILE=python_udf` with the worker dependencies installed.
+
 ### Environment Variables
 
 | Variable | Purpose | Example |

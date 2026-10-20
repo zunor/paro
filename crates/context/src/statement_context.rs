@@ -184,6 +184,29 @@ impl StatementContext {
             .map(|provider| provider.status())
     }
 
+    pub fn python_client(
+        &self,
+    ) -> paro_common::error::Result<Arc<paro_external::python::client::PythonClient>> {
+        self.services
+            .python_runtime
+            .as_ref()
+            .ok_or_else(|| {
+                paro_common::error::python_runtime_unavailable("Python runtime is not configured")
+            })?
+            .python_client()
+    }
+
+    pub fn validate_python_routine(
+        &self,
+        spec: &paro_external::routine::spec::RoutineSpec,
+    ) -> paro_common::error::Result<()> {
+        let (definition, _, _) = paro_external::python::definition::Definition::from_spec(spec)?;
+        if let Some(provider) = &self.services.python_runtime {
+            provider.python_client()?.validate(definition)?;
+        }
+        Ok(())
+    }
+
     pub fn python_execution_slot_limit(&self) -> u16 {
         self.services
             .python_runtime

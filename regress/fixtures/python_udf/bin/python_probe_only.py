@@ -11,7 +11,7 @@ def main() -> int:
         exec(sys.argv[2], namespace)
         return 0
 
-    if len(sys.argv) >= 3 and sys.argv[1] == "-m" and sys.argv[2] == "paro_runtime_worker":
+    if sys.argv[1:] == ["-u", "-m", "paro_worker"]:
         sys.stderr.write("simulated worker bootstrap crash\n")
         return 97
 

@@ -208,7 +208,7 @@ error:
   --> SQL:1:100
   |
 1 | CREATE FUNCTION IF NOT EXISTS isnotempty(p BOOLEAN) RETURNS BOOLEAN LANGUAGE python HANDLER 'batch';
-  | ------                                                                                             ^ unexpected `;`, expecting `AS`, `LANGUAGE`, `IMMUTABLE`, `STABLE`, `VOLATILE`, `STRICT`, `SECURITY`, `HANDLER`, `PACKAGES`, `IMPORTS`, `ROWS`, or `CAPABILITY`
+  | ------                                                                                             ^ unexpected `;`, expecting `AS`, `LANGUAGE`, `MODE`, `IMMUTABLE`, `STABLE`, `VOLATILE`, `STRICT`, `SECURITY`, `HANDLER`, `PACKAGES`, `IMPORTS`, `ROWS`, or `CAPABILITY`
   | |                                                                                                   
   | while parsing `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] [<database>.][<schema>.]<name>(<arg_name arg_type>, ...) RETURNS <type> LANGUAGE <language> [IMMUTABLE|STABLE|VOLATILE] [STRICT] [SECURITY INVOKER|DEFINER] [HANDLER '<handler>'] [PACKAGES ('pkg', ...)] [IMPORTS ('uri', ...)] [ROWS <n>] [CAPABILITY PROFILE <profile>] AS <code>`
 

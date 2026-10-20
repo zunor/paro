@@ -395,7 +395,7 @@ impl TransformGlobalSlots {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SinkGlobal {
     ClientResult(Arc<ClientResultSinkGlobal>),
     Materialize(Arc<MaterializeSinkGlobal>),
@@ -413,7 +413,7 @@ pub enum SinkGlobal {
     Dml(Arc<DmlSinkGlobal>),
     CopyToFile(Arc<CopyToSinkGlobal>),
     ExternalTable(Arc<ExternalTableSinkGlobal>),
-    Dyn(DynGlobalStateBox),
+    Dyn(Arc<dyn DynGlobalState>),
 }
 
 impl SinkGlobal {

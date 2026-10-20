@@ -4,10 +4,10 @@
 <p align="center">
   <strong>An AI-native multi-model database built for agents, not just applications.</strong>
   <br />
-  Vector search · full-text ranking · graph traversal · sandboxed Python — one SQL engine, one query.
+  Vector search · full-text ranking · graph traversal · Python UDFs — one SQL engine, one query.
 </p>
 
-Paro is a multi-model database written in Rust. It unifies relational, vector, full-text, and graph workloads — no sidecar services, no cross-system glue code. A single SQL statement can walk a social graph, rank documents by keyword relevance, re-rank by embedding similarity, and invoke a sandboxed Python UDF — served from a consistent snapshot while concurrent writers commit under serializable isolation.
+Paro is a multi-model database written in Rust. It unifies relational, vector, full-text, and graph workloads — no sidecar services, no cross-system glue code. A single SQL statement can walk a social graph, rank documents by keyword relevance, re-rank by embedding similarity, and invoke a Python UDF — served from a consistent snapshot while concurrent writers commit under serializable isolation.
 
 > [!WARNING]
 > **Paro is currently in beta.**
@@ -23,7 +23,7 @@ Paro is a multi-model database written in Rust. It unifies relational, vector, f
 - **Full-text search** — `GIN` indexes, `to_tsvector`, `plainto_tsquery`, `ts_rank`, and BM25 ranking.
 - **Graph queries** — SQL/PGQ: `CREATE PROPERTY GRAPH`, `GRAPH_TABLE`, multi-hop path traversal.
 - **Serializable transactions** — MVCC snapshot reads run lock-free alongside SSI-validated writes; predicate/range locks, `SELECT ... FOR UPDATE`, and savepoints available when needed.
-- **Sandboxed Python UDFs** — batch-style handlers with Arrow/NumPy fast-path interop, executed in isolated worker processes — safe for running agent-generated code.
+- **Python UDFs** — scalar and vector handlers with real Arrow/NumPy interop, executed in separate worker processes.
 
 ## Quick Start
 
@@ -94,13 +94,13 @@ To run the full example locally, load [`regress/cases/example/quickstart.sql`](r
 
 ## Python UDFs
 
-Python handlers run in isolated worker processes, separate from the database engine — a safer default for agent-generated code. Python support is optional: `parod` starts and serves ordinary SQL without a Python interpreter.
+Python handlers run in separate worker processes and exchange typed Arrow batches with the engine. This isolates interpreter state and permits cancellation; it is not an OS security sandbox. Python support is optional: `parod` starts and serves ordinary SQL without a Python interpreter.
 
 Project-level entry points:
 
 - `make python-udf-unit` runs ABI/runtime Rust tests plus Python worker and SDK unit tests.
 - `make python-udf-startup-smoke` verifies `parod` still starts when the Python runtime is disabled.
-- `make python-udf-regress` runs the dedicated SQL gate on the real worker / artifact execution path.
+- `make python-udf-regress` runs the dedicated SQL gate on the real Arrow Flight execution path.
 - `make python-udf-ci` runs the dedicated Python UDF unit, startup, and SQL-regress flow end-to-end.
 
 More focused docs live here:

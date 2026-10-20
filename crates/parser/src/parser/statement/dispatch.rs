@@ -790,6 +790,7 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             let mut strict = false;
             let mut security = FunctionSecurity::Invoker;
             let mut handler = None;
+            let mut vectorized = false;
             let mut packages = Vec::new();
             let mut imports = Vec::new();
             let mut rows = None;
@@ -802,6 +803,7 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                     CreateFunctionOption::Strict => strict = true,
                     CreateFunctionOption::Security(value) => security = value,
                     CreateFunctionOption::Handler(value) => handler = Some(value),
+                    CreateFunctionOption::Mode(value) => vectorized = value,
                     CreateFunctionOption::Packages(value) => packages = value,
                     CreateFunctionOption::Imports(value) => imports = value,
                     CreateFunctionOption::Rows(value) => rows = Some(value),
@@ -833,6 +835,7 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 strict,
                 security,
                 handler,
+                vectorized,
                 packages,
                 imports,
                 rows,
@@ -3891,6 +3894,7 @@ fn function_return(i: Input) -> IResult<FunctionReturn> {
 
 #[derive(Clone)]
 enum CreateFunctionOption {
+    Mode(bool),
     Language(Identifier),
     Volatility(FunctionVolatility),
     Strict,
@@ -3903,6 +3907,10 @@ enum CreateFunctionOption {
 }
 
 fn create_function_option(i: Input) -> IResult<CreateFunctionOption> {
+    let mode = map(
+        rule! { #match_text("MODE") ~ (#match_text("VECTOR") | #match_text("SCALAR")) },
+        |(_, mode)| CreateFunctionOption::Mode(mode.text().eq_ignore_ascii_case("VECTOR")),
+    );
     let language = map(
         rule! {
             LANGUAGE ~ #ident
@@ -3970,6 +3978,7 @@ fn create_function_option(i: Input) -> IResult<CreateFunctionOption> {
 
     rule!(
         #language
+        | #mode
         | #immutable
         | #stable
         | #volatile

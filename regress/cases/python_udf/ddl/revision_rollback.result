@@ -1,0 +1,55 @@
+CREATE FUNCTION py_catalog(a INTEGER) RETURNS INTEGER LANGUAGE python
+AS $$
+return a + 1
+$$;
+CREATE FUNCTION
+
+BEGIN;
+BEGIN
+
+CREATE OR REPLACE FUNCTION py_catalog(a INTEGER) RETURNS INTEGER LANGUAGE python AS $$return a + 9$$;
+CREATE FUNCTION
+
+SELECT py_catalog(1) AS value;
+value
+10
+
+ROLLBACK;
+ROLLBACK
+
+SELECT py_catalog(1) AS value;
+value
+2
+
+CREATE OR REPLACE FUNCTION py_catalog(a INTEGER) RETURNS INTEGER LANGUAGE python HANDLER 'main' AS $$def main(a): return a$$;
+ERROR: handler signature must be (ctx, arg...) (SQLSTATE=39001)
+
+SELECT py_catalog(1) AS value;
+value
+2
+
+PREPARE py_catalog_plan AS SELECT py_catalog(1) AS value;
+PREPARE
+
+EXECUTE py_catalog_plan;
+value
+2
+
+DROP FUNCTION py_catalog(INTEGER);
+DROP FUNCTION
+
+CREATE FUNCTION py_catalog(a INTEGER) RETURNS INTEGER LANGUAGE python
+AS $$
+return a + 20
+$$;
+CREATE FUNCTION
+
+EXECUTE py_catalog_plan;
+value
+21
+
+DEALLOCATE py_catalog_plan;
+DEALLOCATE
+
+DROP FUNCTION py_catalog(INTEGER);
+DROP FUNCTION

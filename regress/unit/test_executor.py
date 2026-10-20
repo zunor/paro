@@ -484,6 +484,40 @@ def test_control_block_uses_handler_and_replaces_connection() -> None:
     assert result.query_outputs[0].rows == [["1"]]
 
 
+@pytest.mark.parametrize("fail_main", [False, True])
+def test_teardown_uses_reconnected_default_even_after_main_failure(fail_main: bool) -> None:
+    original = _FakeConnection([])
+    replacement = _FakeConnection(
+        [
+            _Step("SELECT 1;", columns=["v"], rows=[(1,)]),
+            _Step("DROP TABLE IF EXISTS t;"),
+        ]
+    )
+    blocks = [
+        Block(kind="control", line_no=1, sql="", control_action="connect"),
+        Block(
+            kind="statement" if fail_main else "query",
+            line_no=2,
+            sql="SELECT 1;",
+            statement_expect="error" if fail_main else None,
+            error_pattern="expected failure" if fail_main else None,
+            query_mode=None if fail_main else "nosort",
+        ),
+        Block(kind="teardown", line_no=3, sql="DROP TABLE IF EXISTS t;"),
+    ]
+
+    def reconnect(conn: Any, _block: Block) -> Any:
+        assert conn is original
+        return replacement
+
+    if fail_main:
+        with pytest.raises(ExecutionError, match="expected error"):
+            execute_blocks(original, blocks, control_handler=reconnect)
+    else:
+        execute_blocks(original, blocks, control_handler=reconnect)
+    assert replacement.steps == []
+
+
 def test_named_sessions_reuse_connections_and_label_outputs() -> None:
     default = _FakeConnection([])
     named = _FakeConnection(
